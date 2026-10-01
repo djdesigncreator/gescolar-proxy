@@ -48,12 +48,28 @@
 .com h4{margin:0 0 4px;font-size:16px}
 .com p{margin:8px 0 0;white-space:pre-wrap;color:var(--ink);font-size:14.5px;line-height:1.5}
 textarea.inp{height:auto;min-height:130px;padding:10px;line-height:1.45;resize:vertical}
+.mx{border-collapse:separate;border-spacing:0;width:100%;font-size:13.5px}
+.mx th,.mx td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:center;white-space:nowrap;background:var(--surface)}
+.mx thead th{font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);position:sticky;top:0;z-index:2}
+.mx th.nm,.mx td.nm{text-align:left;position:sticky;left:0;z-index:1;border-right:1px solid var(--line);min-width:180px}
+.mx thead th.nm{z-index:3}
+.mx th.dc{cursor:pointer;border-top:4px solid transparent}
+.mx th.dc:hover{color:var(--blue)}
+.mx td.v{font:700 13.5px var(--f-mono)}
+.mx .neg{color:var(--bad)} .mx .pos{color:var(--ok)}
+.dcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-bottom:14px}
+.dc-card{background:var(--surface);border:1px solid var(--line);border-left:5px solid var(--blue);border-radius:12px;padding:12px 14px;cursor:pointer;text-align:left;font:inherit;color:inherit}
+.dc-card:hover{border-color:var(--blue)}
+.dc-card b{display:block;font-size:14.5px}
+.dc-card small{display:block;color:var(--muted);font-size:12.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media print{.side,.top,.ph .actions,.dcs,.no-print{display:none!important}.app{display:block}.main{margin:0}.page{padding:0}.card{box-shadow:none}}
 .msg-err{background:var(--bad-soft);color:var(--bad);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600}
 </style>
 </head>
 <body>
 <div id="root"><div class="carregar"><div class="spinner"></div>A abrir o painel…</div></div>
 <div class="toasts" id="toasts"></div>
+<script src="pauta.js" charset="utf-8"></script>
 <script>
 (function(){
 'use strict';
@@ -98,8 +114,7 @@ try{ var h=(location.hash||'').slice(1); if(h) S.pag=h; }catch(e){}
 /* ---------- casca ---------- */
 var NAV = [['Arranque'],['painel','Painel','home'],['turmas','Turmas e salas','layers'],['disciplinas','Disciplinas','book'],['professores','Professores','board'],['estudantes','Estudantes','users'],
   ['Financeiro'],['propinas','Propinas e multas','wallet'],['facturas','Facturas e recibos','receipt'],
-  ['Escola'],['horarios','Horários','cal'],['comunicados','Comunicados','mega'],
-  ['Em construção'],['x','Pautas e notas','grade',1]];
+  ['Escola'],['horarios','Horários','cal'],['pautas','Pautas e notas','grade'],['comunicados','Comunicados','mega']];
 function casca(){
   var e=S.escola||{};
   $('#root').innerHTML='<div class="app"><aside class="side" id="side">'+
@@ -128,11 +143,11 @@ function erroCaixa(m){ return '<div class="msg-err">'+esc(m)+'</div>'; }
 function modal(html){ fechar(); var s=document.createElement('div'); s.className='scrim'; s.id='ov'; s.innerHTML='<div class="modal" role="dialog" aria-modal="true">'+html+'</div>'; s.addEventListener('mousedown',function(e){ if(e.target===s) fechar(); }); document.body.appendChild(s); var f=s.querySelector('input,select'); if(f) setTimeout(function(){ f.focus(); },30); $$('[data-fechar]',s).forEach(function(b){ b.onclick=fechar; }); return s; }
 function fechar(){ var o=$('#ov'); if(o) o.remove(); }
 function aGravar(btn, sim){ if(sim){ btn.disabled=true; btn.dataset.txt=btn.innerHTML; btn.innerHTML='A gravar…'; } else { btn.disabled=false; if(btn.dataset.txt) btn.innerHTML=btn.dataset.txt; } }
-document.addEventListener('keydown',function(e){ if(e.key==='Escape') fechar(); });
+document.addEventListener('keydown',function(e){ if(e.key==='Escape'){ if(window.__gsSujo && window.__gsSujo() && $('#pe')) return; fechar(); } });
 
 /* ---------- páginas ---------- */
 function pagina(){
-  var f = { painel:pPainel, turmas:pTurmas, disciplinas:pDisciplinas, professores:pProfessores, estudantes:pEstudantes, propinas:pPropinas, facturas:pFacturas, horarios:pHorarios, comunicados:pComunicados }[S.pag] || pPainel;
+  var f = { painel:pPainel, turmas:pTurmas, disciplinas:pDisciplinas, professores:pProfessores, estudantes:pEstudantes, propinas:pPropinas, facturas:pFacturas, horarios:pHorarios, pautas:pPautas, comunicados:pComunicados }[S.pag] || pPainel;
   f();
 }
 
@@ -310,6 +325,7 @@ function acessoFamilias(){
     if(!r.ok){ b.innerHTML=erroCaixa(r.erro); return; }
     b.innerHTML='<p style="margin:0">Encarregados e estudantes entram no portal <b>sem palavra-passe</b>: escrevem o telemóvel (ou o número de estudante) e recebem um código por SMS. Lá vêem as propinas, pagam por M-Pesa, e-Mola ou cartão e descarregam os recibos.</p>'+
       '<label class="field">Link do portal da escola<div style="display:flex;gap:8px"><input class="inp mono" id="fa-l" readonly value="'+esc(r.link)+'" style="flex:1;min-width:0;font-size:13px"><button class="btn" id="fa-c">Copiar</button></div></label>'+
+      '<p class="small muted" style="margin:0">Os <b>professores</b> entram no mesmo link, escolhem "Professor" e usam o telemóvel registado em Professores.</p>'+
       '<p class="small muted" style="margin:0">Código da escola: <b class="mono" style="color:var(--ink)">'+esc(r.codigo)+'</b> · '+r.com_telefone+' de '+r.encarregados+' encarregados com telemóvel registado.</p>'+
       '<div class="card card-b" style="background:var(--blue-soft);border-color:transparent"><b>Convidar por SMS</b><div class="small muted" style="margin:4px 0 10px">Envia um SMS a todos os encarregados com o link do portal. Pode ser enviado uma vez por hora.</div>'+
       '<button class="btn pri" id="fa-s"'+(r.com_telefone?'':' disabled')+'>Enviar convite a '+r.com_telefone+' encarregados</button><div id="fa-r" style="margin-top:10px"></div></div>';
@@ -606,6 +622,60 @@ function celulaH(chave, daTurma, DM){
     alvo.forEach(function(k){ if(d) g.aulas[k]={d:d,p:p,s:s}; else delete g.aulas[k]; });
     H.sujo=true; fechar(); desenharH();
   };
+}
+
+/* ================= PAUTAS E NOTAS ================= */
+function triActual(){ var m=new Date().getMonth()+1; return m<=5?1:(m<=8?2:3); }
+function pPautas(){
+  if(typeof window.GSPauta==='undefined'){ $('#page').innerHTML=erroCaixa('Falta o ficheiro pauta.js no site (gescolar-web). Carregue-o no GitHub.'); return; }
+  aCarregar();
+  api('/turmas').then(function(r){
+    if(!r.ok){ $('#page').innerHTML=erroCaixa(r.erro); return; }
+    S.turmas=r.turmas;
+    if(!S.turmas.length){ $('#page').innerHTML=ph('Escola','Pautas e notas','')+vazio('layers','Crie primeiro uma turma','As pautas são por turma. Vá a "Turmas e salas".'); return; }
+    S.P=S.P||{ turma:S.turmas[0].id, tri:triActual() };
+    if(!S.turmas.some(function(t){ return t.id===S.P.turma; })) S.P.turma=S.turmas[0].id;
+    resumoPautas();
+  });
+}
+function resumoPautas(){
+  aCarregar();
+  api('/pautas-turma',{turma:S.P.turma, trimestre:S.P.tri}).then(function(d){
+    if(!d.ok){ $('#page').innerHTML=erroCaixa(d.erro); return; }
+    var ap=d.regras.aprovacao, D=d.disciplinas, E=d.estudantes;
+    var pub=D.filter(function(x){ return x.publicado; }).length, exis=D.filter(function(x){ return x.existe; }).length;
+    function cel(v){ return v==null?'<td class="v muted">—</td>':'<td class="v '+(Math.round(v)>=ap?'pos':'neg')+'">'+GSPauta.fmt(v)+'</td>'; }
+    $('#page').innerHTML=ph('Escola','Pautas e notas', 'Turma <b>'+esc(d.turma.nome)+'</b> · '+d.trimestre+'º trimestre · '+exis+' de '+D.length+' disciplinas com notas · '+pub+' publicadas às famílias.',
+        '<select class="sel" id="p-t">'+S.turmas.map(function(t){ return '<option value="'+t.id+'"'+(t.id===S.P.turma?' selected':'')+'>'+esc(t.nome)+'</option>'; }).join('')+'</select>'+
+        '<select class="sel" id="p-tri">'+[1,2,3].map(function(t){ return '<option value="'+t+'"'+(t===S.P.tri?' selected':'')+'>'+t+'º trimestre</option>'; }).join('')+'</select>'+
+        (exis?'<button class="btn" id="p-pub">'+(pub<exis?'Publicar todas':'Ocultar das famílias')+'</button>':'')+'<button class="btn" id="p-print">Imprimir pauta</button>')+
+      (D.length? '<div class="dcs">'+D.map(function(x){ return '<button class="dc-card" data-dc="'+x.id+'" style="border-left-color:'+esc(x.cor)+'"><b>'+esc(x.nome)+'</b><small>'+esc(x.professores.join(', ')||'Sem professor')+'</small><small>'+x.lancadas+'/'+E.length+' com notas · '+(x.publicado?'<span style="color:var(--ok);font-weight:700">publicada</span>':x.existe?'rascunho':'por lançar')+'</small></button>'; }).join('')+'</div>'
+        : vazio('book','Esta turma não tem disciplinas','Ligue as disciplinas à turma (Turmas e salas → Editar) ou marque-as no horário.'))+
+      (D.length && E.length ? '<section class="card"><div class="tbl-wrap" style="max-height:70vh;overflow:auto"><table class="mx"><thead><tr><th class="nm">Estudante</th>'+
+        D.map(function(x){ return '<th class="dc" data-dc="'+x.id+'" style="border-top-color:'+esc(x.cor)+'" title="'+esc(x.nome)+'">'+esc(x.nome.length>12?x.nome.slice(0,11)+'.':x.nome)+'</th>'; }).join('')+'<th>Média</th><th>Neg.</th></tr></thead><tbody>'+
+        E.map(function(e){ var vs=D.map(function(x){ return e.medias[x.id]; }).filter(function(v){ return v!=null; }), med=vs.length?vs.reduce(function(a,b){return a+b;},0)/vs.length:null, neg=vs.filter(function(v){ return Math.round(v)<ap; }).length;
+          return '<tr><td class="nm"><b>'+esc(e.nome)+'</b><div class="small muted mono">'+esc(e.numero)+'</div></td>'+D.map(function(x){ return cel(e.medias[x.id]); }).join('')+cel(med)+'<td class="v '+(neg?'neg':'')+'">'+(vs.length?neg:'—')+'</td></tr>'; }).join('')+
+        '</tbody></table></div></section><p class="small muted no-print" style="margin-top:10px">Clique numa disciplina para lançar ou corrigir as notas. A vermelho, médias abaixo de '+ap+'.</p>'
+        : (D.length? vazio('users','Sem estudantes nesta turma','Matricule os estudantes para lançar as notas.') : ''));
+    $('#p-t').onchange=function(){ S.P.turma=this.value; resumoPautas(); };
+    $('#p-tri').onchange=function(){ S.P.tri=+this.value; resumoPautas(); };
+    $('#p-print').onclick=function(){ window.print(); };
+    var pb=$('#p-pub'); if(pb) pb.onclick=function(){ var btn=this, publicar=pub<exis; aGravar(btn,true); api('/pautas-publicar',{turma:S.P.turma, trimestre:S.P.tri, publicado:publicar}).then(function(x){ aGravar(btn,false); if(!x.ok){ toast(x.erro); return; } toast(publicar?'Pautas publicadas às famílias':'Pautas ocultadas das famílias'); resumoPautas(); }); };
+    $$('[data-dc]').forEach(function(b){ b.onclick=function(){ editarPauta(b.getAttribute('data-dc')); }; });
+  });
+}
+function editarPauta(disc){
+  var ed=null; window.__gsSujo=function(){ return ed && ed.sujo(); };
+  modal('<div class="modal-h"><h3>Lançar notas</h3><button class="icon-btn" id="pe-x">'+ic('x')+'</button></div><div class="modal-b" id="pe"><div class="carregar"><div class="spinner"></div>A abrir a pauta…</div></div>');
+  var m=$('#ov .modal'); if(m){ m.style.maxWidth='1120px'; }
+  var ov=$('#ov'); var fecharP=function(){ if(ed && ed.sujo() && !confirm('Tem notas por guardar. Fechar mesmo assim?')) return; fechar(); resumoPautas(); };
+  $('#pe-x').onclick=fecharP;
+  if(ov){ var nov=ov.cloneNode(true); ov.parentNode.replaceChild(nov,ov); nov.addEventListener('mousedown',function(e){ if(e.target===nov) fecharP(); }); $('#pe-x').onclick=fecharP; }
+  api('/pauta',{turma:S.P.turma, disciplina:disc, trimestre:S.P.tri}).then(function(r){
+    var el=$('#pe'); if(!el) return;
+    if(!r.ok){ el.innerHTML=erroCaixa(r.erro); return; }
+    ed=GSPauta.montar(el, r.pauta, { aviso:toast, guardar:function(g,pub){ return api('/pauta-guardar',{turma:S.P.turma, disciplina:disc, trimestre:S.P.tri, grelha:g, publicado:pub}); } });
+  });
 }
 
 /* ================= COMUNICADOS ================= */

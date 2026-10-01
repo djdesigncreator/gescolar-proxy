@@ -18,8 +18,8 @@ body{background:var(--bg);margin:0}
 .ac-card{width:100%;max-width:430px;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:26px 22px}
 .ac-card h1{font-family:var(--f-display);font-size:23px;font-weight:800;margin:0;letter-spacing:-.01em}
 .ac-card p.sub{color:var(--muted);margin:6px 0 20px;font-size:15px}
-.ac-tipo{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--surface2,#EEF2F8);border-radius:12px;padding:5px;margin-bottom:18px}
-.ac-tipo button{border:0;background:none;border-radius:9px;padding:10px 8px;font:700 14px var(--f-body);color:var(--muted);cursor:pointer}
+.ac-tipo{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;background:var(--surface2,#EEF2F8);border-radius:12px;padding:5px;margin-bottom:18px}
+.ac-tipo button{border:0;background:none;border-radius:9px;padding:10px 4px;font:700 13.5px var(--f-body);color:var(--muted);cursor:pointer}
 .ac-tipo button.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 4px rgba(10,30,60,.12)}
 .ac-card .field{margin-bottom:14px}
 .ac-card .inp{height:46px;font-size:16px}
@@ -52,7 +52,7 @@ function guardar(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
 function ler(k){ try{ return localStorage.getItem(k)||''; }catch(e){ return ''; } }
 
 /* já tem sessão do portal? vai directo */
-try{ var ja=JSON.parse(ler('gs_sessao')||'null'); if(ja && ja.token && ja.pagina==='portal'){ location.replace('portal.html'); return; } }catch(e){}
+try{ var ja=JSON.parse(ler('gs_sessao')||'null'); if(ja && ja.token && (ja.pagina==='portal'||ja.pagina==='professor')){ location.replace(ja.pagina+'.html'); return; } }catch(e){}
 
 /* código da escola: ?e=josina · josina.gescolar.co.mz · última escola usada */
 var codigo='';
@@ -61,7 +61,7 @@ if(!codigo){ var m=location.hostname.match(/^([a-z0-9-]+)\.gescolar\.co\.mz$/i);
 if(!codigo) codigo=ler('gs_escola');
 var fixo=!!codigo;
 
-var S={ tipo: ler('gs_tipo')==='estudante'?'estudante':'encarregado', valor:'', pedido:'', destino:'', escolaNome:'', espera:0, timer:null };
+var S={ tipo: ['estudante','professor'].indexOf(ler('gs_tipo'))>=0?ler('gs_tipo'):'encarregado', valor:'', pedido:'', destino:'', escolaNome:'', espera:0, timer:null };
 
 function post(rota,corpo){
   return fetch(PROXY+rota,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo||{})})
@@ -72,15 +72,15 @@ function carregar(btn,sim,txt){ if(sim){ btn.disabled=true; btn.dataset.t=btn.in
 
 function passo1(erroMsg){
   clearInterval(S.timer);
-  var enc=S.tipo==='encarregado';
+  var enc=S.tipo!=='estudante', prof=S.tipo==='professor';
   $('#card').innerHTML=
-    '<h1>Acompanhe a escola no telemóvel</h1><p class="sub">Propinas, recibos, notas e horários. Sem palavra-passe: enviamos um código por SMS.</p>'+
+    '<h1>'+(prof?'Área do professor':'Acompanhe a escola no telemóvel')+'</h1><p class="sub">'+(prof?'Horário, turmas e lançamento de notas.':'Propinas, recibos, notas e horários.')+' Sem palavra-passe: enviamos um código por SMS.</p>'+
     (erroMsg?'<div class="ac-msg err">'+esc(erroMsg)+'</div>':'')+
-    '<div class="ac-tipo"><button type="button" data-t="encarregado" class="'+(enc?'on':'')+'">Sou encarregado</button><button type="button" data-t="estudante" class="'+(!enc?'on':'')+'">Sou estudante</button></div>'+
+    '<div class="ac-tipo"><button type="button" data-t="encarregado" class="'+(S.tipo==='encarregado'?'on':'')+'">Encarregado</button><button type="button" data-t="estudante" class="'+(S.tipo==='estudante'?'on':'')+'">Estudante</button><button type="button" data-t="professor" class="'+(prof?'on':'')+'">Professor</button></div>'+
     '<form id="f1" novalidate>'+
     (fixo?'<input type="hidden" id="a-esc" value="'+esc(codigo)+'">':'<label class="field">Código da escola<input class="inp" id="a-esc" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="Ex.: josina" value="'+esc(codigo)+'"><span class="ac-hint">A secretaria da escola dá-lhe este código.</span></label>')+
     (enc
-      ? '<label class="field">O seu número de telemóvel<input class="inp mono" id="a-val" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="13" placeholder="84 123 4567" value="'+esc(S.valor)+'"><span class="ac-hint">O número que deu à escola na matrícula.</span></label>'
+      ? '<label class="field">O seu número de telemóvel<input class="inp mono" id="a-val" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="13" placeholder="84 123 4567" value="'+esc(S.valor)+'"><span class="ac-hint">'+(prof?'O número que deu à Direcção da escola.':'O número que deu à escola na matrícula.')+'</span></label>'
       : '<label class="field">Número de estudante<input class="inp mono" id="a-val" autocapitalize="characters" spellcheck="false" placeholder="Ex.: 2026-0001" value="'+esc(S.valor)+'"><span class="ac-hint">O código vai para o seu telemóvel ou para o do encarregado.</span></label>')+
     '<button class="btn pri" id="b1" type="submit">Receber código por SMS</button></form>'+
     (fixo?'<div class="ac-row"><span class="muted">Escola: <b class="mono" style="color:var(--ink)">'+esc(codigo)+'</b></span><button type="button" id="outra">Outra escola</button></div>':'');
@@ -96,11 +96,11 @@ function pedir(reenviar){
     codigo=($('#a-esc').value||'').trim().toLowerCase();
     S.valor=($('#a-val').value||'').trim();
     if(!codigo) return passo1('Escreva o código da escola.');
-    if(S.tipo==='encarregado' && S.valor.replace(/\D/g,'').replace(/^258/,'').length!==9) return passo1('Escreva o seu número de telemóvel com 9 dígitos.');
+    if(S.tipo!=='estudante' && S.valor.replace(/\D/g,'').replace(/^258/,'').length!==9) return passo1('Escreva o seu número de telemóvel com 9 dígitos.');
     if(S.tipo==='estudante' && !S.valor) return passo1('Escreva o seu número de estudante.');
   }
   if(btn) carregar(btn,true,reenviar?'':' A enviar…');
-  var corpo={escola:codigo, tipo:S.tipo}; if(S.tipo==='encarregado') corpo.telefone=S.valor; else corpo.numero=S.valor;
+  var corpo={escola:codigo, tipo:S.tipo}; if(S.tipo!=='estudante') corpo.telefone=S.valor; else corpo.numero=S.valor;
   post('/acesso-codigo',corpo).then(function(r){
     if(!r.ok){ if(reenviar){ passo2(r.erro); } else passo1(r.erro); return; }
     guardar('gs_escola',codigo);
@@ -142,8 +142,9 @@ function entrar(){
       $('#f2').insertAdjacentHTML('beforebegin','<div class="ac-msg err">'+esc(r.erro)+'</div>'); return;
     }
     clearInterval(S.timer);
-    guardar('gs_sessao',JSON.stringify({token:r.token,nome:r.nome,papel:r.papel,pagina:'portal',escola:r.escola,criada:Date.now()}));
-    location.replace('portal.html');
+    var pg=r.pagina==='professor'?'professor':'portal';
+    guardar('gs_sessao',JSON.stringify({token:r.token,nome:r.nome,papel:r.papel,pagina:pg,escola:r.escola,criada:Date.now()}));
+    location.replace(pg+'.html');
   });
 }
 

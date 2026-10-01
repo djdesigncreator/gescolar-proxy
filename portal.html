@@ -176,7 +176,7 @@ function casca(){
     '</div></header><main class="pt-main" id="pg"></main>'+
     '<nav class="pt-nav">'+ABAS.map(function(a){ return '<button class="'+(S.aba===a[0]?'on':'')+'" data-aba="'+a[0]+'">'+ic(a[2])+a[1]+(a[0]==='propinas'&&atraso?'<span class="bdg">'+atraso+'</span>':'')+'</button>'; }).join('')+'</nav></div>';
   $('#sair').onclick=sair;
-  $$('[data-kid]').forEach(function(b){ b.onclick=function(){ S.atual=b.getAttribute('data-kid'); S.sel={}; try{ localStorage.setItem('gs_educando',S.atual); }catch(x){} casca(); }; });
+  $$('[data-kid]').forEach(function(b){ b.onclick=function(){ S.atual=b.getAttribute('data-kid'); S.sel={}; S.tri=null; try{ localStorage.setItem('gs_educando',S.atual); }catch(x){} casca(); }; });
   $$('[data-aba]').forEach(function(b){ b.onclick=function(){ ir(b.getAttribute('data-aba')); }; });
   pagina();
 }
@@ -302,7 +302,30 @@ function pRecibos(){
 }
 
 /* ================= NOTAS E HORÁRIO (próxima fase) ================= */
-function pNotas(){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Notas e pautas</div>'+vazio('grade','As notas ainda não foram publicadas','Quando os professores lançarem as notas, aparecem aqui por disciplina e trimestre.'); }
+function pNotas(){
+  var e=educando(), L=(e&&e.notas)||[], ap=(S.d.escola.regras&&S.d.escola.regras.aprovacao)||10;
+  if(!L.length){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Notas</div>'+vazio('grade','As notas ainda não foram publicadas','Quando os professores publicarem as notas do trimestre, aparecem aqui por disciplina.'); return; }
+  var tris=[1,2,3].filter(function(t){ return L.some(function(d){ return d.trimestres[t]; }); });
+  if(S.tri==null || (S.tri!=='anual' && tris.indexOf(S.tri)<0)) S.tri=tris[tris.length-1];
+  function nota(v){ return v==null?'<span class="muted">—</span>':'<span style="color:'+(Math.round(v)>=ap?'var(--ok)':'var(--bad)')+'">'+String(Math.round(v*10)/10).replace('.',',')+'</span>'; }
+  var corpo;
+  if(S.tri==='anual'){
+    corpo='<div class="lista">'+L.map(function(d){ var ms=[1,2,3].map(function(t){ return d.trimestres[t]?d.trimestres[t].mt:null; }), v=ms.filter(function(x){ return x!=null; }), ma=v.length===3?v.reduce(function(a,b){return a+b;},0)/3:null;
+      return '<div class="pt-it"><div style="width:5px;align-self:stretch;border-radius:4px;background:'+esc(d.cor)+'"></div><div class="tx"><b>'+esc(d.disciplina)+'</b><small>1º '+nota(ms[0])+' · 2º '+nota(ms[1])+' · 3º '+nota(ms[2])+'</small></div><div class="vl"><small>Média anual</small><b>'+(ma==null?'<span class="muted">—</span>':nota(ma))+'</b></div></div>'; }).join('')+'</div>'+
+      '<p class="small muted" style="margin:10px 2px 0">A média anual aparece quando as notas dos 3 trimestres estiverem publicadas.</p>';
+  } else {
+    var linhas=L.filter(function(d){ return d.trimestres[S.tri]; });
+    var mts=linhas.map(function(d){ return d.trimestres[S.tri].mt; }).filter(function(v){ return v!=null; });
+    var neg=mts.filter(function(v){ return Math.round(v)<ap; }).length, med=mts.length?mts.reduce(function(a,b){return a+b;},0)/mts.length:null;
+    corpo='<div class="pt-g2"><div class="mini"><div class="l">Média do trimestre</div><div class="v">'+(med==null?'—':nota(med))+'</div><div class="d">'+mts.length+' disciplina(s)</div></div><div class="mini"><div class="l">Negativas</div><div class="v" style="color:'+(neg?'var(--bad)':'var(--ok)')+'">'+neg+'</div><div class="d">'+(neg?'Abaixo de '+ap+' valores':'Todas positivas')+'</div></div></div>'+
+      '<div class="lista">'+linhas.map(function(d){ var t=d.trimestres[S.tri];
+        return '<div class="pt-it" style="align-items:flex-start"><div style="width:5px;align-self:stretch;border-radius:4px;background:'+esc(d.cor)+'"></div><div class="tx"><b>'+esc(d.disciplina)+'</b><small>'+t.colunas.map(function(c){ return esc(c.nome)+': <b style="display:inline;font-size:13px">'+nota(c.nota)+'</b>'; }).join(' · ')+'</small>'+(t.completa?'':'<small style="color:var(--warn,#B7791F)">Ainda faltam notas deste trimestre.</small>')+'</div><div class="vl"><small>Média</small><b style="font-size:18px">'+nota(t.mt)+'</b></div></div>'; }).join('')+'</div>';
+  }
+  $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Notas · '+esc(e.nome.split(' ')[0])+'</div>'+
+    '<div class="dias">'+tris.map(function(t){ return '<button class="'+(S.tri===t?'on':'')+'" data-tri="'+t+'">'+t+'º trimestre</button>'; }).join('')+'<button class="'+(S.tri==='anual'?'on':'')+'" data-tri="anual">Ano</button></div>'+corpo+
+    '<p class="small muted" style="margin:12px 2px 0">Notas de 0 a 20. Positiva a partir de '+ap+'. Média do trimestre = (2 × média das ACS + ACP) ÷ 3.</p>';
+  $$('[data-tri]').forEach(function(b){ b.onclick=function(){ var v=b.getAttribute('data-tri'); S.tri=v==='anual'?'anual':+v; pNotas(); }; });
+}
 var DIAS_L=['','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'], DIAS_C=['','Seg','Ter','Qua','Qui','Sex','Sáb'];
 function pHorario(){
   var e=educando(), h=e&&e.horario;
