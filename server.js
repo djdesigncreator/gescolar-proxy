@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Presenças (v4.6): /prof/chamada /prof/chamada-guardar · Direcção: /presencas /chamadas-dia /falta-justificar · portal: faltas
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -33,7 +34,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.5.0';
+const VERSAO = 'gescolar-proxy 4.6.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1017,6 +1018,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
     return {
       id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', turma: t ? (t['Nome'] || '') : '',
       horario: await horarioDaTurma(req.escola, e['Turma'], cache).catch(err => { console.error('[portal] horário', err.message); return null; }),
+      faltas: await faltasDoEstudante(req.escola, e._id, cache).catch(err => { console.error('[portal] faltas', err.message); return []; }),
       notas: await notasDoEstudante(req.escola, e, cache).catch(err => { console.error('[portal] notas', err.message); return []; }),
       comunicados: await comunicadosPara(req.escola, [e['Turma']].filter(Boolean), cache).catch(err => { console.error('[portal] comunicados', err.message); return []; }),
       propinas: ps,
@@ -1318,11 +1320,14 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
     for (const [k, x] of Object.entries(g.aulas || {})) {
       if (x.p !== req.sessao.u) continue;
       const [dia, ti] = k.split('-').map(Number), t = g.tempos[ti]; if (!t) continue;
-      aulas.push({ dia, i: t.i, f: t.f, turma: TM[h['Turma']]['Nome'] || '', turma_id: h['Turma'], disciplina: (DM[x.d] || {})['Nome'] || '', cor: (DM[x.d] || {})['Cor'] || '#0A64DC', sala: x.s || '' });
+      aulas.push({ dia, tempo: ti, i: t.i, f: t.f, turma: TM[h['Turma']]['Nome'] || '', turma_id: h['Turma'], disciplina_id: x.d, disciplina: (DM[x.d] || {})['Nome'] || '', cor: (DM[x.d] || {})['Cor'] || '#0A64DC', sala: x.s || '' });
     }
   }
   aulas.sort((x, y) => x.dia - y.dia || x.i.localeCompare(y.i));
-  res.json({ ok: true,
+  const hoje = hojeMZ();
+  const feitas = (await procurarTodos('chamada', daEscola(req.escola).concat([{ key: 'Data', constraint_type: 'equals', value: hoje.data }]))).map(c => c['Turma'] + '|' + c['Tempo']);
+  aulas.forEach(x => { if (x.dia === hoje.dia) x.chamada = feitas.includes(x.turma_id + '|' + x.tempo); });
+  res.json({ ok: true, hoje,
     eu: { nome: eu['Nome'] || '', telefone: eu['Telefone'] || '' },
     escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', ano: escRaw['Ano Lectivo'] || '' },
     turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
@@ -1402,6 +1407,171 @@ async function notasDoEstudante(escola, est, cache) {
     o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa };
   }
   return Object.values(out).sort((a, b) => a.disciplina.localeCompare(b.disciplina, 'pt'));
+}
+
+// ============================================================
+//  PRESENÇAS E FALTAS (v4.6)
+//  Bubble, data types novos:
+//   Chamada: Escola (Escola) · Turma (text) · Data (text AAAA-MM-DD) · Tempo (number) · Disciplina (text) · Professor (text) · Sumario (text) · Feita Por (text)
+//   Falta:   Escola (Escola) · Turma (text) · Estudante (text) · Data (text) · Tempo (number) · Disciplina (text) · Tipo (text: F falta, A atraso, J justificada)
+//            · Chamada (text) · SMS (yes/no)
+//  Só os ausentes e atrasados criam registo em Falta. Hora de Moçambique (UTC+2).
+// ============================================================
+function hojeMZ(desvioDias) {
+  const d = new Date(Date.now() + 2 * 3600e3 + (desvioDias || 0) * 864e5);
+  return { data: d.toISOString().slice(0, 10), dia: d.getUTCDay() };
+}
+function diaDaSemana(data) { const d = new Date(data + 'T12:00:00Z'); return isNaN(d) ? -1 : d.getUTCDay(); }
+const dataOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && diaDaSemana(d) >= 0;
+const dmCurto = d => d.slice(8, 10) + '/' + d.slice(5, 7);
+// a aula (turma, data, tempo) existe no horário? devolve {disciplina, professor, i, f}
+async function aulaDoHorario(escola, turmaId, data, tempo) {
+  const h = (await procurar('horario', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }], 1))[0];
+  const g = h && lerGrelha(h['Grelha']); if (!g) return null;
+  const a = (g.aulas || {})[diaDaSemana(data) + '-' + Number(tempo)], t = (g.tempos || [])[Number(tempo)];
+  return a && t ? { disciplina: a.d, professor: a.p, i: t.i, f: t.f } : null;
+}
+async function chamadaDe(escola, turma, data, tempo) {
+  return (await procurar('chamada', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turma },
+    { key: 'Data', constraint_type: 'equals', value: data }, { key: 'Tempo', constraint_type: 'equals', value: Number(tempo) }], 1))[0] || null;
+}
+async function dadosChamada(escola, turmaId, data, tempo) {
+  const turma = await daMinhaEscola('turma', turmaId, escola);
+  const aula = await aulaDoHorario(escola, turmaId, data, tempo);
+  if (!aula) { const e = new Error('Não há aula desta turma nesse dia e tempo no horário.'); e.publico = 404; throw e; }
+  const [disc, ests, ch] = await Promise.all([obter('disciplina', aula.disciplina).catch(() => null),
+    procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }]), chamadaDe(escola, turmaId, data, tempo)]);
+  const faltas = ch ? await procurarTodos('falta', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Chamada', constraint_type: 'equals', value: ch._id }]) : [];
+  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, data, tempo: Number(tempo), i: aula.i, f: aula.f, professor: aula.professor,
+    disciplina: { id: aula.disciplina, nome: (disc && disc['Nome']) || '', cor: (disc && disc['Cor']) || '#0A64DC' },
+    estudantes: ests.filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt')).map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })),
+    feita: !!ch, chamada_id: ch ? ch._id : null, sumario: ch ? (ch['Sumario'] || '') : '', feita_por: ch ? (ch['Feita Por'] || '') : '',
+    marcas: Object.fromEntries(faltas.map(f => [f['Estudante'], f['Tipo'] || 'F'])) };
+}
+async function guardarChamada(req, res, quem, podeJustificar) {
+  const b = req.body || {};
+  const d = await dadosChamada(req.escola, String(b.turma || ''), String(b.data || ''), b.tempo);
+  const ids = new Set(d.estudantes.map(e => e.id)), novas = {};
+  for (const [est, t] of Object.entries(b.marcas || {})) {
+    if (!ids.has(est)) continue;
+    const tipo = String(t || '').toUpperCase();
+    if (tipo === 'F' || tipo === 'A' || (tipo === 'J' && (podeJustificar || d.marcas[est] === 'J'))) novas[est] = tipo;
+  }
+  // um professor não pode tirar uma justificação que a Direcção deu
+  if (!podeJustificar) for (const [est, t] of Object.entries(d.marcas)) if (t === 'J' && !novas[est]) novas[est] = 'J';
+  const campos = { 'Escola': req.escola, 'Turma': d.turma.id, 'Data': d.data, 'Tempo': d.tempo, 'Disciplina': d.disciplina.id, 'Professor': d.professor || '', 'Sumario': txt(b.sumario, 1000), 'Feita Por': quem };
+  let chId = d.chamada_id;
+  if (chId) await mudar('chamada', chId, campos); else chId = await criar('chamada', campos);
+  const existentes = await procurarTodos('falta', [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Chamada', constraint_type: 'equals', value: chId }]);
+  const avisar = [];
+  for (const f of existentes) {
+    const n = novas[f['Estudante']];
+    if (!n) await apagar('falta', f._id);
+    else if (n !== f['Tipo']) await mudar('falta', f._id, { 'Tipo': n });
+    if (n === 'F' && !f['SMS']) avisar.push(f);
+  }
+  for (const [est, tipo] of Object.entries(novas)) {
+    if (existentes.some(f => f['Estudante'] === est)) continue;
+    const id = await criar('falta', { 'Escola': req.escola, 'Turma': d.turma.id, 'Estudante': est, 'Data': d.data, 'Tempo': d.tempo, 'Disciplina': d.disciplina.id, 'Tipo': tipo, 'Chamada': chId, 'SMS': false });
+    if (tipo === 'F') avisar.push({ _id: id, 'Estudante': est });
+  }
+  let sms = 0;
+  if (b.sms && avisar.length && d.data === hojeMZ().data) {
+    const esc = await obter('escola', req.escola);
+    for (const f of avisar) {
+      const est = await obter('estudante', f['Estudante']).catch(() => null);
+      const enc = est && est['Encarregado'] ? await obter('encarregado', est['Encarregado']).catch(() => null) : null;
+      if (!enc || enc['Recebe SMS'] === false || tel9(enc['Telefone']).length !== 9) continue;
+      const r = await enviarSMS([enc['Telefone']], (esc['Nome'] || 'Escola') + ': ' + est['Nome'] + ' faltou hoje a ' + d.disciplina.nome + ' (' + d.i + '). Se a falta tiver justificacao, contacte a escola.');
+      if (r.ok) { sms++; await mudar('falta', f._id, { 'SMS': true }).catch(() => {}); }
+    }
+  }
+  const cont = { F: 0, A: 0, J: 0 }; Object.values(novas).forEach(t => cont[t]++);
+  res.json({ ok: true, chamada: chId, presentes: d.estudantes.length - cont.F - cont.J, faltas: cont.F, atrasos: cont.A, justificadas: cont.J, sms });
+}
+
+// ---------- professor ----------
+app.post('/prof/chamada', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!dataOk(b.data)) return erro(res, 400, 'Data inválida.');
+  const d = await dadosChamada(req.escola, String(b.turma || ''), b.data, b.tempo);
+  if (d.professor !== req.sessao.u) return erro(res, 403, 'Esta aula não é sua no horário.');
+  res.json({ ok: true, chamada: d });
+}));
+app.post('/prof/chamada-guardar', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!dataOk(b.data)) return erro(res, 400, 'Data inválida.');
+  if (b.data > hojeMZ().data) return erro(res, 400, 'Não pode fazer a chamada de um dia que ainda não chegou.');
+  if (b.data < hojeMZ(-14).data) return erro(res, 400, 'Só pode corrigir chamadas dos últimos 14 dias. Para datas anteriores, fale com a Direcção.');
+  const aula = await aulaDoHorario(req.escola, String(b.turma || ''), b.data, b.tempo);
+  if (!aula || aula.professor !== req.sessao.u) return erro(res, 403, 'Esta aula não é sua no horário.');
+  const eu = await obter('professor', req.sessao.u).catch(() => null);
+  await guardarChamada(req, res, 'Prof. ' + ((eu && eu['Nome']) || ''), false);
+}));
+
+// ---------- Direcção ----------
+app.post('/chamadas-dia', exigeDireccao, rota(async (req, res) => {
+  const data = dataOk((req.body || {}).data) ? req.body.data : hojeMZ().data, dia = diaDaSemana(data), f = daEscola(req.escola);
+  const [turmas, hs, discs, profs, chs, fs] = await Promise.all([procurarTodos('turma', f), procurarTodos('horario', f), procurarTodos('disciplina', f), procurarTodos('professor', f),
+    procurarTodos('chamada', f.concat([{ key: 'Data', constraint_type: 'equals', value: data }])), procurarTodos('falta', f.concat([{ key: 'Data', constraint_type: 'equals', value: data }]))]);
+  const TM = Object.fromEntries(turmas.filter(t => t['Activa'] !== false).map(t => [t._id, t])), DM = Object.fromEntries(discs.map(d => [d._id, d])), PM = Object.fromEntries(profs.map(p => [p._id, p['Nome']]));
+  const aulas = [];
+  for (const h of hs) {
+    const g = lerGrelha(h['Grelha']); if (!g || !TM[h['Turma']]) continue;
+    for (const [k, a] of Object.entries(g.aulas || {})) {
+      const [d, ti] = k.split('-').map(Number); if (d !== dia || !g.tempos[ti]) continue;
+      const ch = chs.find(c => c['Turma'] === h['Turma'] && Number(c['Tempo']) === ti);
+      const fx = ch ? fs.filter(x => x['Chamada'] === ch._id) : [];
+      aulas.push({ turma: h['Turma'], turma_nome: TM[h['Turma']]['Nome'] || '', tempo: ti, i: g.tempos[ti].i, f: g.tempos[ti].f, disciplina: (DM[a.d] || {})['Nome'] || '', cor: (DM[a.d] || {})['Cor'] || '#0A64DC',
+        professor: PM[a.p] || '', feita: !!ch, faltas: fx.filter(x => x['Tipo'] === 'F').length, atrasos: fx.filter(x => x['Tipo'] === 'A').length, sumario: ch ? (ch['Sumario'] || '') : '' });
+    }
+  }
+  aulas.sort((a, b) => a.i.localeCompare(b.i) || a.turma_nome.localeCompare(b.turma_nome, 'pt'));
+  res.json({ ok: true, data, dia, aulas });
+}));
+app.post('/chamada', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!dataOk(b.data)) return erro(res, 400, 'Data inválida.');
+  res.json({ ok: true, chamada: await dadosChamada(req.escola, String(b.turma || ''), b.data, b.tempo) });
+}));
+app.post('/chamada-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!dataOk(b.data) || b.data > hojeMZ().data) return erro(res, 400, 'Data inválida.');
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  await guardarChamada(req, res, (eu && eu['Nome Completo']) || 'Direcção', true);
+}));
+// resumo de assiduidade da turma num período
+app.post('/presencas', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const turma = await daMinhaEscola('turma', String(b.turma || ''), req.escola);
+  const de = dataOk(b.de) ? b.de : hojeMZ(-30).data, ate = dataOk(b.ate) ? b.ate : hojeMZ().data;
+  const f = daEscola(req.escola).concat([{ key: 'Turma', constraint_type: 'equals', value: turma._id }]);
+  const [ests, chs, fs, discs] = await Promise.all([procurarTodos('estudante', f), procurarTodos('chamada', f, 5000), procurarTodos('falta', f, 5000), procurarTodos('disciplina', daEscola(req.escola))]);
+  const DM = Object.fromEntries(discs.map(d => [d._id, d['Nome']]));
+  const ch = chs.filter(c => c['Data'] >= de && c['Data'] <= ate), fx = fs.filter(x => x['Data'] >= de && x['Data'] <= ate);
+  const aulas = ch.length;
+  res.json({ ok: true, turma: { id: turma._id, nome: turma['Nome'] || '' }, de, ate, aulas,
+    estudantes: ests.filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt')).map(e => {
+      const m = fx.filter(x => x['Estudante'] === e._id);
+      const F = m.filter(x => x['Tipo'] === 'F').length, J = m.filter(x => x['Tipo'] === 'J').length, A = m.filter(x => x['Tipo'] === 'A').length;
+      return { id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', faltas: F, justificadas: J, atrasos: A, presenca: aulas ? Math.round((aulas - F - J) * 100 / aulas) : null,
+        lista: m.sort((a, b) => String(b['Data']).localeCompare(String(a['Data'])) || Number(b['Tempo']) - Number(a['Tempo'])).map(x => ({ id: x._id, data: x['Data'], tempo: Number(x['Tempo']), disciplina: DM[x['Disciplina']] || '', tipo: x['Tipo'] || 'F' })) };
+    }) });
+}));
+app.post('/falta-justificar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const x = await daMinhaEscola('falta', String(b.id || ''), req.escola);
+  if (x['Tipo'] === 'A') return erro(res, 400, 'Os atrasos não se justificam.');
+  await mudar('falta', x._id, { 'Tipo': b.justificar ? 'J' : 'F' });
+  res.json({ ok: true, tipo: b.justificar ? 'J' : 'F' });
+}));
+
+// ---------- portal: faltas do educando ----------
+async function faltasDoEstudante(escola, estId, cache) {
+  if (!cache.discAll) cache.discAll = Object.fromEntries((await procurarTodos('disciplina', daEscola(escola))).map(d => [d._id, d]));
+  const fs = await procurarTodos('falta', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Estudante', constraint_type: 'equals', value: estId }], 1000);
+  return fs.map(x => ({ data: x['Data'], tempo: Number(x['Tempo']), disciplina: (cache.discAll[x['Disciplina']] || {})['Nome'] || '', tipo: x['Tipo'] || 'F' }))
+    .sort((a, b) => String(b.data).localeCompare(String(a.data)) || b.tempo - a.tempo);
 }
 
 // ============================================================
