@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="pt-MZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Factura-recibo · Gescolar</title>
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap">
+<style>
+:root{--blue:#0A64DC;--navy:#0B2A4A;--ink:#0E1B2E;--muted:#5A6A80;--line:#DCE4EF;--soft:#F2F5FA;--ok:#168A52;--bad:#C0392B;
+  --f-d:"Montserrat",system-ui,sans-serif;--f-b:"Source Sans 3",system-ui,sans-serif;--f-m:"JetBrains Mono",ui-monospace,monospace}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:#E7ECF3;color:var(--ink);font-family:var(--f-b);-webkit-font-smoothing:antialiased}
+.barra{position:sticky;top:0;z-index:5;display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 16px;background:var(--navy);color:#fff}
+.barra b{font-family:var(--f-d);font-size:15px;margin-right:auto;display:flex;align-items:center;gap:8px}
+.barra b img{width:22px;height:22px}
+.bt{display:inline-flex;align-items:center;gap:7px;height:38px;padding:0 14px;border-radius:9px;border:1px solid rgba(255,255,255,.25);background:transparent;color:#fff;font:600 14px var(--f-b);cursor:pointer;text-decoration:none}
+.bt:hover{background:rgba(255,255,255,.1)}
+.bt.pri{background:#FFD84D;border-color:#FFD84D;color:#2c2000}
+.bt.pri:hover{background:#F5CB2E}
+.bt[disabled]{opacity:.6;cursor:wait}
+.bt svg{width:16px;height:16px}
+.estado{max-width:520px;margin:60px auto;padding:0 16px;text-align:center;color:var(--muted);font-size:16px}
+.estado .sp{width:28px;height:28px;border:3px solid var(--line);border-top-color:var(--blue);border-radius:50%;margin:0 auto 14px;animation:g 1s linear infinite}
+@keyframes g{to{transform:rotate(360deg)}}
+.estado a{color:var(--blue);font-weight:600}
+#vista{padding:24px 0 48px;display:flex;justify-content:center}
+#escala{transform-origin:top center}
+
+/* ---------- folha A4 (794 px de largura; 1120 px de altura cabe numa página) ---------- */
+.folha{width:794px;min-height:1120px;background:#fff;box-shadow:0 10px 40px rgba(11,42,74,.16);padding:52px 56px 40px;position:relative;display:flex;flex-direction:column;font-size:13.5px;line-height:1.45}
+.topo{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;padding-bottom:22px;border-bottom:3px solid var(--navy)}
+.emissor{display:flex;gap:16px;align-items:flex-start;min-width:0}
+.emissor .lg{width:84px;height:84px;flex:none;display:grid;place-items:center}
+.emissor .lg img{max-width:84px;max-height:84px;object-fit:contain}
+.emissor .lg.ini{border-radius:14px;background:var(--navy);color:#fff;font:800 28px var(--f-d)}
+.emissor h1{font:800 20px/1.2 var(--f-d);margin:2px 0 6px;color:var(--navy)}
+.emissor p{margin:0;color:var(--muted);font-size:12.5px}
+.doc{text-align:right;flex:none}
+.doc .tp{font:800 12px var(--f-d);letter-spacing:.14em;text-transform:uppercase;color:var(--blue)}
+.doc .nr{font:600 19px var(--f-m);margin:6px 0 4px;color:var(--ink)}
+.doc p{margin:0;color:var(--muted);font-size:12.5px}
+.doc .orig{display:inline-block;margin-top:8px;font:700 10.5px var(--f-d);letter-spacing:.1em;text-transform:uppercase;border:1px solid var(--line);border-radius:5px;padding:3px 8px;color:var(--muted)}
+.partes{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:24px 0}
+.caixa{background:var(--soft);border-radius:10px;padding:14px 16px}
+.caixa .et{font:700 10.5px var(--f-d);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.caixa b{display:block;font-size:15px;color:var(--ink)}
+.caixa>span{display:block;color:var(--muted);font-size:12.5px}
+table{width:100%;border-collapse:collapse}
+thead th{font:700 10.5px var(--f-d);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);text-align:left;padding:10px 10px;border-bottom:1.5px solid var(--ink)}
+tbody td{padding:11px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+.r{text-align:right}
+.mono{font-family:var(--f-m);font-size:12.5px}
+tr{page-break-inside:avoid}
+.totais{display:flex;justify-content:space-between;gap:24px;margin-top:20px;align-items:flex-start}
+.extenso{flex:1;min-width:0;color:var(--muted);font-size:12.5px;padding-top:4px}
+.extenso b{color:var(--ink);font-weight:600}
+.soma{width:290px;flex:none}
+.soma div{display:flex;justify-content:space-between;padding:6px 0;color:var(--muted)}
+.soma div span:last-child{font-family:var(--f-m);color:var(--ink)}
+.soma .tot{margin-top:6px;padding:12px 14px;border-radius:10px;background:var(--navy);color:#fff}
+.soma .tot span{color:#fff!important;font-weight:700}
+.soma .tot span:last-child{font-size:17px}
+.pag{margin-top:26px;display:grid;grid-template-columns:1.25fr 1.6fr 1fr .7fr;gap:12px;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.pag .et{font:700 10px var(--f-d);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.pag b{display:block;font-size:13px;margin-top:3px;overflow-wrap:anywhere}
+.carimbo{display:inline-block;margin-top:18px;transform:rotate(-10deg);border:3px solid var(--ok);color:var(--ok);border-radius:10px;padding:4px 16px;font:800 26px var(--f-d);letter-spacing:.14em;opacity:.35}
+.rodape{margin-top:auto;padding-top:28px;display:flex;justify-content:space-between;gap:16px;align-items:flex-end;color:var(--muted);font-size:11.5px;border-top:1px solid var(--line)}
+.rodape .gs{display:flex;align-items:center;gap:8px}
+.rodape .gs img{width:20px;height:20px}
+.assin{margin-top:34px;display:flex;justify-content:flex-end}
+.assin div{width:240px;border-top:1px solid var(--ink);padding-top:6px;text-align:center;color:var(--muted);font-size:12px}
+
+@media print{
+  @page{size:A4;margin:0}
+  body{background:#fff}
+  .barra,.estado{display:none!important}
+  #vista{padding:0;display:block}
+  #escala{transform:none!important;height:auto!important}
+  .folha{box-shadow:none;width:210mm;min-height:297mm}
+}
+</style>
+</head>
+<body>
+<div class="barra">
+  <b><img src="logo.png" alt="">Factura-recibo</b>
+  <a class="bt" href="direccao.html#facturas" id="voltar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>Voltar</a>
+  <button class="bt" id="imprimir" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2M6 14h12v8H6z"/></svg>Imprimir</button>
+  <button class="bt pri" id="baixar" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Descarregar PDF</button>
+</div>
+<div class="estado" id="estado"><div class="sp"></div>A preparar a factura-recibo…</div>
+<div id="vista" hidden><div id="escala"></div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
+<script>
+(function(){
+'use strict';
+var PROXY = 'https://gescolar-proxy.onrender.com';
+function $(s){ return document.querySelector(s); }
+function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+function grp(n){ var v=Math.round((n||0)*100)/100, i=Math.floor(Math.abs(v)), c=Math.round((Math.abs(v)-i)*100); return (v<0?'-':'')+String(i).replace(/\B(?=(\d{3})+(?!\d))/g,' ')+','+String(c).padStart(2,'0'); }
+function mt(n){ return grp(n)+' MT'; }
+function data(iso){ if(!iso) return '—'; var d=new Date(iso); return isNaN(d)?'—':String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+d.getFullYear(); }
+function hora(iso){ if(!iso) return ''; var d=new Date(iso); return isNaN(d)?'':String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); }
+function estado(html){ var e=$('#estado'); e.hidden=false; e.innerHTML=html; $('#vista').hidden=true; }
+
+var METODO = { mpesa:'M-Pesa', emola:'e-Mola', cartao:'Visa / Mastercard', visa:'Visa / Mastercard', mastercard:'Visa / Mastercard', card:'Visa / Mastercard', balcao:'Numerário (secretaria)' };
+
+/* ---------- valor por extenso (português de Moçambique) ---------- */
+var UN=['zero','um','dois','três','quatro','cinco','seis','sete','oito','nove','dez','onze','doze','treze','catorze','quinze','dezasseis','dezassete','dezoito','dezanove'];
+var DZ=['','','vinte','trinta','quarenta','cinquenta','sessenta','setenta','oitenta','noventa'];
+var CT=['','cento','duzentos','trezentos','quatrocentos','quinhentos','seiscentos','setecentos','oitocentos','novecentos'];
+function ate999(n){
+  if(n===0) return '';
+  if(n===100) return 'cem';
+  var c=Math.floor(n/100), r=n%100, p=[];
+  if(c) p.push(CT[c]);
+  if(r){ if(r<20) p.push(UN[r]); else { var d=Math.floor(r/10), u=r%10; p.push(DZ[d]+(u?' e '+UN[u]:'')); } }
+  return p.join(' e ');
+}
+function extensoInteiro(n){
+  if(n===0) return 'zero';
+  var grupos=[], i=0; while(n>0){ grupos.push(n%1000); n=Math.floor(n/1000); i++; }
+  var nomes=[['',''],['mil','mil'],['milhão','milhões'],['mil milhões','mil milhões']], partes=[];
+  for(var g=grupos.length-1; g>=0; g--){
+    var v=grupos[g]; if(!v) continue;
+    var t = (g===1 && v===1) ? 'mil' : ate999(v)+(g? ' '+(v===1?nomes[g][0]:nomes[g][1]) : '');
+    partes.push({t:t,v:v,g:g});
+  }
+  var out='';
+  partes.forEach(function(p,k){
+    if(k>0){ var ult = k===partes.length-1; out += (ult && (p.v<100 || p.v%100===0)) ? ' e ' : ' '; }
+    out+=p.t;
+  });
+  return out;
+}
+function extenso(valor){
+  var v=Math.round((valor||0)*100), mts=Math.floor(v/100), cts=v%100;
+  var s=extensoInteiro(mts)+(mts===1?' metical':' meticais');
+  if(/(milhão|milhões)$/.test(extensoInteiro(mts))) s=extensoInteiro(mts)+' de meticais';
+  if(cts) s+=' e '+extensoInteiro(cts)+(cts===1?' centavo':' centavos');
+  return s.charAt(0).toUpperCase()+s.slice(1);
+}
+window.__extenso = extenso;
+
+/* ---------- sessão e pedido ---------- */
+var SES=null; try{ SES=JSON.parse(localStorage.getItem('gs_sessao')||'null'); }catch(e){}
+var id=''; try{ id=new URLSearchParams(location.search).get('id')||''; }catch(e){}
+if(SES && SES.pagina) $('#voltar').href = SES.pagina+'.html'+(SES.pagina==='direccao'?'#facturas':'');
+if(!SES || !SES.token){ estado('A sessão terminou. <a href="entrar.html">Entre outra vez</a> e abra a factura de novo.'); return; }
+if(!id){ estado('Falta indicar a factura. <a href="direccao.html#facturas">Voltar às facturas</a>'); return; }
+
+var R=null;
+fetch(PROXY+'/recibo',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SES.token},body:JSON.stringify({id:id})})
+  .then(function(r){ return r.json().catch(function(){ return {ok:false,erro:'Resposta inválida do servidor.'}; }).then(function(d){ d._st=r.status; return d; }); })
+  .then(function(d){
+    if(d._st===401){ estado('A sessão terminou. <a href="entrar.html">Entre outra vez</a> e abra a factura de novo.'); return; }
+    if(!d.ok){ estado(esc(d.erro||'Não foi possível abrir a factura.')+' <a href="'+esc($('#voltar').getAttribute('href'))+'">Voltar</a>'); return; }
+    R=d.recibo; desenhar();
+  })
+  .catch(function(){ estado('Sem ligação ao servidor do Gescolar. Na primeira vez do dia pode demorar alguns segundos. <a href="">Tentar de novo</a>'); });
+
+function desenhar(){
+  var E=R.escola||{}, est=R.estudante||{}, enc=R.encarregado||null;
+  var iniciais=String(E.nome||'?').trim().split(/\s+/).filter(function(w){ return w.length>2; }).slice(0,2).map(function(w){ return w[0]; }).join('').toUpperCase() || '?';
+  var linhas=R.linhas&&R.linhas.length ? R.linhas : [{descricao:'Pagamento de propinas', valor:R.valor-R.multa, multa:R.multa, total:R.valor}];
+  var sub=linhas.reduce(function(s,l){ return s+(l.valor||0); },0), mul=linhas.reduce(function(s,l){ return s+(l.multa||0); },0);
+  var local=[E.morada, [E.cidade,E.provincia].filter(Boolean).join(', ')].filter(Boolean).join(' · ');
+  var contactos=[E.telefone?'Tel. '+E.telefone:'', E.email].filter(Boolean).join(' · ');
+  var ref = R.metodo==='balcao' ? (R.recebido_por ? 'Recebido por '+R.recebido_por : 'Secretaria') : (R.transacao || R.referencia || '—');
+
+  var html =
+  '<div class="folha" id="folha">'+
+    
+    '<div class="topo">'+
+      '<div class="emissor">'+
+        (E.logotipo ? '<div class="lg"><img src="'+esc(E.logotipo)+'" alt=""></div>' : '<div class="lg ini">'+esc(iniciais)+'</div>')+
+        '<div><h1>'+esc(E.nome||'')+'</h1>'+
+          (E.nuit?'<p>NUIT <span class="mono">'+esc(E.nuit)+'</span></p>':'')+
+          (local?'<p>'+esc(local)+'</p>':'')+
+          (contactos?'<p>'+esc(contactos)+'</p>':'')+
+        '</div>'+
+      '</div>'+
+      '<div class="doc"><div class="tp">Factura-recibo</div><div class="nr">'+esc(R.documento)+'</div>'+
+        '<p>Data: <b style="color:var(--ink)">'+data(R.data)+'</b> '+esc(hora(R.data))+'</p><span class="orig">Original</span></div>'+
+    '</div>'+
+    '<div class="partes">'+
+      '<div class="caixa"><div class="et">Estudante</div><b>'+esc(est.nome||'—')+'</b>'+
+        '<span>Nº <span class="mono">'+esc(est.numero||'—')+'</span>'+(est.turma?' · Turma '+esc(est.turma):'')+'</span></div>'+
+      '<div class="caixa"><div class="et">Encarregado de educação</div><b>'+esc(enc?enc.nome:'Consumidor final')+'</b>'+
+        (enc&&enc.telefone?'<span>Tel. '+esc(enc.telefone)+'</span>':'')+(enc&&enc.email?'<span>'+esc(enc.email)+'</span>':'')+'</div>'+
+    '</div>'+
+    '<table><thead><tr><th style="width:44px">#</th><th>Descrição</th><th>Vencimento</th><th class="r">Valor</th><th class="r">Multa</th><th class="r">Total</th></tr></thead><tbody>'+
+      linhas.map(function(l,i){ return '<tr><td class="mono">'+(i+1)+'</td><td>'+esc(l.descricao)+'</td><td class="mono">'+data(l.vencimento)+'</td><td class="r mono">'+grp(l.valor)+'</td><td class="r mono">'+(l.multa?grp(l.multa):'—')+'</td><td class="r mono"><b>'+grp(l.total)+'</b></td></tr>'; }).join('')+
+    '</tbody></table>'+
+    '<div class="totais">'+
+      '<div class="extenso">Valor recebido por extenso:<br><b>'+esc(extenso(R.valor))+'</b><br><span class="carimbo">PAGO</span></div>'+
+      '<div class="soma"><div><span>Propinas</span><span>'+mt(sub)+'</span></div><div><span>Multas por atraso</span><span>'+mt(mul)+'</span></div>'+
+        '<div class="tot"><span>Total pago</span><span>'+mt(R.valor)+'</span></div></div>'+
+    '</div>'+
+    '<div class="pag">'+
+      '<div><div class="et">Forma de pagamento</div><b>'+esc(METODO[R.metodo]||R.metodo||'—')+'</b></div>'+
+      '<div><div class="et">'+(R.metodo==='balcao'?'Caixa':'Transacção')+'</div><b class="mono">'+esc(ref)+'</b></div>'+
+      '<div><div class="et">Telefone</div><b class="mono">'+esc(R.telefone||'—')+'</b></div>'+
+      '<div><div class="et">Estado</div><b style="color:var(--ok)">Pago</b></div>'+
+    '</div>'+
+    '<div class="assin"><div>A Secretaria</div></div>'+
+    '<div class="rodape"><div>Documento processado por computador.<br>Guarde este recibo como comprovativo do pagamento.</div>'+
+      '<div class="gs"><img src="logo.png" alt="">Gescolar · gescolar.co.mz</div></div>'+
+  '</div>';
+  $('#escala').innerHTML=html;
+  $('#estado').hidden=true; $('#vista').hidden=false;
+  document.title=R.documento+' · '+(E.nome||'Gescolar');
+  ajustar(); window.addEventListener('resize',ajustar);
+  $('#baixar').disabled=false; $('#imprimir').disabled=false;
+}
+
+/* no telemóvel a folha encolhe para caber no ecrã (só no ecrã; o PDF sai em A4 completo) */
+function ajustar(){
+  var f=$('#folha'), w=$('#escala'); if(!f) return;
+  var k=Math.min(1,(window.innerWidth-24)/794);
+  w.style.transform = k<1 ? 'scale('+k+')' : '';
+  w.style.height = k<1 ? (f.offsetHeight*k)+'px' : '';
+}
+
+function nomeFicheiro(){ return (String(R.documento||'factura').replace(/[^\w-]+/g,'-').replace(/-+/g,'-').replace(/^-|-$/g,'') || 'factura-recibo')+'.pdf'; }
+
+$('#imprimir').onclick=function(){ window.print(); };
+$('#baixar').onclick=function(){
+  var b=this;
+  if(typeof window.html2pdf!=='function'){ window.print(); return; }   // se a biblioteca não carregar, usa "Guardar como PDF" do navegador
+  b.disabled=true; var t=b.innerHTML; b.innerHTML='A gerar o PDF…';
+  var w=$('#escala'), tr=w.style.transform; w.style.transform='';
+  var pronto = (document.fonts && document.fonts.ready) ? document.fonts.ready : Promise.resolve();
+  pronto.then(function(){
+    return window.html2pdf().set({
+      margin:0, filename:nomeFicheiro(),
+      image:{type:'jpeg',quality:0.96},
+      html2canvas:{scale:2, useCORS:true, backgroundColor:'#ffffff', scrollX:0, scrollY:0},
+      jsPDF:{unit:'mm', format:'a4', orientation:'portrait'},
+      pagebreak:{mode:['css','legacy']}
+    }).from($('#folha')).save();
+  }).catch(function(){ window.print(); })
+  .then(function(){ w.style.transform=tr; ajustar(); b.disabled=false; b.innerHTML=t; });
+};
+})();
+</script>
+</body>
+</html>
