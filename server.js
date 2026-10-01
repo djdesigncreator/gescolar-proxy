@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Escola de condução 3 (v5.2): /exames /exame-marcar /exame-resultado · /prof/aula-estado · portal com aulas e exames
 //    Escola de condução 2 (v5.1): /viaturas /viatura-guardar /viatura-apagar /aulas-praticas /aula-marcar /aula-estado
 //    Escola de condução 1 (v5.0): /cursos /curso-guardar /curso-apagar /instruendos /inscrever /inscricao-estado
 //    Convites aos professores (v4.10): SMS automático ao registar · /professor-convite /professores-convite
@@ -41,7 +42,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.1.0';
+const VERSAO = 'gescolar-proxy 5.2.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1038,6 +1039,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
       horario: await horarioDaTurma(req.escola, e['Turma'], cache).catch(err => { console.error('[portal] horário', err.message); return null; }),
       faltas: await faltasDoEstudante(req.escola, e._id, cache).catch(err => { console.error('[portal] faltas', err.message); return []; }),
       notas: await notasDoEstudante(req.escola, e, cache).catch(err => { console.error('[portal] notas', err.message); return []; }),
+      conducao: await conducaoDoEstudante(req.escola, e._id, cache).catch(err => { console.error('[portal] condução', err.message); return null; }),
       comunicados: await comunicadosPara(req.escola, [e['Turma']].filter(Boolean), cache).catch(err => { console.error('[portal] comunicados', err.message); return []; }),
       propinas: ps,
       divida: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
@@ -1352,6 +1354,7 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
       estudantes: ests.filter(e => e['Turma'] === p.turma && (e['Estado'] || 'activo') === 'activo').length }))
       .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt')),
     aulas,
+    conducao: await praticasDoInstrutor(req.escola, req.sessao.u).catch(err => { console.error('[prof] condução', err.message); return null; }),
     comunicados: cs.filter(c => !c['Turma']).map(c => comOut(c)).sort((x, y) => String(y.data || '').localeCompare(String(x.data || ''))).slice(0, 10) });
 }));
 app.post('/prof/pauta', exigeProfessor, rota(async (req, res) => {
@@ -2222,6 +2225,106 @@ app.post('/aula-estado', exigeDireccao, rota(async (req, res) => {
   await mudar('aulapratica', a._id, mud);
   res.json({ ok: true, estado });
 }));
+
+// ============================================================
+//  ESCOLA DE CONDUÇÃO · PARTE 3: EXAMES, INSTRUTOR E PORTAL (v5.2)
+//  Bubble:
+//   Exame Conducao: Escola (Escola) · Estudante (text) · Inscricao (text) · Tipo (text: codigo | conducao) · Data (text AAAA-MM-DD)
+//                   · Hora (text) · Local (text) · Resultado (text: marcado | aprovado | reprovado | faltou) · Tentativa (number) · Notas (text)
+//  Regra: o exame de condução só se marca depois de aprovado no exame de código.
+//  Aprovado no exame de condução → a inscrição passa a "concluida" e o instruendo recebe os parabéns por SMS.
+// ============================================================
+const TIPO_EXAME = { codigo: 'Exame de código', conducao: 'Exame de condução' };
+const exameOut = (x, D) => { const e = (D && D.EM[x['Estudante']]) || {}, i = (D && D.IM[x['Inscricao']]) || {};
+  return { id: x._id, tipo: x['Tipo'] || 'codigo', tipo_nome: TIPO_EXAME[x['Tipo']] || 'Exame', data: x['Data'] || '', hora: x['Hora'] || '', local: x['Local'] || '', resultado: x['Resultado'] || 'marcado',
+    tentativa: Number(x['Tentativa'] || 1), notas: x['Notas'] || '', estudante: x['Estudante'], instruendo: e['Nome'] || '', numero: e['Numero'] || '', categoria: i['Categoria'] || '', inscricao: x['Inscricao'] }; };
+app.post('/exames', exigeDireccao, rota(async (req, res) => {
+  const [D, xs] = await Promise.all([dadosAulas(req.escola), procurarTodos('exameconducao', daEscola(req.escola), 5000)]);
+  const hoje = hojeMZ().data;
+  res.json({ ok: true, hoje,
+    exames: xs.map(x => exameOut(x, D)).sort((a, b) => (b.data.localeCompare(a.data)) || (b.tentativa - a.tentativa) || b.hora.localeCompare(a.hora)),
+    inscricoes: D.ins.filter(i => (i['Estado'] || 'activa') === 'activa').map(i => {
+      const meus = xs.filter(x => x['Inscricao'] === i._id);
+      return Object.assign({ id: i._id, nome: (D.EM[i['Estudante']] || {})['Nome'] || '', numero: (D.EM[i['Estudante']] || {})['Numero'] || '', categoria: i['Categoria'] || '',
+        codigo_aprovado: meus.some(x => x['Tipo'] === 'codigo' && x['Resultado'] === 'aprovado') }, progressoInscricao(i, D)); }).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/exame-marcar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, tipo = b.tipo === 'conducao' ? 'conducao' : 'codigo';
+  const i = await daMinhaEscola('inscricaoconducao', String(b.inscricao || ''), req.escola);
+  if ((i['Estado'] || 'activa') !== 'activa') return erro(res, 400, 'Esta inscrição já não está em curso.');
+  if (!dataOk(b.data)) return erro(res, 400, 'Escolha a data do exame.');
+  if (b.hora && !HHMM.test(b.hora)) return erro(res, 400, 'Hora inválida.');
+  const xs = await procurarTodos('exameconducao', daEscola(req.escola).concat([{ key: 'Inscricao', constraint_type: 'equals', value: i._id }]));
+  if (xs.some(x => x['Tipo'] === tipo && (x['Resultado'] || 'marcado') === 'marcado')) return erro(res, 409, 'Já há um ' + TIPO_EXAME[tipo].toLowerCase() + ' marcado para este instruendo. Registe primeiro o resultado.');
+  if (tipo === 'conducao' && !xs.some(x => x['Tipo'] === 'codigo' && x['Resultado'] === 'aprovado')) return erro(res, 400, 'O instruendo ainda não foi aprovado no exame de código.');
+  if (tipo === 'codigo' && xs.some(x => x['Tipo'] === 'codigo' && x['Resultado'] === 'aprovado')) return erro(res, 400, 'O instruendo já foi aprovado no exame de código.');
+  const tentativa = xs.filter(x => x['Tipo'] === tipo && ['aprovado', 'reprovado', 'faltou'].includes(x['Resultado'])).length + 1;
+  const id = await criar('exameconducao', { 'Escola': req.escola, 'Estudante': i['Estudante'], 'Inscricao': i._id, 'Tipo': tipo, 'Data': b.data, 'Hora': b.hora || '', 'Local': txt(b.local, 80), 'Resultado': 'marcado', 'Tentativa': tentativa, 'Notas': txt(b.notas, 300) });
+  let sms = false;
+  if (b.sms) {
+    const [e, esc] = await Promise.all([obter('estudante', i['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null)]);
+    if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': ' + TIPO_EXAME[tipo].toLowerCase() + ' da carta ' + i['Categoria'] + ' marcado para ' + dmCurto(b.data) + (b.hora ? ' as ' + b.hora : '') + (b.local ? ', ' + txt(b.local, 60) : '') + '. Leve o BI. Boa sorte!')).ok;
+  }
+  res.json({ ok: true, id, tentativa, sms });
+}));
+app.post('/exame-resultado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, r = String(b.resultado || '');
+  if (!['marcado', 'aprovado', 'reprovado', 'faltou'].includes(r)) return erro(res, 400, 'Resultado inválido.');
+  const x = await daMinhaEscola('exameconducao', String(b.id || ''), req.escola);
+  if (r !== 'marcado' && x['Data'] > hojeMZ().data) return erro(res, 400, 'O exame ainda não aconteceu.');
+  await mudar('exameconducao', x._id, { 'Resultado': r });
+  let concluida = false, sms = false;
+  if (x['Tipo'] === 'conducao' && r === 'aprovado') {
+    await mudar('inscricaoconducao', x['Inscricao'], { 'Estado': 'concluida' }).catch(() => {});
+    concluida = true;
+    const [e, esc, i] = await Promise.all([obter('estudante', x['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null), obter('inscricaoconducao', x['Inscricao']).catch(() => null)]);
+    if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': parabens, ' + String(e['Nome'] || '').split(' ')[0] + '! Foi aprovado no exame de conducao da carta ' + ((i && i['Categoria']) || '') + '. Boa estrada!')).ok;
+  }
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, resultado: r, concluida, sms });
+}));
+
+// ---------- instrutor: as suas aulas práticas ----------
+async function praticasDoInstrutor(escola, profId) {
+  const f = daEscola(escola);
+  const aps = (await procurarTodos('aulapratica', f.concat([{ key: 'Instrutor', constraint_type: 'equals', value: profId }]), 5000));
+  if (!aps.length) return null;
+  const D = await dadosAulas(escola);
+  const hoje = hojeMZ().data, ate = hojeMZ(7).data, antes = hojeMZ(-7).data;
+  return { hoje, aulas: aps.filter(a => a['Data'] >= antes && a['Data'] <= ate && a['Estado'] !== 'cancelada').map(a => aulaOut(a, D)).sort((x, y) => (x.data + x.inicio).localeCompare(y.data + y.inicio)),
+    feitas_mes: aps.filter(a => a['Estado'] === 'feita' && String(a['Data']).slice(0, 7) === hoje.slice(0, 7)).length };
+}
+app.post('/prof/aula-estado', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {}, estado = String(b.estado || '');
+  if (!['feita', 'faltou', 'marcada'].includes(estado)) return erro(res, 400, 'Estado inválido.');
+  const a = await daMinhaEscola('aulapratica', String(b.id || ''), req.escola);
+  if (a['Instrutor'] !== req.sessao.u) return erro(res, 403, 'Esta aula não é sua.');
+  if (a['Estado'] === 'cancelada') return erro(res, 400, 'Esta aula foi cancelada pela escola.');
+  if (estado !== 'marcada' && a['Data'] > hojeMZ().data) return erro(res, 400, 'Esta aula ainda não aconteceu.');
+  if (a['Data'] < hojeMZ(-7).data) return erro(res, 400, 'Só pode corrigir aulas dos últimos 7 dias. Fale com a escola.');
+  const mud = { 'Estado': estado }; if (b.notas !== undefined) mud['Notas'] = txt(b.notas, 300);
+  await mudar('aulapratica', a._id, mud);
+  res.json({ ok: true, estado });
+}));
+
+// ---------- portal: o percurso do instruendo ----------
+async function conducaoDoEstudante(escola, estId, cache) {
+  const f = daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: estId }]);
+  const ins = await procurarTodos('inscricaoconducao', f);
+  if (!ins.length) return null;
+  const i = ins.filter(x => (x['Estado'] || 'activa') === 'activa')[0] || ins.sort((a, b) => String(b['Created Date'] || '').localeCompare(String(a['Created Date'] || '')))[0];
+  const [c, aps, xs] = await Promise.all([obter('cursoconducao', i['Curso']).catch(() => null), procurarTodos('aulapratica', f, 2000), procurarTodos('exameconducao', f, 200)]);
+  if (!cache.profs) cache.profs = Object.fromEntries((await procurarTodos('professor', daEscola(escola))).map(p => [p._id, p['Nome'] || '']));
+  if (!cache.vias) cache.vias = Object.fromEntries((await procurarTodos('viatura', daEscola(escola))).map(v => [v._id, v]));
+  const minhas = aps.filter(a => a['Inscricao'] === i._id), hoje = hojeMZ().data;
+  return { categoria: i['Categoria'] || '', curso: (c && c['Nome']) || '', estado: i['Estado'] || 'activa', teoricas: Number((c && c['Aulas Teoricas']) || 0),
+    praticas: { feitas: minhas.filter(a => a['Estado'] === 'feita').length, faltou: minhas.filter(a => a['Estado'] === 'faltou').length, total: Number((c && c['Aulas Praticas']) || 0), minutos: minhas.filter(a => a['Estado'] === 'feita').reduce((x, a) => x + Number(a['Minutos'] || 0), 0) },
+    proximas: minhas.filter(a => a['Estado'] === 'marcada' && a['Data'] >= hoje).sort((a, b) => (a['Data'] + a['Inicio']).localeCompare(b['Data'] + b['Inicio'])).slice(0, 10)
+      .map(a => ({ data: a['Data'], inicio: a['Inicio'], fim: a['Fim'], instrutor: cache.profs[a['Instrutor']] || '', viatura: (cache.vias[a['Viatura']] || {})['Matricula'] || '', modelo: (cache.vias[a['Viatura']] || {})['Marca Modelo'] || '' })),
+    historico: minhas.filter(a => ['feita', 'faltou'].includes(a['Estado'])).sort((a, b) => (b['Data'] + b['Inicio']).localeCompare(a['Data'] + a['Inicio'])).slice(0, 20)
+      .map(a => ({ data: a['Data'], inicio: a['Inicio'], estado: a['Estado'], instrutor: cache.profs[a['Instrutor']] || '', notas: a['Notas'] || '' })),
+    exames: xs.filter(x => x['Inscricao'] === i._id).map(x => exameOut(x)).sort((a, b) => (b.data.localeCompare(a.data)) || (b.tentativa - a.tentativa) || b.hora.localeCompare(a.hora)) };
+}
 
 // ============================================================
 //  WEBHOOK DA MOZPAYMENT
