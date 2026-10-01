@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Convites aos professores (v4.10): SMS automático ao registar · /professor-convite /professores-convite
 //    Palavra-passe e equipa (v4.9): /senha-pedir /senha-nova (código por SMS) · /equipa /equipa-criar /equipa-estado
 //    Assinatura e plataforma (v4.8): /assinatura /assinatura-pagar /assinatura-estado · /pl/resumo /pl/escola /pl/escola-guardar
 //                                    /pl/transferencia /pl/transferencia-apagar  (PLATAFORMA_EMAILS)
@@ -38,7 +39,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.9.0';
+const VERSAO = 'gescolar-proxy 4.10.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -444,10 +445,12 @@ app.post('/professor-guardar', exigeDireccao, rota(async (req, res) => {
   const campos = { 'Escola': req.escola, 'Nome': nome, 'Telefone': txt(b.telefone, 30), 'Email': email, 'Disciplinas': Array.isArray(b.disciplinas) ? b.disciplinas.map(String) : [],
     'Monodocencia': !!b.monodocencia, 'Desde': num(b.desde, new Date().getFullYear()), 'Activo': true };
   if (b.licenca) campos['Licenca Instrutor'] = txt(b.licenca, 30);
-  let id = b.id ? String(b.id) : null;
+  let id = b.id ? String(b.id) : null, novo = !id;
   if (id) { await daMinhaEscola('professor', id, req.escola); await mudar('professor', id, campos); }
   else id = await criar('professor', campos);
-  res.json({ ok: true, id });
+  let sms = false;
+  if (novo && b.convidar !== false && tel9(campos['Telefone']).length === 9) sms = await convidarProfessor(req.escola, Object.assign({ _id: id }, campos)).catch(() => false);
+  res.json({ ok: true, id, sms });
 }));
 app.post('/professor-apagar', exigeDireccao, rota(async (req, res) => {
   const id = String((req.body || {}).id || '');
@@ -1944,6 +1947,34 @@ app.post('/equipa-estado', exigeSoDireccao, rota(async (req, res) => {
   if (!u || u['Escola'] !== req.escola) return erro(res, 404, 'Utilizador não encontrado.');
   await mudar('user', id, { 'Activo': !!b.activo });
   res.json({ ok: true, activo: !!b.activo });
+}));
+
+// ============================================================
+//  CONVITES AOS PROFESSORES (v4.10)
+//  O professor entra em acesso.html?e=<código da escola> → Professor → telemóvel → código SMS.
+// ============================================================
+async function convidarProfessor(escolaId, p, escRaw) {
+  const tel = tel9(p['Telefone']); if (tel.length !== 9) return false;
+  const esc = escRaw || await obter('escola', escolaId);
+  const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
+  const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre em ' + link + ' , escolha Professor e use este numero.');
+  return r.ok;
+}
+app.post('/professor-convite', exigeDireccao, rota(async (req, res) => {
+  const p = await daMinhaEscola('professor', String((req.body || {}).id || ''), req.escola);
+  if (tel9(p['Telefone']).length !== 9) return erro(res, 400, 'Este professor não tem telemóvel registado. Edite-o e acrescente o número.');
+  if (travao('conv-prof|' + p._id, 3, 60)) return erro(res, 429, 'Já enviou o acesso a este professor várias vezes. Tente daqui a uma hora.');
+  if (!await convidarProfessor(req.escola, p)) return erro(res, 502, 'O SMS não foi enviado. Tente mais tarde.');
+  res.json({ ok: true });
+}));
+app.post('/professores-convite', exigeDireccao, rota(async (req, res) => {
+  if (travao('conv-profs|' + req.escola, 1, 60)) return erro(res, 429, 'O convite já foi enviado há pouco. Pode voltar a enviar daqui a uma hora.');
+  const [esc, profs] = await Promise.all([obter('escola', req.escola), procurarTodos('professor', daEscola(req.escola))]);
+  const alvo = profs.filter(p => p['Activo'] !== false && tel9(p['Telefone']).length === 9);
+  if (!alvo.length) return erro(res, 400, 'Nenhum professor tem telemóvel registado.');
+  let enviados = 0;
+  for (const p of alvo) if (await convidarProfessor(req.escola, p, esc).catch(() => false)) enviados++;
+  res.json({ ok: true, enviados, sem_telefone: profs.filter(p => p['Activo'] !== false).length - alvo.length });
 }));
 
 // ============================================================
