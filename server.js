@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Painel (v4.7): /painel-indicadores — dinheiro, chamadas de hoje, faltas, notas por trimestre
 //    Presenças (v4.6): /prof/chamada /prof/chamada-guardar · Direcção: /presencas /chamadas-dia /falta-justificar · portal: faltas
 //
 //  Variáveis de ambiente:
@@ -34,7 +35,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.6.0';
+const VERSAO = 'gescolar-proxy 4.7.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1573,6 +1574,94 @@ async function faltasDoEstudante(escola, estId, cache) {
   return fs.map(x => ({ data: x['Data'], tempo: Number(x['Tempo']), disciplina: (cache.discAll[x['Disciplina']] || {})['Nome'] || '', tipo: x['Tipo'] || 'F' }))
     .sort((a, b) => String(b.data).localeCompare(String(a.data)) || b.tempo - a.tempo);
 }
+
+// ============================================================
+//  PAINEL DA DIRECÇÃO COM NÚMEROS REAIS (v4.7)
+//  POST /painel-indicadores   (guarda 60 s em memória por escola; { fresco:true } força)
+// ============================================================
+const cachePainel = new Map();
+app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
+  const c = cachePainel.get(req.escola);
+  if (c && !(req.body || {}).fresco && Date.now() - c.t < 60e3) return res.json(c.d);
+  const f = daEscola(req.escola), hoje = hojeMZ(), mes = hoje.data.slice(0, 7);
+  const [escola, ests, turmas, props, pags, chsHoje, faltas, pautas, a, discs] = await Promise.all([
+    resumoEscola(req.escola), procurarTodos('estudante', f), procurarTodos('turma', f), procurarTodos('propina', f, 20000), procurarTodos('pagamento', f, 20000),
+    procurarTodos('chamada', f.concat([{ key: 'Data', constraint_type: 'equals', value: hoje.data }])), procurarTodos('falta', f, 20000), procurarTodos('pauta', f, 5000),
+    atribuicoes(req.escola), procurarTodos('disciplina', f)]);
+  const regras = (escola && escola.regras) || {}, ap = Number(regras.aprovacao || 10);
+  const activos = ests.filter(e => (e['Estado'] || 'activo') === 'activo'), EM = Object.fromEntries(ests.map(e => [e._id, e]));
+  const TM = Object.fromEntries(turmas.filter(t => t['Activa'] !== false).map(t => [t._id, t])), DM = Object.fromEntries(discs.map(d => [d._id, d]));
+  const PM = Object.fromEntries(a.profs.map(p => [p._id, p['Nome'] || '']));
+  const dataMZ = iso => iso ? new Date(new Date(iso).getTime() + 2 * 3600e3).toISOString().slice(0, 10) : '';
+
+  // --- dinheiro ---
+  const pagos = pags.filter(p => p['Estado'] === 'pago');
+  const meses = []; for (let k = 5; k >= 0; k--) { const d = new Date(hoje.data + 'T12:00:00Z'); d.setUTCDate(1); d.setUTCMonth(d.getUTCMonth() - k); meses.push(d.toISOString().slice(0, 7)); }
+  const serie = meses.map(m => ({ mes: m, valor: pagos.filter(p => dataMZ(p['Pago Em']).slice(0, 7) === m).reduce((x, p) => x + Number(p['Valor'] || 0), 0) }));
+  const doMes = pagos.filter(p => dataMZ(p['Pago Em']).slice(0, 7) === mes);
+  const porMetodo = {}; doMes.forEach(p => { const k = p['Metodo'] || 'outro'; porMetodo[k] = (porMetodo[k] || 0) + Number(p['Valor'] || 0); });
+  const divida = {}; let atraso = 0, multas = 0, aVencer = 0;
+  for (const p of props) {
+    if (p['Estado'] === 'anulada' || p['Estado'] === 'paga' || !EM[p['Estudante']] || (EM[p['Estudante']]['Estado'] || 'activo') !== 'activo') continue;
+    const cp = calcPropina(p, regras);
+    if (cp.estado === 'atrasada') { atraso += cp.total; multas += cp.multa; divida[p['Estudante']] = (divida[p['Estudante']] || 0) + cp.total; }
+    else if (String(p['Vencimento'] || '').slice(0, 7) === mes) aVencer += cp.total;
+  }
+  const devedores = Object.entries(divida).sort((x, y) => y[1] - x[1]).slice(0, 5).map(([id, v]) => ({ id, nome: EM[id]['Nome'] || '', numero: EM[id]['Numero'] || '', turma: (TM[EM[id]['Turma']] || {})['Nome'] || '', divida: v }));
+  const ultimos = pagos.slice().sort((x, y) => String(y['Pago Em'] || '').localeCompare(String(x['Pago Em'] || ''))).slice(0, 5)
+    .map(p => ({ id: p._id, documento: p['Documento'] || '', data: p['Pago Em'], valor: Number(p['Valor'] || 0), metodo: p['Metodo'] || '', estudante: (EM[p['Estudante']] || {})['Nome'] || '' }));
+
+  // --- hoje: aulas e chamadas ---
+  const aulasHoje = [];
+  for (const h of a.hs) {
+    const g = lerGrelha(h['Grelha']); if (!g || !TM[h['Turma']]) continue;
+    for (const [k, x] of Object.entries(g.aulas || {})) {
+      const [d, ti] = k.split('-').map(Number); if (d !== hoje.dia || !g.tempos[ti]) continue;
+      aulasHoje.push({ turma: TM[h['Turma']]['Nome'] || '', turma_id: h['Turma'], tempo: ti, i: g.tempos[ti].i, f: g.tempos[ti].f, disciplina: (DM[x.d] || {})['Nome'] || '', professor: PM[x.p] || '',
+        feita: chsHoje.some(c => c['Turma'] === h['Turma'] && Number(c['Tempo']) === ti) });
+    }
+  }
+  aulasHoje.sort((x, y) => x.i.localeCompare(y.i));
+  const agora = new Date(Date.now() + 2 * 3600e3).toISOString().slice(11, 16);
+  const atrasadas = aulasHoje.filter(x => !x.feita && x.i <= agora);
+
+  // --- faltas ---
+  const d7 = hojeMZ(-6).data, d30 = hojeMZ(-29).data;
+  const fx = faltas.filter(x => EM[x['Estudante']]);
+  const porDia = []; for (let k = 6; k >= 0; k--) { const d = hojeMZ(-k).data; porDia.push({ data: d, faltas: fx.filter(x => x['Data'] === d && x['Tipo'] === 'F').length }); }
+  const cont30 = {}; fx.filter(x => x['Data'] >= d30 && x['Tipo'] === 'F').forEach(x => { cont30[x['Estudante']] = (cont30[x['Estudante']] || 0) + 1; });
+  const maisFaltas = Object.entries(cont30).sort((x, y) => y[1] - x[1]).slice(0, 5).map(([id, n]) => ({ id, nome: EM[id]['Nome'] || '', turma: (TM[EM[id]['Turma']] || {})['Nome'] || '', faltas: n }));
+
+  // --- notas do trimestre ---
+  const tri = (m => m <= 5 ? 1 : m <= 8 ? 2 : 3)(Number(hoje.data.slice(5, 7)));
+  const pt = pautas.filter(p => Number(p['Trimestre']) === tri);
+  const pares = a.pares.filter(p => TM[p.turma] && DM[p.disciplina]);
+  const semNotas = {}; let comNotas = 0;
+  for (const p of pares) {
+    const reg = pt.find(x => x['Turma'] === p.turma && x['Disciplina'] === p.disciplina);
+    const g = reg && lerGrelha(reg['Grelha']);
+    if (g && Object.keys(g.notas || {}).length) { comNotas++; continue; }
+    for (const pid of (p.professores.size ? p.professores : new Set(['']))) {
+      const k = pid || 'sem'; (semNotas[k] = semNotas[k] || { professor: PM[pid] || 'Sem professor', pendentes: [] }).pendentes.push((DM[p.disciplina]['Nome'] || '') + ' · ' + (TM[p.turma]['Nome'] || ''));
+    }
+  }
+  const aproveitamento = Object.values(TM).map(t => {
+    let pos = 0, n = 0;
+    for (const reg of pt.filter(x => x['Turma'] === t._id)) { const g = lerGrelha(reg['Grelha']); if (!g) continue; for (const eid of Object.keys(g.notas || {})) { const m = mediasPauta(g, eid); if (m.mt == null) continue; n++; if (Math.round(m.mt) >= ap) pos++; } }
+    return { turma: t['Nome'] || '', notas: n, positivas: pos, pct: n ? Math.round(pos * 100 / n) : null };
+  }).sort((x, y) => x.turma.localeCompare(y.turma, 'pt'));
+
+  const d = { ok: true, gerado: new Date().toISOString(), hoje: hoje.data, dia: hoje.dia, mes,
+    dinheiro: { recebido_mes: doMes.reduce((x, p) => x + Number(p['Valor'] || 0), 0), recebido_hoje: pagos.filter(p => dataMZ(p['Pago Em']) === hoje.data).reduce((x, p) => x + Number(p['Valor'] || 0), 0),
+      pagamentos_mes: doMes.length, em_atraso: atraso, multas, a_vencer: aVencer, estudantes_atraso: Object.keys(divida).length, por_metodo: porMetodo, serie, devedores, ultimos },
+    hoje_aulas: { total: aulasHoje.length, feitas: aulasHoje.filter(x => x.feita).length, por_fazer: atrasadas.slice(0, 8), faltas: fx.filter(x => x['Data'] === hoje.data && x['Tipo'] === 'F').length },
+    faltas: { semana: fx.filter(x => x['Data'] >= d7 && x['Tipo'] === 'F').length, mes: fx.filter(x => x['Data'] >= d30 && x['Tipo'] === 'F').length, por_dia: porDia, mais_faltas: maisFaltas },
+    notas: { trimestre: tri, pares: pares.length, com_notas: comNotas,
+      publicadas: pt.filter(x => x['Publicado']).length, aproveitamento, sem_notas: Object.values(semNotas).sort((x, y) => y.pendentes.length - x.pendentes.length).slice(0, 8) },
+    estudantes: activos.length };
+  cachePainel.set(req.escola, { t: Date.now(), d });
+  res.json(d);
+}));
 
 // ============================================================
 //  WEBHOOK DA MOZPAYMENT
