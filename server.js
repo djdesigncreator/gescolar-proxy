@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Palavra-passe e equipa (v4.9): /senha-pedir /senha-nova (código por SMS) · /equipa /equipa-criar /equipa-estado
 //    Assinatura e plataforma (v4.8): /assinatura /assinatura-pagar /assinatura-estado · /pl/resumo /pl/escola /pl/escola-guardar
 //                                    /pl/transferencia /pl/transferencia-apagar  (PLATAFORMA_EMAILS)
 //    Painel (v4.7): /painel-indicadores — dinheiro, chamadas de hoje, faltas, notas por trimestre
@@ -37,7 +38,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.8.0';
+const VERSAO = 'gescolar-proxy 4.9.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1707,7 +1708,7 @@ app.post('/assinatura', exigeDireccao, rota(async (req, res) => {
     planos: Object.keys(PRECOS).map(k => ({ nome: k, preco: PRECOS[k], limite: LIMITES[k] })),
     historico: subs.map(subOut).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
 }));
-app.post('/assinatura-pagar', exigeDireccao, rota(async (req, res) => {
+app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
   const b = req.body || {}, metodo = String(b.metodo || '').toLowerCase();
   if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
   if (!MOZ_WALLET) return erro(res, 500, 'O servidor ainda não tem a carteira configurada (MOZ_WALLET).');
@@ -1839,6 +1840,110 @@ app.post('/pl/transferencia-apagar', exigePlataforma, rota(async (req, res) => {
   if (!t) return erro(res, 404, 'Transferência não encontrada.');
   await apagar('transferencia', id);
   res.json({ ok: true });
+}));
+
+// ============================================================
+//  RECUPERAR PALAVRA-PASSE E EQUIPA DA ESCOLA (v4.9)
+//  Bubble, 2 backend workflows novos (ver instruções):
+//   senha-temp  (parâmetro email)  → Assign a temp password to a user → Return data: senha = Result of step 1
+//   senha-mudar (parâmetro nova; exige autenticação do utilizador) → Update the user's credentials (Password = nova)
+//  O workflow login já existente devolve o token do utilizador, usado para chamar senha-mudar em nome dele.
+// ============================================================
+function linkPagina(nome) { return PORTAL_URL.replace(/[^/]*$/, nome); }
+async function wfComo(nome, corpo, tokenUser) {
+  const r = await fetch(BUBBLE_WF + '/' + nome, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tokenUser }, body: JSON.stringify(corpo || {}) });
+  const t = await r.text(); let d = null; try { d = t ? JSON.parse(t) : null; } catch (e) { d = { raw: t }; }
+  if (!r.ok) { const e = new Error(nome + ': ' + ((d && d.body && d.body.message) || (d && d.message) || t || r.status)); e.status = r.status; throw e; }
+  return d;
+}
+async function userPorEmail(email) {
+  const l = await procurar('user', [{ key: 'email', constraint_type: 'equals', value: email }], 1);
+  return l[0] || null;
+}
+const emailDoUser = u => (u && u['authentication'] && u['authentication']['email'] && u['authentication']['email']['email']) || (u && u['email']) || '';
+
+app.post('/senha-pedir', rota(async (req, res) => {
+  const email = txt((req.body || {}).email, 120).toLowerCase();
+  if (!emailOk(email)) return erro(res, 400, 'Escreva o email da sua conta.');
+  if (travao('senha-ip|' + req.ip, 10, 15) || travao('senha|' + email, 3, 15)) return erro(res, 429, 'Muitos pedidos seguidos. Espere 15 minutos.');
+  const u = await userPorEmail(email);
+  if (!u) return erro(res, 404, 'Não encontrámos nenhuma conta com este email.');
+  if (u['Activo'] === false) return erro(res, 403, 'Esta conta está desactivada. Fale com a Direcção da escola.');
+  const tel = tel9(u['Telefone']);
+  if (tel.length !== 9) return erro(res, 409, 'Esta conta não tem telemóvel registado. Escreva para geral@gescolar.co.mz a pedir ajuda.');
+  const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0'), pedido = crypto.randomBytes(16).toString('hex');
+  const r = await enviarSMS([tel], 'Gescolar: o seu codigo para criar uma nova palavra-passe e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.');
+  if (!r.ok) return erro(res, 502, 'Não foi possível enviar o SMS agora. Tente de novo dentro de um minuto.');
+  pedidosAcesso.set(pedido, { tipo: 'senha', id: u._id, email, hash: hashCodigo(pedido + codigo), exp: Date.now() + 600e3, tent: 0 });
+  res.json({ ok: true, pedido, destino: mascarar(tel) });
+}));
+app.post('/senha-nova', rota(async (req, res) => {
+  const b = req.body || {}, chave = String(b.pedido || '');
+  const pd = pedidosAcesso.get(chave);
+  if (!pd || pd.tipo !== 'senha' || pd.exp < Date.now()) return erro(res, 410, 'O código expirou. Peça um novo.');
+  const nova = String(b.password || '');
+  if (nova.length < 8) return erro(res, 400, 'A palavra-passe tem de ter pelo menos 8 caracteres.');
+  pd.tent++;
+  if (pd.tent > 5) { pedidosAcesso.delete(chave); return erro(res, 429, 'Demasiadas tentativas. Peça um novo código.'); }
+  const cod = soDigitos(b.codigo), a = Buffer.from(hashCodigo(chave + cod)), c = Buffer.from(pd.hash);
+  if (cod.length !== 6 || a.length !== c.length || !crypto.timingSafeEqual(a, c)) return erro(res, 401, 'Código errado (' + (5 - pd.tent) + ' tentativas restantes).');
+  try {
+    const t = await workflow('senha-temp', { email: pd.email });
+    const temp = achar(t, ['senha', 'password', 'temp', 'temp_password']);
+    if (!temp) throw new Error('senha-temp não devolveu a senha — confirme o "Return data from API" com a chave senha');
+    const l = await workflow('login', { email: pd.email, password: String(temp) });
+    const tok = achar(l, ['token']);
+    if (!tok) throw new Error('login não devolveu o token do utilizador');
+    await wfComo('senha-mudar', { nova }, String(tok));
+  } catch (e) {
+    console.error('[senha-nova]', e.message);
+    return erro(res, 500, 'Não foi possível mudar a palavra-passe agora. Tente de novo ou fale com o suporte.');
+  }
+  pedidosAcesso.delete(chave);
+  res.json(await abrirSessao(pd.id, PLATAFORMA_EMAILS.includes(pd.email)));
+}));
+
+// ---------- equipa da escola (só a Direcção) ----------
+function exigeSoDireccao(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
+  if (!s.e || s.p !== 'Direccao') return erro(res, 403, 'Só a Direcção pode gerir a equipa.');
+  req.sessao = s; req.escola = s.e; next();
+}
+const userOut = u => ({ id: u._id, nome: u['Nome Completo'] || '', email: emailDoUser(u), telefone: u['Telefone'] || '', papel: u['Papel'] || '', activo: u['Activo'] !== false, ultimo: u['Ultimo Acesso'] || null });
+app.post('/equipa', exigeSoDireccao, rota(async (req, res) => {
+  const us = await procurarTodos('user', daEscola(req.escola), 200);
+  res.json({ ok: true, eu: req.sessao.u, equipa: us.filter(u => ['Direccao', 'Secretaria'].includes(u['Papel'])).map(userOut).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/equipa-criar', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const nome = txt(b.nome, 100), email = txt(b.email, 120).toLowerCase(), tel = tel9(b.telefone), papel = b.papel === 'Direccao' ? 'Direccao' : 'Secretaria';
+  if (nome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo.');
+  if (!emailOk(email)) return erro(res, 400, 'O email não parece válido.');
+  if (tel.length !== 9) return erro(res, 400, 'O telemóvel tem 9 dígitos. É por ele que a pessoa cria a palavra-passe.');
+  if (await userPorEmail(email)) return erro(res, 409, 'Este email já tem conta no Gescolar.');
+  let userId;
+  try {
+    const r = await workflow('signup', { email, password: crypto.randomBytes(18).toString('base64url') });
+    userId = r && r.response && r.response.user_id;
+  } catch (e) {
+    if (e.status === 400) return erro(res, 409, 'Este email já tem conta no Gescolar.');
+    throw e;
+  }
+  if (!userId) throw new Error('signup não devolveu user_id');
+  await mudar('user', userId, { 'Escola': req.escola, 'Papel': papel, 'Nome Completo': nome, 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Activo': true });
+  const esc = await obter('escola', req.escola).catch(() => null);
+  const link = linkPagina('recuperar.html') + '?email=' + encodeURIComponent(email);
+  const r = await enviarSMS([tel], 'Gescolar: foi criada a sua conta (' + (papel === 'Direccao' ? 'Direccao' : 'Secretaria') + ') em ' + ((esc && esc['Nome']) || 'a escola') + '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, ''));
+  res.json({ ok: true, id: userId, sms: r.ok, link });
+}));
+app.post('/equipa-estado', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {}, id = String(b.id || '');
+  if (id === req.sessao.u) return erro(res, 400, 'Não pode desactivar a sua própria conta.');
+  const u = await obter('user', id).catch(() => null);
+  if (!u || u['Escola'] !== req.escola) return erro(res, 404, 'Utilizador não encontrado.');
+  await mudar('user', id, { 'Activo': !!b.activo });
+  res.json({ ok: true, activo: !!b.activo });
 }));
 
 // ============================================================
