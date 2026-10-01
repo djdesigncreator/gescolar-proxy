@@ -14,6 +14,7 @@
 //    Propinas e pagamentos (v4): /propinas-gerar /propinas /pagar /pagar-balcao /pagamento-estado /pagamentos
 //                                GET|POST /wh-moz/<MOZ_WEBHOOK_KEY>  — webhook da MozPayment
 //    SMS (v4.1): /sms-teste  — e recibo por SMS ao encarregado sempre que um pagamento fica pago
+//    Facturas (v4.2): /escola-dados /escola-guardar (logótipo e dados da factura) /recibo (dados da factura-recibo em PDF)
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -27,7 +28,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.1.0';
+const VERSAO = 'gescolar-proxy 4.2.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -796,7 +797,7 @@ app.post('/pagar-balcao', exigeDireccao, rota(async (req, res) => {
 
 app.post('/pagamento-estado', exigeDireccao, rota(async (req, res) => {
   const p = await daMinhaEscola('pagamento', String((req.body || {}).id || ''), req.escola);
-  res.json({ ok: true, estado: p['Estado'] || 'pendente', documento: p['Documento'] || null, valor: p['Valor'] || 0, metodo: p['Metodo'] || '' });
+  res.json({ ok: true, id: p._id, estado: p['Estado'] || 'pendente', documento: p['Documento'] || null, valor: p['Valor'] || 0, metodo: p['Metodo'] || '' });
 }));
 
 app.post('/pagamentos', exigeDireccao, rota(async (req, res) => {
@@ -805,6 +806,76 @@ app.post('/pagamentos', exigeDireccao, rota(async (req, res) => {
   res.json({ ok: true, pagamentos: pags.filter(p => p['Estado'] === 'pago').map(p => { const e = est.find(x => x._id === p['Estudante']);
     return { id: p._id, documento: p['Documento'], data: p['Pago Em'], metodo: p['Metodo'], valor: p['Valor'], multa: p['Multa Incluida'] || 0, estudante: e ? e['Nome'] : '', numero: e ? e['Numero'] : '', referencia: p['Referencia'] || '', transacao: p['Transacao'] || '', telefone: p['Telefone'] || '' }; })
     .sort((a, b) => String(b.data).localeCompare(String(a.data))) });
+}));
+
+// ============================================================
+//  DADOS DA ESCOLA PARA AS FACTURAS (v4.2)
+//  Campos novos no Bubble, data type Escola:  Logotipo (text)  ·  Morada (text)
+//  O logótipo fica guardado como imagem em texto (data:image/...;base64), pequeno (até 300 KB),
+//  para o PDF sair sempre com ele, sem depender de outro servidor.
+// ============================================================
+const LOGO_MAX = 300 * 1024;
+function escolaFactura(e) {
+  return { id: e._id, nome: e['Nome'] || '', nuit: e['NUIT'] || '', morada: e['Morada'] || '', cidade: e['Cidade'] || '', provincia: e['Provincia'] || '',
+    telefone: e['Telefone'] || '', email: e['Email'] || '', subdominio: e['Subdominio'] || '', logotipo: e['Logotipo'] || '' };
+}
+app.post('/escola-dados', exigeDireccao, rota(async (req, res) => {
+  const e = await obter('escola', req.escola);
+  res.json({ ok: true, escola: escolaFactura(e) });
+}));
+app.post('/escola-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const mud = {};
+  if (b.logotipo !== undefined) {
+    const l = String(b.logotipo || '');
+    if (l && !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(l)) return erro(res, 400, 'O logótipo tem de ser uma imagem PNG, JPG ou WEBP.');
+    if (l.length > LOGO_MAX) return erro(res, 400, 'O logótipo é demasiado grande. Use uma imagem mais pequena.');
+    mud['Logotipo'] = l;
+  }
+  if (b.morada !== undefined) mud['Morada'] = txt(b.morada, 160);
+  if (b.telefone !== undefined) mud['Telefone'] = txt(b.telefone, 30);
+  if (b.email !== undefined) {
+    const em = txt(b.email, 120).toLowerCase();
+    if (em && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return erro(res, 400, 'O email da escola não parece válido.');
+    mud['Email'] = em;
+  }
+  if (!Object.keys(mud).length) return erro(res, 400, 'Nada para guardar.');
+  await mudar('escola', req.escola, mud);
+  const e = await obter('escola', req.escola);
+  res.json({ ok: true, escola: escolaFactura(e) });
+}));
+
+// ---------- factura-recibo ----------
+// Quem pode ver: a Direcção/Secretaria da escola do pagamento.
+// (Na área do Estudante e do Encarregado, cada um verá só os seus — próxima fase.)
+async function dadosRecibo(pag) {
+  const [escola, est, enc] = await Promise.all([
+    obter('escola', pag['Escola']).catch(() => null),
+    pag['Estudante'] ? obter('estudante', pag['Estudante']).catch(() => null) : null,
+    pag['Encarregado'] ? obter('encarregado', pag['Encarregado']).catch(() => null) : null
+  ]);
+  const turma = est && est['Turma'] ? await obter('turma', est['Turma']).catch(() => null) : null;
+  const props = await Promise.all((pag['Propinas'] || []).map(id => obter('propina', id).catch(() => null)));
+  const linhas = props.filter(Boolean).map(p => {
+    const valor = Number(p['Valor'] || 0), multa = Number(p['Multa'] || 0);
+    return { descricao: p['Descricao'] || 'Propina', vencimento: p['Vencimento'] || null, valor, multa, total: Number(p['Total'] || (valor + multa)) };
+  }).sort((a, b) => String(a.vencimento || '').localeCompare(String(b.vencimento || '')));
+  const recebido = pag['Recebido Por'] ? await obter('user', pag['Recebido Por']).catch(() => null) : null;
+  return {
+    escola: escola ? escolaFactura(escola) : { nome: '' },
+    id: pag._id, documento: pag['Documento'] || '', data: pag['Pago Em'] || pag['Created Date'] || null,
+    metodo: pag['Metodo'] || '', referencia: pag['Referencia'] || '', transacao: pag['Transacao'] || '', telefone: pag['Telefone'] || '',
+    valor: Number(pag['Valor'] || 0), multa: Number(pag['Multa Incluida'] || 0),
+    estudante: est ? { nome: est['Nome'] || '', numero: est['Numero'] || '', turma: turma ? (turma['Nome'] || '') : '' } : null,
+    encarregado: enc ? { nome: enc['Nome'] || '', telefone: enc['Telefone'] || '', email: enc['Email'] || '' } : null,
+    recebido_por: recebido ? (recebido['Nome Completo'] || '') : '',
+    linhas
+  };
+}
+app.post('/recibo', exigeDireccao, rota(async (req, res) => {
+  const p = await daMinhaEscola('pagamento', String((req.body || {}).id || ''), req.escola);
+  if (p['Estado'] !== 'pago' || !p['Documento']) return erro(res, 409, 'Este pagamento ainda não está confirmado, por isso ainda não tem factura-recibo.');
+  res.json({ ok: true, recibo: await dadosRecibo(p) });
 }));
 
 // ============================================================
