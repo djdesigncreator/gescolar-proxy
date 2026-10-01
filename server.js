@@ -15,6 +15,8 @@
 //                                GET|POST /wh-moz/<MOZ_WEBHOOK_KEY>  — webhook da MozPayment
 //    SMS (v4.1): /sms-teste  — e recibo por SMS ao encarregado sempre que um pagamento fica pago
 //    Facturas (v4.2): /escola-dados /escola-guardar (logótipo e dados da factura) /recibo (dados da factura-recibo em PDF)
+//    Portal das famílias (v4.3): /acesso-codigo /acesso-entrar (entrada por código SMS, sem palavra-passe)
+//                                /p/inicio /p/pagar /p/pagamento-estado  ·  /familias-link /familias-convite (Direcção)
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -28,7 +30,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.2.0';
+const VERSAO = 'gescolar-proxy 4.3.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -92,8 +94,8 @@ async function procurar(tipo, filtros, limite) {
 
 // ---------- sessões assinadas ----------
 const b64 = s => Buffer.from(s).toString('base64url');
-function assinar(dados) {
-  const corpo = b64(JSON.stringify(Object.assign({}, dados, { exp: Date.now() + SESSAO_DIAS * 864e5 })));
+function assinar(dados, dias) {
+  const corpo = b64(JSON.stringify(Object.assign({}, dados, { exp: Date.now() + (dias || SESSAO_DIAS) * 864e5 })));
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(corpo).digest('base64url');
   return corpo + '.' + sig;
 }
@@ -269,7 +271,7 @@ app.post('/login', async (req, res) => {
 app.post('/sessao', async (req, res) => {
   const s = sessaoDo(req);
   if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
-  try { res.json(await abrirSessao(s.u)); }
+  try { res.json(s.t === 'portal' ? await abrirSessaoPortal(s) : await abrirSessao(s.u)); }
   catch (e) { console.error('[sessao]', e.message); erro(res, e.publico || 500, e.publico ? e.message : 'Não foi possível confirmar a sessão.'); }
 });
 
@@ -478,6 +480,11 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
     'Data Matricula': new Date().toISOString(), 'Estado': 'activo', 'Saude Notas': txt(b.saude, 300) };
   if (b.nascimento && !isNaN(Date.parse(b.nascimento))) campos['Data Nascimento'] = new Date(b.nascimento).toISOString();
   if (encId) campos['Encarregado'] = encId;
+  const telEst = soDigitos(b.telefone).replace(/^258/, '');
+  if (telEst) {
+    if (telEst.length !== 9) return erro(res, 400, 'O telemóvel do estudante tem 9 dígitos.');
+    campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
+  }
   const id = await criar('estudante', campos);
   res.json({ ok: true, id, numero });
 }));
@@ -651,6 +658,8 @@ async function prepararCobranca(req, ids) {
     const p = await daMinhaEscola('propina', id, req.escola);
     if (p['Estado'] === 'paga') { const e = new Error('Uma das mensalidades escolhidas já está paga.'); e.publico = 409; throw e; }
     if (p['Estado'] === 'anulada') { const e = new Error('Uma das mensalidades escolhidas foi anulada.'); e.publico = 409; throw e; }
+    if (req.educandos && !req.educandos.includes(p['Estudante'])) { const e = new Error('Registo não encontrado.'); e.publico = 404; throw e; }
+    if (ps.length && ps[0].p['Estudante'] !== p['Estudante']) { const e = new Error('Cobre as mensalidades de um estudante de cada vez.'); e.publico = 400; throw e; }
     ps.push({ p, c: calcPropina(p, (escola && escola.regras) || {}) });
   }
   const total = ps.reduce((s, x) => s + x.c.total, 0), multa = ps.reduce((s, x) => s + x.c.multa, 0);
@@ -746,7 +755,7 @@ async function proximoDocumento(escola) {
   return 'FR ' + ano + '/' + String(maior + 1).padStart(6, '0');
 }
 
-app.post('/pagar', exigeDireccao, rota(async (req, res) => {
+async function cobrarOnline(req, res) {
   const b = req.body || {};
   const metodo = String(b.metodo || '').toLowerCase();
   if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
@@ -782,7 +791,8 @@ app.post('/pagar', exigeDireccao, rota(async (req, res) => {
     await mudar('pagamento', pagId, { 'Estado': 'falhado', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
     erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(e.message).slice(0, 300));
   }
-}));
+}
+app.post('/pagar', exigeDireccao, rota(cobrarOnline));
 
 app.post('/pagar-balcao', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {};
@@ -872,10 +882,169 @@ async function dadosRecibo(pag) {
     linhas
   };
 }
-app.post('/recibo', exigeDireccao, rota(async (req, res) => {
+app.post('/recibo', exigeQualquer, rota(async (req, res) => {
   const p = await daMinhaEscola('pagamento', String((req.body || {}).id || ''), req.escola);
+  if (req.educandos && !req.educandos.includes(p['Estudante'])) return erro(res, 404, 'Registo não encontrado.');
   if (p['Estado'] !== 'pago' || !p['Documento']) return erro(res, 409, 'Este pagamento ainda não está confirmado, por isso ainda não tem factura-recibo.');
   res.json({ ok: true, recibo: await dadosRecibo(p) });
+}));
+
+// ============================================================
+//  PORTAL DAS FAMÍLIAS (v4.3) — Encarregado e Estudante
+//  Entrada sem palavra-passe: código da escola + telemóvel (encarregado) ou número de estudante,
+//  e um código de 6 dígitos enviado por SMS. A sessão dura 30 dias.
+//  Campo novo no Bubble (opcional): Estudante → Telefone (text), para estudantes com telemóvel próprio.
+// ============================================================
+const PORTAL_DIAS = 30;
+const PORTAL_URL = (process.env.PORTAL_URL || 'https://djdesigncreator.github.io/gescolar-web/acesso.html').replace(/\/+$/, '');
+const pedidosAcesso = new Map();
+setInterval(() => { const a = Date.now(); for (const [k, v] of pedidosAcesso) if (v.exp < a) pedidosAcesso.delete(k); }, 300e3).unref();
+const hashCodigo = c => crypto.createHmac('sha256', SESSION_SECRET || 'x').update(String(c)).digest('hex');
+const tel9 = t => soDigitos(t).replace(/^00258/, '').replace(/^258(?=\d{9}$)/, '');
+const mascarar = t => { const d = tel9(t); return d.length === 9 ? d.slice(0, 2) + ' *** **' + d.slice(7) : '***'; };
+function linkFamilias(sub) { return PORTAL_URL + '?e=' + encodeURIComponent(sub || ''); }
+
+async function escolaPorCodigo(codigo) {
+  const c = slug(String(codigo || '').replace(/\.gescolar\.co\.mz.*$/i, ''));
+  if (!c) return null;
+  const l = await procurar('escola', [{ key: 'Subdominio', constraint_type: 'equals', value: c }], 1);
+  return l[0] || null;
+}
+async function educandosDe(s) {
+  if (s.p === 'Estudante') return [s.u];
+  const l = await procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: s.e }, { key: 'Encarregado', constraint_type: 'equals', value: s.u }], 50);
+  return l.filter(e => (e['Estado'] || 'activo') === 'activo').map(e => e._id);
+}
+async function abrirSessaoPortal(s) {
+  const tipo = s.p === 'Estudante' ? 'estudante' : 'encarregado';
+  const eu = await obter(tipo, s.u).catch(() => null);
+  if (!eu || eu['Escola'] !== s.e) { const e = new Error('Conta não encontrada. Entre outra vez.'); e.publico = 401; throw e; }
+  if (tipo === 'encarregado' && eu['Activo'] === false) { const e = new Error('Este acesso foi desactivado. Fale com a escola.'); e.publico = 403; throw e; }
+  if (tipo === 'estudante' && (eu['Estado'] || 'activo') !== 'activo') { const e = new Error('Este estudante já não está activo na escola.'); e.publico = 403; throw e; }
+  const escola = await resumoEscola(s.e);
+  if (escola && escola.estado === 'suspensa') { const e = new Error('O acesso desta escola está suspenso. Fale com a escola.'); e.publico = 402; throw e; }
+  const token = assinar({ u: s.u, e: s.e, p: s.p, t: 'portal' }, PORTAL_DIAS);
+  return { ok: true, token, nome: eu['Nome'] || '', papel: s.p, pagina: 'portal', escola, expira_dias: PORTAL_DIAS };
+}
+async function exigePortal(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
+  if (s.t !== 'portal' || !s.e) return erro(res, 403, 'Esta página é para encarregados e estudantes.');
+  try { req.sessao = s; req.escola = s.e; req.educandos = await educandosDe(s); next(); }
+  catch (e) { console.error('[portal]', e.message); erro(res, 500, 'Não foi possível concluir. Tente de novo.'); }
+}
+function exigeQualquer(req, res, next) {
+  const s = sessaoDo(req);
+  if (s && s.t === 'portal') return exigePortal(req, res, next);
+  return exigeDireccao(req, res, next);
+}
+
+// 1) pede o código
+app.post('/acesso-codigo', rota(async (req, res) => {
+  if (!SESSION_SECRET) return erro(res, 500, 'O servidor ainda não está configurado (SESSION_SECRET).');
+  const b = req.body || {};
+  const tipo = b.tipo === 'estudante' ? 'estudante' : 'encarregado';
+  if (travao('acesso-ip|' + req.ip, 12, 15)) return erro(res, 429, 'Muitos pedidos seguidos. Espere 15 minutos.');
+  const esc = await escolaPorCodigo(b.escola);
+  if (!esc) return erro(res, 404, 'Não encontrámos essa escola. Confirme o código da escola com a secretaria.');
+  if (esc['Estado'] === 'suspensa') return erro(res, 402, 'O acesso desta escola está suspenso. Fale com a escola.');
+  let alvo = null, destino = '';
+  if (tipo === 'encarregado') {
+    const tel = tel9(b.telefone);
+    if (tel.length !== 9) return erro(res, 400, 'Escreva o seu número de telemóvel com 9 dígitos.');
+    const encs = await procurarTodos('encarregado', daEscola(esc._id));
+    alvo = encs.find(e => tel9(e['Telefone']) === tel && e['Activo'] !== false);
+    if (!alvo) return erro(res, 404, 'Este número não está registado como encarregado nesta escola. Peça à secretaria para confirmar o seu número.');
+    destino = tel;
+  } else {
+    const num = txt(b.numero, 30).toUpperCase().replace(/\s+/g, '');
+    if (!num) return erro(res, 400, 'Escreva o seu número de estudante.');
+    const l = await procurar('estudante', [{ key: 'Escola', constraint_type: 'equals', value: esc._id }, { key: 'Numero', constraint_type: 'equals', value: num }], 1);
+    alvo = l[0];
+    if (!alvo || (alvo['Estado'] || 'activo') !== 'activo') return erro(res, 404, 'Não encontrámos esse número de estudante nesta escola.');
+    destino = tel9(alvo['Telefone']);
+    if (destino.length !== 9 && alvo['Encarregado']) { const en = await obter('encarregado', alvo['Encarregado']).catch(() => null); destino = en ? tel9(en['Telefone']) : ''; }
+    if (destino.length !== 9) return erro(res, 409, 'Ainda não há telemóvel registado para este estudante. Peça à secretaria para registar o seu número ou o do encarregado.');
+  }
+  if (travao('acesso|' + alvo._id, 3, 15)) return erro(res, 429, 'Já enviámos vários códigos. Espere 15 minutos e tente de novo.');
+  const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  const pedido = crypto.randomBytes(16).toString('hex');
+  const r = await enviarSMS([destino], esc['Nome'] + ': o seu codigo de acesso ao Gescolar e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.');
+  if (!r.ok) return erro(res, 502, 'Não foi possível enviar o SMS agora. Tente de novo dentro de um minuto.');
+  pedidosAcesso.set(pedido, { escola: esc._id, tipo, id: alvo._id, hash: hashCodigo(pedido + codigo), exp: Date.now() + 600e3, tent: 0 });
+  res.json({ ok: true, pedido, destino: mascarar(destino), escola: esc['Nome'] || '' });
+}));
+// 2) confirma o código e abre a sessão
+app.post('/acesso-entrar', rota(async (req, res) => {
+  const b = req.body || {}, chave = String(b.pedido || '');
+  const pd = pedidosAcesso.get(chave);
+  if (!pd || pd.exp < Date.now()) return erro(res, 410, 'O código expirou. Peça um novo.');
+  pd.tent++;
+  if (pd.tent > 5) { pedidosAcesso.delete(chave); return erro(res, 429, 'Demasiadas tentativas. Peça um novo código.'); }
+  const cod = soDigitos(b.codigo);
+  const a = Buffer.from(hashCodigo(chave + cod)), c = Buffer.from(pd.hash);
+  if (cod.length !== 6 || a.length !== c.length || !crypto.timingSafeEqual(a, c)) return erro(res, 401, 'Código errado. Confirme o SMS e tente de novo (' + (5 - pd.tent) + ' tentativas restantes).');
+  pedidosAcesso.delete(chave);
+  res.json(await abrirSessaoPortal({ u: pd.id, e: pd.escola, p: pd.tipo === 'estudante' ? 'Estudante' : 'Encarregado' }));
+}));
+
+// tudo o que o portal mostra, num só pedido
+app.post('/p/inicio', exigePortal, rota(async (req, res) => {
+  const s = req.sessao;
+  const [escRaw, eu, escola] = await Promise.all([obter('escola', req.escola), obter(s.p === 'Estudante' ? 'estudante' : 'encarregado', s.u), resumoEscola(req.escola)]);
+  const regras = (escola && escola.regras) || {};
+  const ests = (await Promise.all(req.educandos.map(id => obter('estudante', id).catch(() => null)))).filter(Boolean);
+  const turmaIds = [...new Set(ests.map(e => e['Turma']).filter(Boolean))];
+  const turmas = {}; (await Promise.all(turmaIds.map(id => obter('turma', id).catch(() => null)))).filter(Boolean).forEach(t => { turmas[t._id] = t; });
+  const educandos = await Promise.all(ests.map(async e => {
+    const f = [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Estudante', constraint_type: 'equals', value: e._id }];
+    const [props, pags] = await Promise.all([procurarTodos('propina', f, 600), procurarTodos('pagamento', f, 600)]);
+    const ps = props.filter(p => p['Estado'] !== 'anulada').map(p => ({ id: p._id, mes: p['Mes'], descricao: p['Descricao'], tipo: p['Tipo'] || 'propina', vencimento: p['Vencimento'], pago_em: p['Pago Em'] || null, ...calcPropina(p, regras) }))
+      .sort((a, b) => String(a.vencimento || '').localeCompare(String(b.vencimento || '')));
+    const t = turmas[e['Turma']];
+    return {
+      id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', turma: t ? (t['Nome'] || '') : '',
+      propinas: ps,
+      divida: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
+      em_aberto: ps.filter(p => p.estado !== 'paga').reduce((x, p) => x + p.total, 0),
+      recibos: pags.filter(p => p['Estado'] === 'pago' && p['Documento']).map(p => ({ id: p._id, documento: p['Documento'], data: p['Pago Em'], metodo: p['Metodo'], valor: Number(p['Valor'] || 0), multa: Number(p['Multa Incluida'] || 0) }))
+        .sort((a, b) => String(b.data || '').localeCompare(String(a.data || '')))
+    };
+  }));
+  let telefone = tel9(eu && eu['Telefone']);
+  if (telefone.length !== 9 && s.p === 'Estudante' && eu && eu['Encarregado']) { const en = await obter('encarregado', eu['Encarregado']).catch(() => null); telefone = en ? tel9(en['Telefone']) : ''; }
+  res.json({ ok: true,
+    eu: { nome: (eu && eu['Nome']) || '', papel: s.p, telefone: telefone.length === 9 ? telefone : '' },
+    escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', telefone: escRaw['Telefone'] || '', email: escRaw['Email'] || '', ano: escRaw['Ano Lectivo'] || '', regras },
+    educandos: educandos.sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/p/pagar', exigePortal, rota(cobrarOnline));
+app.post('/p/pagamento-estado', exigePortal, rota(async (req, res) => {
+  const p = await daMinhaEscola('pagamento', String((req.body || {}).id || ''), req.escola);
+  if (!req.educandos.includes(p['Estudante'])) return erro(res, 404, 'Registo não encontrado.');
+  res.json({ ok: true, id: p._id, estado: p['Estado'] || 'pendente', documento: p['Documento'] || null, valor: p['Valor'] || 0, metodo: p['Metodo'] || '' });
+}));
+
+// Direcção: link do portal e convite por SMS aos encarregados
+app.post('/familias-link', exigeDireccao, rota(async (req, res) => {
+  const [esc, encs] = await Promise.all([obter('escola', req.escola), procurarTodos('encarregado', daEscola(req.escola))]);
+  const comTel = encs.filter(e => e['Activo'] !== false && e['Recebe SMS'] !== false && tel9(e['Telefone']).length === 9);
+  res.json({ ok: true, link: linkFamilias(esc['Subdominio']), codigo: esc['Subdominio'] || '', encarregados: encs.length, com_telefone: comTel.length });
+}));
+app.post('/familias-convite', exigeDireccao, rota(async (req, res) => {
+  if (travao('convite|' + req.escola, 1, 60)) return erro(res, 429, 'O convite já foi enviado há pouco. Pode voltar a enviar daqui a uma hora.');
+  const [esc, encs] = await Promise.all([obter('escola', req.escola), procurarTodos('encarregado', daEscola(req.escola))]);
+  const nums = [...new Set(encs.filter(e => e['Activo'] !== false && e['Recebe SMS'] !== false).map(e => tel9(e['Telefone'])).filter(t => t.length === 9))];
+  if (!nums.length) return erro(res, 400, 'Ainda não há encarregados com telemóvel registado.');
+  const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
+  const msg = (esc['Nome'] || 'A escola') + ': ja pode ver propinas, recibos e notas do seu educando e pagar por M-Pesa ou e-Mola. Entre em ' + link + ' com o seu numero de telemovel.';
+  let enviados = 0, falhas = 0;
+  for (let i = 0; i < nums.length; i += 50) {
+    const r = await enviarSMS(nums.slice(i, i + 50), msg);
+    if (r.ok) enviados += r.numeros.length; else falhas += nums.slice(i, i + 50).length;
+  }
+  if (!enviados) return erro(res, 502, 'Não foi possível enviar os SMS agora. Tente mais tarde.');
+  res.json({ ok: true, enviados, falhas });
 }));
 
 // ============================================================
