@@ -25,6 +25,29 @@
 .chk{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px;max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:10px}
 .chk label{display:flex;gap:8px;align-items:center;font-size:14px;color:var(--ink);font-weight:500}
 .dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+.hg-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.hg{border-collapse:separate;border-spacing:4px;width:100%;min-width:640px}
+.hg th{font:700 12px var(--f-body);text-transform:uppercase;letter-spacing:.05em;color:var(--muted);padding:6px 4px;text-align:center}
+.hg td.t{font-family:var(--f-mono);font-size:12px;color:var(--muted);white-space:nowrap;text-align:right;padding-right:8px;width:96px}
+.hg td.c{height:58px;border:1.5px dashed var(--line);border-radius:9px;cursor:pointer;vertical-align:top;padding:6px 8px;font-size:13px;line-height:1.25;background:var(--surface)}
+.hg td.c:hover{border-color:var(--blue)}
+.hg td.c.on{border-style:solid;border-left-width:5px}
+.hg td.c b{display:block;font-size:13.5px;color:var(--ink)}
+.hg td.c small{color:var(--muted);font-size:11.5px;display:block}
+.hg td.c .mais{color:var(--muted);font-size:20px;display:grid;place-items:center;height:100%}
+.tempo{display:grid;grid-template-columns:28px 1fr 1fr;gap:6px;align-items:center;margin-bottom:6px}
+.tempo .inp{height:34px;font-family:var(--f-mono);font-size:13.5px}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chips label{display:flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:99px;padding:5px 12px;font-size:13.5px;font-weight:600;cursor:pointer;color:var(--ink)}
+.carga{display:flex;flex-wrap:wrap;gap:6px}
+.carga span{font-size:12.5px;border-radius:6px;padding:3px 8px;background:var(--surface2,#EEF2F8);border:1px solid var(--line)}
+.carga span.ok{border-color:var(--ok);color:var(--ok)}
+.carga span.falta{border-color:var(--warn);color:var(--warn)}
+.com{padding:16px 18px;border-bottom:1px solid var(--line)}
+.com:last-child{border-bottom:0}
+.com h4{margin:0 0 4px;font-size:16px}
+.com p{margin:8px 0 0;white-space:pre-wrap;color:var(--ink);font-size:14.5px;line-height:1.5}
+textarea.inp{height:auto;min-height:130px;padding:10px;line-height:1.45;resize:vertical}
 .msg-err{background:var(--bad-soft);color:var(--bad);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600}
 </style>
 </head>
@@ -75,7 +98,8 @@ try{ var h=(location.hash||'').slice(1); if(h) S.pag=h; }catch(e){}
 /* ---------- casca ---------- */
 var NAV = [['Arranque'],['painel','Painel','home'],['turmas','Turmas e salas','layers'],['disciplinas','Disciplinas','book'],['professores','Professores','board'],['estudantes','Estudantes','users'],
   ['Financeiro'],['propinas','Propinas e multas','wallet'],['facturas','Facturas e recibos','receipt'],
-  ['Em construção'],['x','Horários','cal',1],['x','Pautas e notas','grade',1],['x','Comunicados','mega',1]];
+  ['Escola'],['horarios','Horários','cal'],['comunicados','Comunicados','mega'],
+  ['Em construção'],['x','Pautas e notas','grade',1]];
 function casca(){
   var e=S.escola||{};
   $('#root').innerHTML='<div class="app"><aside class="side" id="side">'+
@@ -108,7 +132,7 @@ document.addEventListener('keydown',function(e){ if(e.key==='Escape') fechar(); 
 
 /* ---------- páginas ---------- */
 function pagina(){
-  var f = { painel:pPainel, turmas:pTurmas, disciplinas:pDisciplinas, professores:pProfessores, estudantes:pEstudantes, propinas:pPropinas, facturas:pFacturas }[S.pag] || pPainel;
+  var f = { painel:pPainel, turmas:pTurmas, disciplinas:pDisciplinas, professores:pProfessores, estudantes:pEstudantes, propinas:pPropinas, facturas:pFacturas, horarios:pHorarios, comunicados:pComunicados }[S.pag] || pPainel;
   f();
 }
 
@@ -468,6 +492,149 @@ function dadosFactura(){
     api('/escola-guardar',{logotipo:logo, morada:$('#lg-mor').value, telefone:$('#lg-tel').value, email:$('#lg-em').value}).then(function(r){
       if(!r.ok){ aGravar(btn,false); $('#lg-err').innerHTML=erroCaixa(r.erro); return; }
       S.dadosEscola=r.escola; fechar(); toast('Dados da factura guardados.'); if(S.pag==='facturas') pFacturas();
+    });
+  };
+}
+
+/* ================= HORÁRIOS ================= */
+var DIAS_C=['','Seg','Ter','Qua','Qui','Sex','Sáb'], DIAS_L=['','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'];
+function minutos(h){ var p=String(h||'').split(':'); return (+p[0])*60+(+p[1]); }
+function hhmm(m){ return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); }
+function gerarTempos(inicio, n, dur, pausa, recreioDepois, recreio){
+  var t=[], m=minutos(inicio);
+  for(var k=0;k<n;k++){ t.push({i:hhmm(m), f:hhmm(m+dur)}); m+=dur+(k+1===recreioDepois?recreio:pausa); }
+  return t;
+}
+function grelhaNova(turma){
+  var ini = /tarde/i.test(turma.turno||'')?'12:30':/noite|laboral/i.test(turma.turno||'')?'17:30':'07:00';
+  return { dias:[1,2,3,4,5], tempos:gerarTempos(ini,6,45,5,3,20), aulas:{} };
+}
+function pHorarios(){
+  aCarregar();
+  api('/horarios').then(function(d){
+    if(!d.ok){ $('#page').innerHTML=erroCaixa(d.erro); return; }
+    S.H={ d:d, turma:(S.H&&S.H.turma)||'', grelha:null, publicado:false, sujo:false };
+    if(!d.turmas.length){ $('#page').innerHTML=ph('Escola','Horários','')+vazio('layers','Crie primeiro uma turma','Os horários são feitos por turma. Vá a "Turmas e salas".'); return; }
+    if(!d.turmas.some(function(t){ return t.id===S.H.turma; })) S.H.turma=d.turmas[0].id;
+    abrirTurmaH();
+  });
+}
+function abrirTurmaH(){
+  var H=S.H, t=H.d.turmas.filter(function(x){ return x.id===H.turma; })[0];
+  var h=H.d.horarios.filter(function(x){ return x.turma===H.turma; })[0];
+  H.grelha = h ? JSON.parse(JSON.stringify(h.grelha)) : grelhaNova(t);
+  H.publicado = h ? h.publicado : false; H.existe=!!h; H.sujo=false;
+  desenharH();
+}
+function desenharH(){
+  var H=S.H, d=H.d, g=H.grelha, t=d.turmas.filter(function(x){ return x.id===H.turma; })[0];
+  var DM={}; d.disciplinas.forEach(function(x){ DM[x.id]=x; }); var PM={}; d.professores.forEach(function(x){ PM[x.id]=x; });
+  var conta={}; Object.keys(g.aulas).forEach(function(k){ var a=g.aulas[k]; conta[a.d]=(conta[a.d]||0)+1; });
+  var daTurma=(t.disciplinas||[]).filter(function(id){ return DM[id]; });
+  var nAulas=Object.keys(g.aulas).length;
+  $('#page').innerHTML=ph('Escola','Horários', H.existe ? (H.publicado?'<span class="pill ok">Publicado</span> As famílias já vêem este horário no portal.':'<span class="pill warn">Rascunho</span> Ainda não está visível para as famílias.') : 'Monte o horário da turma: escolha os dias, os tempos, e clique numa célula para marcar a aula.',
+      '<select class="sel" id="h-t">'+d.turmas.map(function(x){ return '<option value="'+x.id+'"'+(x.id===H.turma?' selected':'')+'>'+esc(x.nome)+'</option>'; }).join('')+'</select>'+
+      '<label class="btn" style="cursor:pointer"><input type="checkbox" id="h-pub"'+(H.publicado?' checked':'')+'> Publicar</label>'+
+      '<button class="btn pri" id="h-save">'+ic('save')+'Guardar'+(H.sujo?' *':'')+'</button>')+
+    '<div id="h-err"></div>'+
+    '<div style="display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:16px;align-items:start" class="h-lay">'+
+      '<section class="card card-b"><div class="hg-wrap"><table class="hg"><thead><tr><th></th>'+g.dias.map(function(dd){ return '<th>'+DIAS_C[dd]+'</th>'; }).join('')+'</tr></thead><tbody>'+
+        g.tempos.map(function(tp,ti){ return '<tr><td class="t">'+tp.i+'<br>'+tp.f+'</td>'+g.dias.map(function(dd){ var a=g.aulas[dd+'-'+ti], ds=a&&DM[a.d];
+          return ds ? '<td class="c on" data-c="'+dd+'-'+ti+'" style="border-color:'+esc(ds.cor||'#0A64DC')+';background:color-mix(in srgb,'+esc(ds.cor||'#0A64DC')+' 9%,var(--surface))"><b>'+esc(ds.nome)+'</b><small>'+esc(a.p&&PM[a.p]?PM[a.p].nome:'sem professor')+'</small>'+(a.s?'<small>'+esc(a.s)+'</small>':'')+'</td>'
+                    : '<td class="c" data-c="'+dd+'-'+ti+'"><span class="mais">+</span></td>'; }).join('')+'</tr>'; }).join('')+
+      '</tbody></table></div>'+
+      '<div style="margin-top:12px"><div class="small muted" style="margin-bottom:6px;font-weight:600">Aulas por semana · '+nAulas+' marcadas</div><div class="carga">'+
+        (daTurma.length? daTurma.map(function(id){ var x=DM[id], n=conta[id]||0, c=x.carga||0; return '<span class="'+(c? (n>=c?'ok':'falta') : '')+'">'+esc(x.nome)+' '+n+(c?'/'+c:'')+'</span>'; }).join('') : '<span>Esta turma ainda não tem disciplinas ligadas (Turmas e salas → Editar).</span>')+
+      '</div></div></section>'+
+      '<section class="card card-b"><div class="eyebrow" style="margin-bottom:8px">Dias de aulas</div><div class="chips">'+[1,2,3,4,5,6].map(function(dd){ return '<label><input type="checkbox" data-dia="'+dd+'"'+(g.dias.indexOf(dd)>=0?' checked':'')+'>'+DIAS_C[dd]+'</label>'; }).join('')+'</div>'+
+        '<div class="eyebrow" style="margin:16px 0 8px">Tempos</div>'+
+        g.tempos.map(function(tp,ti){ return '<div class="tempo"><span class="small muted mono">'+(ti+1)+'º</span><input class="inp" type="time" data-ti="'+ti+'" data-k="i" value="'+tp.i+'"><input class="inp" type="time" data-ti="'+ti+'" data-k="f" value="'+tp.f+'"></div>'; }).join('')+
+        '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"><button class="btn sm" id="h-mais">'+ic('plus')+'Tempo</button><button class="btn sm" id="h-menos"'+(g.tempos.length>1?'':' disabled')+'>Tirar último</button><button class="btn sm ghost" id="h-gerar">Gerar tempos…</button></div>'+
+        '<p class="small muted" style="margin:14px 0 0">O Gescolar avisa se um professor ficar com duas turmas à mesma hora.</p></section>'+
+    '</div>';
+  if(window.innerWidth<900){ var l=$('.h-lay'); if(l) l.style.gridTemplateColumns='minmax(0,1fr)'; }
+  function sujar(){ H.sujo=true; }
+  $('#h-t').onchange=function(){ var v=this.value; if(H.sujo && !confirm('Tem alterações por guardar nesta turma. Mudar mesmo assim?')){ this.value=H.turma; return; } H.turma=v; abrirTurmaH(); };
+  $('#h-pub').onchange=function(){ H.publicado=this.checked; sujar(); $('#h-save').innerHTML=ic('save')+'Guardar *'; };
+  $$('[data-dia]').forEach(function(c){ c.onchange=function(){ var dd=+c.getAttribute('data-dia'); if(c.checked){ g.dias.push(dd); g.dias.sort(); } else { if(g.dias.length===1){ c.checked=true; toast('Tem de haver pelo menos um dia'); return; } g.dias=g.dias.filter(function(x){ return x!==dd; }); Object.keys(g.aulas).forEach(function(k){ if(+k.split('-')[0]===dd) delete g.aulas[k]; }); } sujar(); desenharH(); }; });
+  $$('[data-ti]').forEach(function(inp){ inp.onchange=function(){ var ti=+inp.getAttribute('data-ti'); if(!/^\d\d:\d\d$/.test(inp.value)) return; g.tempos[ti][inp.getAttribute('data-k')]=inp.value; sujar(); desenharH(); }; });
+  $('#h-mais').onclick=function(){ if(g.tempos.length>=14){ toast('No máximo 14 tempos'); return; } var u=g.tempos[g.tempos.length-1], m=minutos(u.f)+5, dur=minutos(u.f)-minutos(u.i)||45; g.tempos.push({i:hhmm(m),f:hhmm(Math.min(m+dur,23*60+59))}); sujar(); desenharH(); };
+  $('#h-menos').onclick=function(){ var n=g.tempos.length-1; g.tempos.pop(); Object.keys(g.aulas).forEach(function(k){ if(+k.split('-')[1]===n) delete g.aulas[k]; }); sujar(); desenharH(); };
+  $('#h-gerar').onclick=function(){
+    modal('<div class="modal-h"><h3>Gerar tempos</h3><button class="icon-btn" data-fechar>'+ic('x')+'</button></div><div class="modal-b">'+
+      '<div class="frow"><label class="field">Primeiro tempo começa<input class="inp" type="time" id="g-i" value="'+g.tempos[0].i+'"></label><label class="field">Número de tempos<input class="inp" type="number" min="1" max="14" id="g-n" value="'+g.tempos.length+'"></label></div>'+
+      '<div class="frow"><label class="field">Duração (min)<input class="inp" type="number" min="20" max="120" id="g-d" value="45"></label><label class="field">Intervalo entre tempos (min)<input class="inp" type="number" min="0" max="30" id="g-p" value="5"></label></div>'+
+      '<div class="frow"><label class="field">Recreio depois do tempo nº<input class="inp" type="number" min="0" max="13" id="g-r" value="3"></label><label class="field">Duração do recreio (min)<input class="inp" type="number" min="0" max="60" id="g-rd" value="20"></label></div>'+
+      '<p class="small muted" style="margin:0">As aulas já marcadas ficam nos mesmos tempos.</p></div><div class="modal-f"><button class="btn" data-fechar>Cancelar</button><button class="btn pri" id="g-ok">Gerar</button></div>');
+    $('#g-ok').onclick=function(){
+      var n=Math.max(1,Math.min(14,+$('#g-n').value||6)), dur=Math.max(20,Math.min(120,+$('#g-d').value||45));
+      var ini=$('#g-i').value||'07:00'; if(minutos(ini)+n*dur>24*60-1){ toast('Os tempos passam da meia-noite'); return; }
+      g.tempos=gerarTempos(ini,n,dur,Math.max(0,+$('#g-p').value||0),+$('#g-r').value||0,Math.max(0,+$('#g-rd').value||0));
+      Object.keys(g.aulas).forEach(function(k){ if(+k.split('-')[1]>=n) delete g.aulas[k]; });
+      fechar(); sujar(); desenharH();
+    };
+  };
+  $$('[data-c]').forEach(function(td){ td.onclick=function(){ celulaH(td.getAttribute('data-c'), daTurma, DM); }; });
+  $('#h-save').onclick=function(){
+    var btn=this; aGravar(btn,true); $('#h-err').innerHTML='';
+    api('/horario-guardar',{turma:H.turma, grelha:g, publicado:H.publicado}).then(function(r){
+      aGravar(btn,false);
+      if(!r.ok){ $('#h-err').innerHTML='<div class="msg-err" style="margin-bottom:14px">'+esc(r.erro)+(r.conflitos?'<ul style="margin:6px 0 0;padding-left:18px;font-weight:500">'+r.conflitos.map(function(c){ return '<li>'+esc(c)+'</li>'; }).join('')+'</ul>':'')+'</div>'; window.scrollTo(0,0); return; }
+      var h=H.d.horarios.filter(function(x){ return x.turma===H.turma; })[0];
+      if(h){ h.grelha=r.grelha; h.publicado=r.publicado; } else H.d.horarios.push({id:r.id, turma:H.turma, grelha:r.grelha, publicado:r.publicado});
+      H.grelha=JSON.parse(JSON.stringify(r.grelha)); H.existe=true; H.sujo=false;
+      toast(r.publicado?'Horário guardado e publicado':'Horário guardado como rascunho'); desenharH();
+    });
+  };
+}
+function celulaH(chave, daTurma, DM){
+  var H=S.H, g=H.grelha, a=g.aulas[chave]||{}, dd=+chave.split('-')[0], ti=+chave.split('-')[1], tp=g.tempos[ti];
+  var outras=H.d.disciplinas.filter(function(x){ return daTurma.indexOf(x.id)<0; });
+  function opDisc(){ return '<option value="">— Sem aula —</option>'+(daTurma.length?'<optgroup label="Desta turma">'+daTurma.map(function(id){ return '<option value="'+id+'"'+(a.d===id?' selected':'')+'>'+esc(DM[id].nome)+'</option>'; }).join('')+'</optgroup>':'')+(outras.length?'<optgroup label="Outras">'+outras.map(function(x){ return '<option value="'+x.id+'"'+(a.d===x.id?' selected':'')+'>'+esc(x.nome)+'</option>'; }).join('')+'</optgroup>':''); }
+  function opProf(did){ var dl=H.d.professores.filter(function(p){ return did && (p.disciplinas||[]).indexOf(did)>=0; }), resto=H.d.professores.filter(function(p){ return dl.indexOf(p)<0; });
+    return '<option value="">— Sem professor —</option>'+(dl.length?'<optgroup label="Dão esta disciplina">'+dl.map(function(p){ return '<option value="'+p.id+'"'+(a.p===p.id?' selected':'')+'>'+esc(p.nome)+'</option>'; }).join('')+'</optgroup>':'')+(resto.length?'<optgroup label="Outros">'+resto.map(function(p){ return '<option value="'+p.id+'"'+(a.p===p.id?' selected':'')+'>'+esc(p.nome)+'</option>'; }).join('')+'</optgroup>':''); }
+  modal('<div class="modal-h"><h3>'+DIAS_L[dd]+' · '+tp.i+'–'+tp.f+'</h3><button class="icon-btn" data-fechar>'+ic('x')+'</button></div><div class="modal-b">'+
+    '<label class="field">Disciplina<select class="sel" id="c-d">'+opDisc()+'</select></label>'+
+    '<label class="field">Professor<select class="sel" id="c-p">'+opProf(a.d)+'</select></label>'+
+    '<label class="field">Sala (opcional)<input class="inp" id="c-s" maxlength="30" value="'+esc(a.s||'')+'" placeholder="Ex.: Laboratório"></label>'+
+    '<label class="small" style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="c-all"> Repetir em todos os dias neste tempo</label></div>'+
+    '<div class="modal-f">'+(a.d?'<button class="btn danger" id="c-x">'+ic('trash')+'Limpar</button>':'')+'<button class="btn" data-fechar>Cancelar</button><button class="btn pri" id="c-ok">Aplicar</button></div>');
+  $('#c-d').onchange=function(){ a.d=this.value; var pv=$('#c-p').value; $('#c-p').innerHTML=opProf(this.value); $('#c-p').value=pv; if($('#c-p').value!==pv) $('#c-p').value=''; };
+  var x=$('#c-x'); if(x) x.onclick=function(){ delete g.aulas[chave]; H.sujo=true; fechar(); desenharH(); };
+  $('#c-ok').onclick=function(){
+    var d=$('#c-d').value, p=$('#c-p').value, s=$('#c-s').value.trim(), alvo=$('#c-all').checked?g.dias.map(function(z){ return z+'-'+ti; }):[chave];
+    alvo.forEach(function(k){ if(d) g.aulas[k]={d:d,p:p,s:s}; else delete g.aulas[k]; });
+    H.sujo=true; fechar(); desenharH();
+  };
+}
+
+/* ================= COMUNICADOS ================= */
+function pComunicados(){
+  aCarregar();
+  Promise.all([api('/comunicados'), api('/turmas')]).then(function(r){
+    var d=r[0]; if(!d.ok){ $('#page').innerHTML=erroCaixa(d.erro); return; }
+    S.turmas=r[1].ok?r[1].turmas:(S.turmas||[]);
+    var L=d.comunicados;
+    $('#page').innerHTML=ph('Escola','Comunicados', L.length? L.length+' comunicados publicados. As famílias vêem-nos no portal.' : 'Avise as famílias: reuniões, feriados, provas, eventos. Aparecem no portal e podem seguir por SMS.', '<button class="btn pri" id="c-novo">'+ic('plus')+'Novo comunicado</button>')+
+      (L.length? '<section class="card">'+L.map(function(c){ return '<div class="com"><div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start"><div><h4>'+esc(c.titulo)+'</h4><div class="small muted">'+data(c.data)+' · '+esc(c.autor)+' · '+(c.turma?'<span class="tag">'+esc(c.turma_nome||'Turma')+'</span>':'<span class="tag">Toda a escola</span>')+(c.sms?' · <span style="color:var(--ok);font-weight:700">SMS a '+c.sms+'</span>':'')+'</div></div><button class="btn sm danger" data-del="'+c.id+'" title="Apagar">'+ic('trash')+'</button></div><p>'+esc(c.texto)+'</p></div>'; }).join('')+'</section>'
+        : vazio('mega','Ainda sem comunicados','Publique o primeiro aviso. Por exemplo: "Reunião de encarregados sexta-feira às 15h".'));
+    $('#c-novo').onclick=novoComunicado;
+    $$('[data-del]').forEach(function(b){ b.onclick=function(){ confirmar('Apagar comunicado','O comunicado deixa de aparecer no portal das famílias. Os SMS já enviados não podem ser recolhidos.',function(btn){ api('/comunicado-apagar',{id:b.getAttribute('data-del')}).then(function(x){ if(!x.ok){ aGravar(btn,false); $('#cf-err').innerHTML=erroCaixa(x.erro); return; } fechar(); toast('Comunicado apagado'); pComunicados(); }); }); }; });
+  });
+}
+function novoComunicado(){
+  modal('<div class="modal-h"><h3>Novo comunicado</h3><button class="icon-btn" data-fechar>'+ic('x')+'</button></div><div class="modal-b">'+
+    '<label class="field">Título<input class="inp" id="n-t" maxlength="120" placeholder="Ex.: Reunião de encarregados"></label>'+
+    '<label class="field">Texto<textarea class="inp" id="n-x" maxlength="3000" placeholder="Escreva o aviso com a data, a hora e o local."></textarea><span class="small muted" id="n-c" style="font-weight:400">0 / 3000</span></label>'+
+    '<label class="field">Para quem<select class="sel" id="n-d"><option value="">Toda a escola</option>'+(S.turmas||[]).map(function(t){ return '<option value="'+t.id+'">Só a turma '+esc(t.nome)+'</option>'; }).join('')+'</select></label>'+
+    '<label style="display:flex;gap:10px;align-items:flex-start;color:var(--ink);font-size:14px;font-weight:600"><input type="checkbox" id="n-s" style="margin-top:3px"><span>Enviar também por SMS aos encarregados<br><span class="small muted" style="font-weight:400">Vai o título e o início do texto. Cada SMS tem custo.</span></span></label>'+
+    '<div id="n-err"></div></div><div class="modal-f"><button class="btn" data-fechar>Cancelar</button><button class="btn pri" id="n-ok">'+ic('mega')+'Publicar</button></div>');
+  $('#n-x').oninput=function(){ $('#n-c').textContent=this.value.length+' / 3000'; };
+  $('#n-ok').onclick=function(){
+    var btn=this; aGravar(btn,true);
+    api('/comunicado-guardar',{titulo:$('#n-t').value, texto:$('#n-x').value, turma:$('#n-d').value, sms:$('#n-s').checked}).then(function(r){
+      if(!r.ok){ aGravar(btn,false); $('#n-err').innerHTML=erroCaixa(r.erro); return; }
+      fechar(); toast(r.sms?'Publicado e enviado por SMS a '+r.sms+' encarregados':'Comunicado publicado'); if(r.aviso) setTimeout(function(){ toast(r.aviso); },400); pComunicados();
     });
   };
 }

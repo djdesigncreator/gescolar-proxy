@@ -82,6 +82,27 @@ label.pt-it{cursor:pointer}
 .barra-pagar small{display:block;opacity:.8;font-size:12.5px}
 .barra-pagar b{font:800 19px var(--f-display)}
 .barra-pagar .btn{background:var(--sun);border-color:var(--sun);color:#2c2000;height:44px;font-size:15px}
+.dias{display:flex;gap:6px;overflow-x:auto;margin-bottom:12px;scrollbar-width:none}
+.dias::-webkit-scrollbar{display:none}
+.dias button{flex:none;border:1px solid var(--line);background:var(--surface);border-radius:10px;padding:8px 14px;font:700 14px var(--f-body);color:var(--muted);cursor:pointer}
+.dias button.on{background:var(--blue);border-color:var(--blue);color:#fff}
+.dias button.hoje:not(.on){border-color:var(--blue);color:var(--blue)}
+.aula{display:flex;gap:12px;align-items:stretch;padding:12px 14px;border-bottom:1px solid var(--line)}
+.aula:last-child{border-bottom:0}
+.aula .hr{font-family:var(--f-mono);font-size:12.5px;color:var(--muted);width:52px;flex:none;line-height:1.35}
+.aula .barra{width:4px;border-radius:4px;flex:none}
+.aula .tx{flex:1;min-width:0}
+.aula .tx b{display:block;font-size:15px}
+.aula .tx small{color:var(--muted);font-size:13px}
+.aula.livre .tx b{color:var(--muted);font-weight:500}
+.aula.agora{background:var(--blue-soft)}
+.com-it{padding:14px 16px;border-bottom:1px solid var(--line)}
+.com-it:last-child{border-bottom:0}
+.com-it b{display:block;font-size:15.5px}
+.com-it small{color:var(--muted);font-size:12.5px}
+.com-it p{margin:6px 0 0;white-space:pre-wrap;font-size:14.5px;line-height:1.5;color:var(--ink)}
+.com-it p.corta{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.com-it button{background:none;border:0;padding:0;margin-top:4px;color:var(--blue);font:600 13.5px var(--f-body);cursor:pointer}
 .carregar{display:flex;align-items:center;justify-content:center;gap:12px;padding:60px 16px;color:var(--muted)}
 .carregar .spinner{margin:0;width:28px;height:28px;border-width:3px}
 .msg-err{background:var(--bad-soft);color:var(--bad);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600}
@@ -180,8 +201,10 @@ function pInicio(){
     '</div>'+
     '<div class="pt-g2"><div class="mini"><div class="l">Por pagar</div><div class="v num">'+mt(e.em_aberto)+'</div><div class="d">'+abertas.length+' mensalidade(s)</div></div>'+
       '<div class="mini"><div class="l">Último pagamento</div><div class="v num">'+(ult?mt(ult.valor):'—')+'</div><div class="d">'+(ult?data(ult.data)+' · '+esc((METODO[ult.metodo]||[ult.metodo])[0]):'Ainda sem pagamentos')+'</div></div></div>'+
-    '<div class="sec-t">Comunicados da escola</div>'+vazio('mega','Sem comunicados','Quando a escola publicar avisos, aparecem aqui.')+
+    '<div class="sec-t">Comunicados da escola</div>'+(e.comunicados&&e.comunicados.length ? '<div class="lista">'+e.comunicados.slice(0,S.todosCom?30:3).map(function(c){ var longo=c.texto.length>180; return '<div class="com-it"><b>'+esc(c.titulo)+'</b><small>'+data(c.data)+(c.turma?' · Turma '+esc(e.turma):' · Toda a escola')+'</small><p'+(longo?' class="corta"':'')+'>'+esc(c.texto)+'</p>'+(longo?'<button type="button" data-ler>Ler tudo</button>':'')+'</div>'; }).join('')+'</div>'+(e.comunicados.length>3&&!S.todosCom?'<div style="text-align:center;margin-top:10px"><button class="btn sm" id="todos-com">Ver todos ('+e.comunicados.length+')</button></div>':'') : vazio('mega','Sem comunicados','Quando a escola publicar avisos, aparecem aqui.'))+
     '<div class="sec-t">Contactos da escola</div><div class="lista"><div class="pt-it"><div class="tx"><b>'+esc(d.escola.nome)+'</b><small>'+esc([d.escola.telefone,d.escola.email].filter(Boolean).join(' · ')||'—')+'</small></div>'+(d.escola.telefone?'<a class="btn sm" href="tel:'+esc(String(d.escola.telefone).replace(/[^\d+]/g,''))+'">Ligar</a>':'')+'</div></div>';
+  $$('[data-ler]').forEach(function(x){ x.onclick=function(){ x.previousElementSibling.classList.remove('corta'); x.remove(); }; });
+  var tc=$('#todos-com'); if(tc) tc.onclick=function(){ S.todosCom=true; pInicio(); };
   var b=$('#pg-pagar'); if(b) b.onclick=function(){ S.sel={}; abertas.forEach(function(p){ if(p.estado==='atrasada') S.sel[p.id]=1; }); if(!Object.keys(S.sel).length && prox) S.sel[prox.id]=1; ir('propinas'); };
 }
 
@@ -280,7 +303,24 @@ function pRecibos(){
 
 /* ================= NOTAS E HORÁRIO (próxima fase) ================= */
 function pNotas(){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Notas e pautas</div>'+vazio('grade','As notas ainda não foram publicadas','Quando os professores lançarem as notas, aparecem aqui por disciplina e trimestre.'); }
-function pHorario(){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Horário da turma</div>'+vazio('cal','O horário ainda não foi publicado','Quando a escola publicar o horário da turma, aparece aqui.'); }
+var DIAS_L=['','Segunda','Terça','Quarta','Quinta','Sexta','Sábado'], DIAS_C=['','Seg','Ter','Qua','Qui','Sex','Sáb'];
+function pHorario(){
+  var e=educando(), h=e&&e.horario;
+  if(!h){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Horário da turma</div>'+vazio('cal','O horário ainda não foi publicado','Quando a escola publicar o horário da turma'+(e&&e.turma?' '+e.turma:'')+', aparece aqui.'); return; }
+  var hoje=new Date().getDay(); if(hoje===0) hoje=1;
+  if(!S.dia || h.dias.indexOf(S.dia)<0) S.dia = h.dias.indexOf(hoje)>=0 ? hoje : h.dias[0];
+  var agoraM=new Date().getHours()*60+new Date().getMinutes(), hm=function(x){ var p=x.split(':'); return (+p[0])*60+(+p[1]); };
+  var linhas=h.tempos.map(function(t,ti){ var a=h.aulas[S.dia+'-'+ti]; var agora=(S.dia===new Date().getDay() && agoraM>=hm(t.i) && agoraM<hm(t.f));
+    return a ? '<div class="aula'+(agora?' agora':'')+'"><div class="hr">'+t.i+'<br>'+t.f+'</div><div class="barra" style="background:'+esc(a.cor||'#0A64DC')+'"></div><div class="tx"><b>'+esc(a.disciplina)+(agora?' <span class="pill info">Agora</span>':'')+'</b><small>'+esc([a.professor,a.sala].filter(Boolean).join(' · ')||'—')+'</small></div></div>'
+             : '<div class="aula livre"><div class="hr">'+t.i+'<br>'+t.f+'</div><div class="barra" style="background:var(--line)"></div><div class="tx"><b>Sem aula</b></div></div>'; });
+  // tira os tempos livres do fim do dia
+  var ult=-1; h.tempos.forEach(function(t,ti){ if(h.aulas[S.dia+'-'+ti]) ult=ti; });
+  linhas = ult<0 ? [] : linhas.slice(0, ult+1);
+  $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Horário · Turma '+esc(e.turma)+'</div>'+
+    '<div class="dias">'+h.dias.map(function(d){ return '<button class="'+(d===S.dia?'on ':'')+(d===new Date().getDay()?'hoje':'')+'" data-dia="'+d+'">'+DIAS_C[d]+'</button>'; }).join('')+'</div>'+
+    (linhas.length? '<div class="lista">'+linhas.join('')+'</div>' : vazio('cal','Sem aulas','Não há aulas marcadas para '+DIAS_L[S.dia].toLowerCase()+'.'));
+  $$('[data-dia]').forEach(function(b){ b.onclick=function(){ S.dia=+b.getAttribute('data-dia'); pHorario(); }; });
+}
 
 /* ---------- arranque ---------- */
 fetch(PROXY+'/sessao',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SES.token}})
