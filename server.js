@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Escola de condução 1 (v5.0): /cursos /curso-guardar /curso-apagar /instruendos /inscrever /inscricao-estado
 //    Convites aos professores (v4.10): SMS automático ao registar · /professor-convite /professores-convite
 //    Palavra-passe e equipa (v4.9): /senha-pedir /senha-nova (código por SMS) · /equipa /equipa-criar /equipa-estado
 //    Assinatura e plataforma (v4.8): /assinatura /assinatura-pagar /assinatura-estado · /pl/resumo /pl/escola /pl/escola-guardar
@@ -39,7 +40,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.10.0';
+const VERSAO = 'gescolar-proxy 5.0.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -343,8 +344,14 @@ app.post('/painel', exigeDireccao, rota(async (req, res) => {
     resumoEscola(req.escola), procurarTodos('turma', f), procurarTodos('disciplina', f), procurarTodos('professor', f), procurarTodos('estudante', f)
   ]);
   const act = l => l.filter(x => x['Activa'] !== false && x['Activo'] !== false);
-  const t = act(turmas), d = act(disciplinas), p = act(professores), e = estudantes.filter(x => (x['Estado'] || 'activo') === 'activo');
-  res.json({ ok: true, escola, contagem: { turmas: t.length, disciplinas: d.length, professores: p.length, estudantes: e.length },
+  const t = act(turmas), d = act(disciplinas), p = act(professores), todos = estudantes.filter(x => (x['Estado'] || 'activo') === 'activo');
+  const e = todos.filter(x => !String(x['Numero'] || '').startsWith('C'));
+  let cursos = 0, instruendos = 0;
+  if (escola && (escola.niveis || []).includes('CON')) {
+    const [cs, ins] = await Promise.all([procurarTodos('cursoconducao', f), procurarTodos('inscricaoconducao', f)]);
+    cursos = cs.filter(c => c['Activo'] !== false).length; instruendos = ins.filter(i => (i['Estado'] || 'activa') === 'activa').length;
+  }
+  res.json({ ok: true, escola, contagem: { turmas: t.length, disciplinas: d.length, professores: p.length, estudantes: e.length, cursos, instruendos },
     arranque: [
       { id: 'turmas', feito: t.length > 0, n: t.length },
       { id: 'disciplinas', feito: d.length > 0, n: d.length },
@@ -1975,6 +1982,121 @@ app.post('/professores-convite', exigeDireccao, rota(async (req, res) => {
   let enviados = 0;
   for (const p of alvo) if (await convidarProfessor(req.escola, p, esc).catch(() => false)) enviados++;
   res.json({ ok: true, enviados, sem_telefone: profs.filter(p => p['Activo'] !== false).length - alvo.length });
+}));
+
+// ============================================================
+//  ESCOLA DE CONDUÇÃO · PARTE 1: CURSOS E INSCRIÇÕES (v5.0)
+//  O instruendo é um Estudante (sem turma, com telemóvel próprio): assim usa o mesmo portal,
+//  as mesmas cobranças (Propina com Tipo "prestacao", sem multa) e os mesmos recibos.
+//  Bubble:
+//   Curso Conducao:    Escola (Escola) · Categoria (text) · Nome (text) · Preco (number) · Prestacoes (number)
+//                      · Aulas Teoricas (number) · Aulas Praticas (number) · Idade Minima (number) · Activo (yes/no)
+//   Inscricao Conducao: Escola (Escola) · Estudante (text) · Curso (text) · Categoria (text) · Data Inscricao (date)
+//                      · Estado (text: activa | concluida | desistiu) · Preco (number) · Prestacoes (number)
+// ============================================================
+const CATEGORIAS = {
+  A1: { nome: 'Motociclos até 125 cc', idade: 16 }, A: { nome: 'Motociclos', idade: 18 }, B: { nome: 'Ligeiros', idade: 18 },
+  BE: { nome: 'Ligeiros com reboque', idade: 18 }, C: { nome: 'Pesados de mercadorias', idade: 18 }, CE: { nome: 'Pesados com reboque', idade: 18 }, D: { nome: 'Pesados de passageiros', idade: 25 }
+};
+const cursoOut = (c, ins) => ({ id: c._id, categoria: c['Categoria'] || '', nome: c['Nome'] || '', preco: Number(c['Preco'] || 0), prestacoes: Number(c['Prestacoes'] || 1),
+  teoricas: Number(c['Aulas Teoricas'] || 0), praticas: Number(c['Aulas Praticas'] || 0), idade: Number(c['Idade Minima'] || (CATEGORIAS[c['Categoria']] || {}).idade || 18), activo: c['Activo'] !== false,
+  inscritos: ins ? ins.filter(i => i['Curso'] === c._id && (i['Estado'] || 'activa') === 'activa').length : undefined });
+app.post('/cursos', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [cs, ins] = await Promise.all([procurarTodos('cursoconducao', f), procurarTodos('inscricaoconducao', f)]);
+  res.json({ ok: true, categorias: CATEGORIAS, cursos: cs.filter(c => c['Activo'] !== false).map(c => cursoOut(c, ins)).sort((a, b) => Object.keys(CATEGORIAS).indexOf(a.categoria) - Object.keys(CATEGORIAS).indexOf(b.categoria) || a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/curso-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, cat = String(b.categoria || '').toUpperCase();
+  if (!CATEGORIAS[cat]) return erro(res, 400, 'Escolha a categoria da carta.');
+  const preco = Math.round(Number(b.preco)), prest = Math.round(Number(b.prestacoes || 1));
+  if (!(preco > 0)) return erro(res, 400, 'Escreva o preço do curso.');
+  if (!(prest >= 1 && prest <= 12)) return erro(res, 400, 'As prestações vão de 1 a 12.');
+  const campos = { 'Escola': req.escola, 'Categoria': cat, 'Nome': txt(b.nome, 80) || ('Carta ' + cat + ' · ' + CATEGORIAS[cat].nome), 'Preco': preco, 'Prestacoes': prest,
+    'Aulas Teoricas': Math.max(0, Math.round(Number(b.teoricas) || 0)), 'Aulas Praticas': Math.max(0, Math.round(Number(b.praticas) || 0)),
+    'Idade Minima': Math.max(CATEGORIAS[cat].idade, Math.round(Number(b.idade) || 0)), 'Activo': true };
+  let id = b.id ? String(b.id) : null;
+  if (id) { await daMinhaEscola('cursoconducao', id, req.escola); await mudar('cursoconducao', id, campos); } else id = await criar('cursoconducao', campos);
+  res.json({ ok: true, id });
+}));
+app.post('/curso-apagar', exigeDireccao, rota(async (req, res) => {
+  const c = await daMinhaEscola('cursoconducao', String((req.body || {}).id || ''), req.escola);
+  await mudar('cursoconducao', c._id, { 'Activo': false });
+  res.json({ ok: true });
+}));
+function idadeEm(nasc) { const n = new Date(nasc), h = new Date(); let a = h.getUTCFullYear() - n.getUTCFullYear(); if (h.getUTCMonth() < n.getUTCMonth() || (h.getUTCMonth() === n.getUTCMonth() && h.getUTCDate() < n.getUTCDate())) a--; return a; }
+app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [ins, cs, ests, props, esc] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola)]);
+  const CM = Object.fromEntries(cs.map(c => [c._id, c])), EM = Object.fromEntries(ests.map(e => [e._id, e]));
+  const regras = (esc && esc.regras) || {};
+  res.json({ ok: true, instruendos: ins.map(i => {
+    const e = EM[i['Estudante']] || {}, c = CM[i['Curso']] || {};
+    const ps = props.filter(p => p['Estudante'] === i['Estudante'] && p['Estado'] !== 'anulada').map(p => Object.assign({ id: p._id, vencimento: p['Vencimento'], descricao: p['Descricao'] }, calcPropina(p, regras)));
+    const pago = ps.filter(p => p.estado === 'paga').reduce((x, p) => x + p.total, 0), total = ps.reduce((x, p) => x + p.total, 0);
+    const prox = ps.filter(p => p.estado !== 'paga').sort((a, b) => String(a.vencimento).localeCompare(String(b.vencimento)))[0];
+    return { id: i._id, estudante: i['Estudante'], nome: e['Nome'] || '', numero: e['Numero'] || '', telefone: e['Telefone'] || '', nascimento: e['Data Nascimento'] || null,
+      curso: c['Nome'] || '', categoria: i['Categoria'] || c['Categoria'] || '', data: i['Data Inscricao'] || i['Created Date'] || null, estado: i['Estado'] || 'activa',
+      preco: Number(i['Preco'] || 0), pago, total, em_atraso: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
+      proxima: prox ? { valor: prox.total, vencimento: prox.vencimento } : null };
+  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, nome = txt(b.nome, 100);
+  if (nome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do instruendo.');
+  const tel = tel9(b.telefone);
+  if (tel.length !== 9) return erro(res, 400, 'O telemóvel tem 9 dígitos. É por ele que o instruendo entra no portal e recebe avisos.');
+  if (!b.nascimento || isNaN(Date.parse(b.nascimento))) return erro(res, 400, 'Escreva a data de nascimento: a idade mínima depende da categoria.');
+  const c = await daMinhaEscola('cursoconducao', String(b.curso || ''), req.escola);
+  if (c['Activo'] === false) return erro(res, 400, 'Este curso já não está activo.');
+  const idade = idadeEm(b.nascimento), minima = Number(c['Idade Minima'] || (CATEGORIAS[c['Categoria']] || {}).idade || 18);
+  if (idade < minima) return erro(res, 400, 'A carta ' + c['Categoria'] + ' exige pelo menos ' + minima + ' anos. O instruendo tem ' + idade + '.');
+  const prest = Math.max(1, Math.min(Number(c['Prestacoes'] || 1), Math.round(Number(b.prestacoes) || Number(c['Prestacoes'] || 1))));
+  const preco = Number(c['Preco'] || 0);
+  const inicio = b.inicio && !isNaN(Date.parse(b.inicio)) ? new Date(b.inicio + 'T12:00:00Z') : new Date();
+  // número do instruendo: C<ano>-0001 (separado dos estudantes)
+  const ests = await procurarTodos('estudante', daEscola(req.escola));
+  const ano = String(new Date().getFullYear());
+  const repetido = ests.find(e => tel9(e['Telefone']) === tel && (e['Estado'] || 'activo') === 'activo' && String(e['Numero'] || '').startsWith('C'));
+  let estId, numero;
+  if (repetido) { estId = repetido._id; numero = repetido['Numero']; }
+  else {
+    const maior = ests.map(e => String(e['Numero'] || '')).filter(n => n.startsWith('C' + ano + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, x) => Math.max(a, x), 0);
+    numero = 'C' + ano + '-' + String(maior + 1).padStart(4, '0');
+    const campos = { 'Escola': req.escola, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'),
+      'Data Nascimento': new Date(b.nascimento).toISOString(), 'Ano Lectivo': ano, 'Data Matricula': new Date().toISOString(), 'Estado': 'activo' };
+    estId = await criar('estudante', campos);
+  }
+  const insId = await criar('inscricaoconducao', { 'Escola': req.escola, 'Estudante': estId, 'Curso': c._id, 'Categoria': c['Categoria'], 'Data Inscricao': new Date().toISOString(), 'Estado': 'activa', 'Preco': preco, 'Prestacoes': prest });
+  // prestações: dividir o preço; a primeira vence no dia da inscrição (ou no início escolhido), as outras de mês a mês
+  const base = Math.floor(preco / prest), resto = preco - base * prest, linhas = [];
+  for (let k = 0; k < prest; k++) {
+    const v = new Date(inicio); v.setUTCMonth(v.getUTCMonth() + k); v.setUTCHours(21, 59, 0, 0);
+    const valor = base + (k === 0 ? resto : 0);
+    linhas.push({ 'Escola': req.escola, 'Estudante': estId, 'Ano Lectivo': String(v.getUTCFullYear()), 'Tipo': 'prestacao', 'Mes': v.getUTCMonth() + 1,
+      'Descricao': 'Carta ' + c['Categoria'] + ' · ' + (prest === 1 ? 'pagamento único' : 'prestação ' + (k + 1) + '/' + prest), 'Valor': valor, 'Vencimento': v.toISOString(), 'Multa': 0, 'Total': valor, 'Estado': 'aberta' });
+  }
+  await criarEmLote('propina', linhas);
+  const esc = await obter('escola', req.escola).catch(() => null);
+  let sms = false;
+  if (b.sms !== false && esc) {
+    const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
+    const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Estudante).');
+    sms = r.ok;
+  }
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, id: insId, estudante: estId, numero, prestacoes: prest, sms });
+}));
+app.post('/inscricao-estado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, estado = String(b.estado || '');
+  if (!['activa', 'concluida', 'desistiu'].includes(estado)) return erro(res, 400, 'Estado inválido.');
+  const i = await daMinhaEscola('inscricaoconducao', String(b.id || ''), req.escola);
+  await mudar('inscricaoconducao', i._id, { 'Estado': estado });
+  if (estado === 'desistiu') { // prestações por pagar ficam anuladas
+    const ps = await procurarTodos('propina', daEscola(req.escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: i['Estudante'] }, { key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]));
+    for (const p of ps.filter(x => x['Estado'] !== 'paga')) await mudar('propina', p._id, { 'Estado': 'anulada' }).catch(() => {});
+  }
+  res.json({ ok: true, estado });
 }));
 
 // ============================================================
