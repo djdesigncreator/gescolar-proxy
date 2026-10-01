@@ -25,7 +25,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.0.0';
+const VERSAO = 'gescolar-proxy 4.0.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -506,9 +506,21 @@ function achar(obj, nomes, prof) {
   for (const k of Object.keys(obj)) { const v = achar(obj[k], nomes, (prof || 0) + 1); if (v != null && v !== '') return v; }
   return undefined;
 }
+// o link pode vir com ou sem https://, num campo com nome próprio, ou dentro de texto/HTML
+const CAMPOS_LINK = ['link', 'url', 'checkout_url', 'checkoutUrl', 'checkout', 'payment_url', 'paymentUrl', 'payment_link', 'redirect_url', 'redirect', 'session_url', 'href'];
+function normalLink(v) {
+  if (typeof v !== 'string') return undefined;
+  v = v.trim().replace(/^["']|["']$/g, '');
+  const m = v.match(/https?:\/\/[^\s"'<>]+/i);
+  if (m) return m[0];
+  if (/^\/\/[^\s]+\.[a-z]{2,}/i.test(v)) return 'https:' + v;
+  if (/^(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(\/[^\s]*)?$/i.test(v) && v.indexOf('.') > 0 && !/^\d+(\.\d+)*$/.test(v)) return 'https://' + v;
+  return undefined;
+}
 function acharLink(obj, prof) {
-  if (typeof obj === 'string') return /^https?:\/\//i.test(obj) ? obj : undefined;
-  if (!obj || typeof obj !== 'object' || (prof || 0) > 4) return undefined;
+  if (typeof obj === 'string') { const m = obj.match(/https?:\/\/[^\s"'<>]+/i); return m ? m[0] : undefined; }
+  if (!obj || typeof obj !== 'object' || (prof || 0) > 5) return undefined;
+  for (const n of CAMPOS_LINK) { const v = normalLink(obj[n]); if (v) return v; }
   for (const k of Object.keys(obj)) { const v = acharLink(obj[k], (prof || 0) + 1); if (v) return v; }
   return undefined;
 }
@@ -538,7 +550,7 @@ async function mozPedido(caminho, corpo) {
     const r = await fetch(MOZ_BASE + '/' + caminho, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(corpo) });
     const t = await r.text(); let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
     if ((r.status === 401 || r.status === 403) && tentativa === 0) continue;   // token caducado: novo login e repete
-    console.log('[moz] ' + caminho + ' → ' + r.status + ' ' + t.slice(0, 300));
+    console.log('[moz] ' + caminho + ' → ' + r.status + ' ' + t.slice(0, 1500));
     if (!r.ok) { const e = new Error(achar(d, ['message', 'mensagem', 'error', 'erro']) || ('MozPayment respondeu ' + r.status)); e.moz = d; throw e; }
     return d;
   }
@@ -683,7 +695,7 @@ app.post('/pagar', exigeDireccao, rota(async (req, res) => {
     if (metodo === 'cartao') {
       const d = await mozPedido(MOZ_CARD_PATH, { valor: String(total), nome_cliente: nome, carteira: MOZ_WALLET, nome_producto: produto.slice(0, 120) });
       const link = acharLink(d);
-      if (!link) throw new Error('A MozPayment não devolveu o link de pagamento.');
+      if (!link) throw new Error('sem link na resposta: ' + JSON.stringify(d).slice(0, 220));
       const sessao = String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || '');
       await mudar('pagamento', pagId, { 'Referencia': sessao, 'Raw': JSON.stringify(d).slice(0, 4000) });
       return res.json({ ok: true, pagamento: pagId, estado: 'pendente', link, total });
@@ -695,7 +707,7 @@ app.post('/pagar', exigeDireccao, rota(async (req, res) => {
   } catch (e) {
     console.error('[pagar]', e.message);
     await mudar('pagamento', pagId, { 'Estado': 'falhado', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
-    erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(e.message).slice(0, 160));
+    erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(e.message).slice(0, 300));
   }
 }));
 
