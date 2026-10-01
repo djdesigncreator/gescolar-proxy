@@ -11,18 +11,21 @@
 //    Direcção (v3): /painel /turmas /turma-guardar /turma-apagar /disciplinas /disciplina-guardar
 //                   /disciplina-apagar /disciplinas-modelo /professores /professor-guardar
 //                   /professor-apagar /estudantes /matricular
+//    Propinas e pagamentos (v4): /propinas-gerar /propinas /pagar /pagar-balcao /pagamento-estado /pagamentos
+//                                GET|POST /wh-moz/<MOZ_WEBHOOK_KEY>  — webhook da MozPayment
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
 //    BUBBLE_TOKEN    token de admin da Data API
 //    SESSION_SECRET  frase longa e aleatória que assina as sessões
 //    ORIGENS         endereços das páginas, separados por vírgulas
+//    MOZ_EMAIL, MOZ_SENHA, MOZ_WALLET, MOZ_WEBHOOK_KEY, MOZ_CARD_PATH (ver secção PAGAMENTOS)
 // ============================================================
 'use strict';
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 3.0.0';
+const VERSAO = 'gescolar-proxy 4.0.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -156,7 +159,7 @@ async function abrirSessao(userId) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -475,6 +478,303 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
   const id = await criar('estudante', campos);
   res.json({ ok: true, id, numero });
 }));
+
+
+// ============================================================
+//  PAGAMENTOS (versão 4)
+//  MozPayment: login → token; M-Pesa / e-Mola (push para o telemóvel); cartão (link de checkout)
+//  Carteira única do Gescolar (MOZ_WALLET). O Gescolar separa internamente o que é de cada escola.
+//
+//  Variáveis:
+//    MOZ_EMAIL, MOZ_SENHA      conta MozPayment (nunca no código)
+//    MOZ_WALLET                carteira que recebe tudo
+//    MOZ_BASE                  https://mozpayment.co.mz/api/1.1/wf   (por defeito)
+//    MOZ_CARD_PATH             caminho do cartão: payment (por defeito) ou bankpayment
+//    MOZ_WEBHOOK_KEY           chave que faz parte do URL do webhook
+// ============================================================
+const MOZ_BASE = (process.env.MOZ_BASE || 'https://mozpayment.co.mz/api/1.1/wf').replace(/\/+$/, '');
+const MOZ_EMAIL = process.env.MOZ_EMAIL || '';
+const MOZ_SENHA = process.env.MOZ_SENHA || '';
+const MOZ_WALLET = process.env.MOZ_WALLET || '';
+const MOZ_CARD_PATH = (process.env.MOZ_CARD_PATH || 'payment').replace(/^\/+/, '');
+const MOZ_WEBHOOK_KEY = process.env.MOZ_WEBHOOK_KEY || '';
+
+// procura um campo em qualquer nível da resposta (a MozPayment nem sempre devolve no mesmo sítio)
+function achar(obj, nomes, prof) {
+  if (!obj || typeof obj !== 'object' || (prof || 0) > 4) return undefined;
+  for (const n of nomes) if (obj[n] != null && obj[n] !== '') return obj[n];
+  for (const k of Object.keys(obj)) { const v = achar(obj[k], nomes, (prof || 0) + 1); if (v != null && v !== '') return v; }
+  return undefined;
+}
+function acharLink(obj, prof) {
+  if (typeof obj === 'string') return /^https?:\/\//i.test(obj) ? obj : undefined;
+  if (!obj || typeof obj !== 'object' || (prof || 0) > 4) return undefined;
+  for (const k of Object.keys(obj)) { const v = acharLink(obj[k], (prof || 0) + 1); if (v) return v; }
+  return undefined;
+}
+function sessionDoLink(link) {
+  try {
+    const u = new URL(link);
+    for (const k of ['session_id', 'sessionId', 'session', 'sid', 'checkout_session', 'id']) { const v = u.searchParams.get(k); if (v) return v; }
+    const partes = u.pathname.split('/').filter(Boolean); return partes[partes.length - 1] || null;
+  } catch (e) { return null; }
+}
+
+let MOZ_TOKEN = null, MOZ_TOKEN_ATE = 0;
+async function mozLogin(forcar) {
+  if (!forcar && MOZ_TOKEN && Date.now() < MOZ_TOKEN_ATE) return MOZ_TOKEN;
+  if (!MOZ_EMAIL || !MOZ_SENHA) throw new Error('MOZ_EMAIL ou MOZ_SENHA em falta no container');
+  const r = await fetch(MOZ_BASE + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: MOZ_EMAIL, senha: MOZ_SENHA }) });
+  const t = await r.text(); let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
+  const token = achar(d, ['token', 'access_token', 'accessToken', 'jwt']);
+  if (!r.ok || !token) throw new Error('login MozPayment falhou (' + r.status + '): ' + t.slice(0, 200));
+  const segs = Number(achar(d, ['expires', 'expires_in'])) || 3600;
+  MOZ_TOKEN = String(token); MOZ_TOKEN_ATE = Date.now() + Math.max(300, segs - 120) * 1000;
+  return MOZ_TOKEN;
+}
+async function mozPedido(caminho, corpo) {
+  for (let tentativa = 0; tentativa < 2; tentativa++) {
+    const token = await mozLogin(tentativa > 0);
+    const r = await fetch(MOZ_BASE + '/' + caminho, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(corpo) });
+    const t = await r.text(); let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
+    if ((r.status === 401 || r.status === 403) && tentativa === 0) continue;   // token caducado: novo login e repete
+    console.log('[moz] ' + caminho + ' → ' + r.status + ' ' + t.slice(0, 300));
+    if (!r.ok) { const e = new Error(achar(d, ['message', 'mensagem', 'error', 'erro']) || ('MozPayment respondeu ' + r.status)); e.moz = d; throw e; }
+    return d;
+  }
+  throw new Error('A MozPayment recusou o acesso (verifique MOZ_EMAIL e MOZ_SENHA).');
+}
+
+// ---------- multas calculadas no momento ----------
+function calcPropina(p, regras) {
+  const valor = Number(p['Valor'] || 0);
+  const estado = p['Estado'] || 'aberta';
+  if (estado === 'paga' || estado === 'anulada') return { valor, multa: Number(p['Multa'] || 0), total: Number(p['Total'] || valor), estado, meses_atraso: 0 };
+  const venc = p['Vencimento'] ? new Date(p['Vencimento']) : null;
+  let meses = 0;
+  if (venc && Date.now() > venc.getTime() + 864e5 - 1) meses = Math.max(1, Math.ceil((Date.now() - venc.getTime()) / (30 * 864e5)));
+  const pct = (p['Tipo'] || 'propina') === 'propina' && meses ? Math.min(Number(regras.multa_max || 25), Number(regras.multa || 0) * meses) : 0;
+  const multa = Math.round(valor * pct / 100);
+  return { valor, multa, total: valor + multa, estado: meses ? 'atrasada' : 'aberta', meses_atraso: meses };
+}
+const MESES_NOME = ['', 'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+
+// ---------- criação em lote (Bubble bulk) ----------
+async function criarEmLote(tipo, lista) {
+  let criados = 0;
+  for (let i = 0; i < lista.length; i += 500) {
+    const fatia = lista.slice(i, i + 500);
+    const r = await fetch(BUBBLE_BASE + '/' + tipo + '/bulk', { method: 'POST', headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN, 'Content-Type': 'text/plain' }, body: fatia.map(x => JSON.stringify(x)).join('\n') });
+    const t = await r.text();
+    if (!r.ok) throw new Error('bulk ' + tipo + ': ' + t.slice(0, 200));
+    criados += t.split('\n').filter(l => /"status"\s*:\s*"success"/.test(l)).length;
+  }
+  return criados;
+}
+
+// ---------- propinas: gerar, listar ----------
+app.post('/propinas-gerar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const de = Math.max(1, Math.min(12, num(b.de, 2))), ate = Math.max(de, Math.min(12, num(b.ate, 11)));
+  const escola = await resumoEscola(req.escola);
+  const ano = Number((escola && escola.ano) || new Date().getFullYear());
+  const dia = Math.max(1, Math.min(28, Number((escola && escola.regras.dia_limite) || 10)));
+  const f = daEscola(req.escola);
+  let turmas = (await procurarTodos('turma', f)).filter(t => t['Activa'] !== false);
+  if (b.turma) turmas = turmas.filter(t => t._id === String(b.turma));
+  if (!turmas.length) return erro(res, 400, 'Escolha uma turma.');
+  const [estudantes, existentes] = await Promise.all([procurarTodos('estudante', f), procurarTodos('propina', f)]);
+  const ja = new Set(existentes.filter(p => (p['Tipo'] || 'propina') === 'propina').map(p => p['Estudante'] + '|' + p['Ano Lectivo'] + '|' + p['Mes']));
+  const novas = [];
+  let semValor = 0;
+  for (const t of turmas) {
+    const valor = Number(t['Propina Mensal'] || 0);
+    const daTurma = estudantes.filter(e => e['Turma'] === t._id && (e['Estado'] || 'activo') === 'activo');
+    if (!valor) { semValor += daTurma.length ? 1 : 0; continue; }
+    for (const e of daTurma) for (let m = de; m <= ate; m++) {
+      if (ja.has(e._id + '|' + ano + '|' + m)) continue;
+      const linha = { 'Escola': req.escola, 'Estudante': e._id, 'Turma': t._id, 'Ano Lectivo': String(ano), 'Tipo': 'propina', 'Mes': m,
+        'Descricao': 'Propina de ' + MESES_NOME[m] + ' ' + ano + ' · ' + t['Nome'], 'Valor': valor, 'Vencimento': new Date(Date.UTC(ano, m - 1, dia, 21, 59)).toISOString(),
+        'Multa': 0, 'Total': valor, 'Estado': 'aberta' };
+      if (e['Encarregado']) linha['Encarregado'] = e['Encarregado'];
+      novas.push(linha);
+    }
+  }
+  const criadas = novas.length ? await criarEmLote('propina', novas) : 0;
+  res.json({ ok: true, criadas, pedidas: novas.length, turmas_sem_valor: semValor });
+}));
+
+app.post('/propinas', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, f = daEscola(req.escola);
+  const filtros = b.turma ? f.concat([{ key: 'Turma', constraint_type: 'equals', value: String(b.turma) }]) : f;
+  const [escola, props, est, encs] = await Promise.all([resumoEscola(req.escola), procurarTodos('propina', filtros, 6000), procurarTodos('estudante', filtros), procurarTodos('encarregado', f)]);
+  const regras = (escola && escola.regras) || {};
+  const porEst = {};
+  for (const p of props) {
+    if (p['Estado'] === 'anulada') continue;
+    const c = calcPropina(p, regras);
+    (porEst[p['Estudante']] = porEst[p['Estudante']] || []).push({ id: p._id, mes: p['Mes'], descricao: p['Descricao'], tipo: p['Tipo'] || 'propina', vencimento: p['Vencimento'], pago_em: p['Pago Em'] || null, ...c });
+  }
+  const lista = est.filter(e => (e['Estado'] || 'activo') === 'activo').map(e => {
+    const en = encs.find(x => x._id === e['Encarregado']);
+    const ps = (porEst[e._id] || []).sort((a, b) => (a.mes || 0) - (b.mes || 0));
+    const divida = ps.filter(p => p.estado === 'atrasada').reduce((s, p) => s + p.total, 0);
+    return { id: e._id, nome: e['Nome'], numero: e['Numero'], turma: e['Turma'], encarregado: en ? { nome: en['Nome'], telefone: en['Telefone'] || '' } : null, propinas: ps, divida };
+  }).sort((a, b) => b.divida - a.divida || a.nome.localeCompare(b.nome, 'pt'));
+  const tot = { cobrado: 0, divida: 0, multas: 0, atraso: 0 };
+  lista.forEach(e => e.propinas.forEach(p => { if (p.estado === 'paga') tot.cobrado += p.total; if (p.estado === 'atrasada') { tot.divida += p.total; tot.multas += p.multa; } }));
+  tot.atraso = lista.filter(e => e.divida > 0).length;
+  res.json({ ok: true, estudantes: lista, totais: tot, regras });
+}));
+
+// ---------- cobrar ----------
+async function prepararCobranca(req, ids) {
+  if (!Array.isArray(ids) || !ids.length) { const e = new Error('Escolha pelo menos uma mensalidade.'); e.publico = 400; throw e; }
+  const escola = await resumoEscola(req.escola);
+  const ps = [];
+  for (const id of ids.map(String)) {
+    const p = await daMinhaEscola('propina', id, req.escola);
+    if (p['Estado'] === 'paga') { const e = new Error('Uma das mensalidades escolhidas já está paga.'); e.publico = 409; throw e; }
+    if (p['Estado'] === 'anulada') { const e = new Error('Uma das mensalidades escolhidas foi anulada.'); e.publico = 409; throw e; }
+    ps.push({ p, c: calcPropina(p, (escola && escola.regras) || {}) });
+  }
+  const total = ps.reduce((s, x) => s + x.c.total, 0), multa = ps.reduce((s, x) => s + x.c.multa, 0);
+  return { escola, ps, total, multa };
+}
+async function aplicarPago(pag, extra) {
+  const agora = new Date().toISOString();
+  const documento = await proximoDocumento(pag['Escola']);
+  await mudar('pagamento', pag._id, Object.assign({ 'Estado': 'pago', 'Pago Em': agora, 'Documento': documento }, extra || {}));
+  for (const pid of (pag['Propinas'] || [])) {
+    const p = await obter('propina', pid).catch(() => null);
+    const escola = p ? await resumoEscola(p['Escola']) : null;
+    const c = p ? calcPropina(p, (escola && escola.regras) || {}) : { multa: 0, total: 0 };
+    await mudar('propina', pid, { 'Estado': 'paga', 'Pago Em': agora, 'Pagamento': pag._id, 'Multa': c.multa, 'Total': c.total }).catch(e => console.error('[pago] propina ' + pid + ': ' + e.message));
+  }
+  return documento;
+}
+async function proximoDocumento(escola) {
+  const ano = new Date().getFullYear();
+  const pagos = await procurarTodos('pagamento', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Documento', constraint_type: 'is_not_empty' }]);
+  const maior = pagos.map(p => String(p['Documento'] || '')).filter(d => d.indexOf('FR ' + ano + '/') === 0)
+    .map(d => parseInt(d.split('/')[1], 10) || 0).reduce((a, c) => Math.max(a, c), 0);
+  return 'FR ' + ano + '/' + String(maior + 1).padStart(6, '0');
+}
+
+app.post('/pagar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const metodo = String(b.metodo || '').toLowerCase();
+  if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
+  if (!MOZ_WALLET) return erro(res, 500, 'O servidor ainda não tem a carteira configurada (MOZ_WALLET).');
+  const { ps, total, multa } = await prepararCobranca(req, b.propinas);
+  const est = ps[0].p['Estudante'] ? await obter('estudante', ps[0].p['Estudante']).catch(() => null) : null;
+  const nome = txt(b.nome, 80) || (est && est['Nome']) || 'Encarregado';
+  const numero = soDigitos(b.numero);
+  if (metodo !== 'cartao') {
+    if (numero.length !== 9) return erro(res, 400, 'O número tem 9 dígitos, por exemplo 84 123 4567.');
+    const pre = numero.slice(0, 2);
+    if (metodo === 'mpesa' && !['84', '85'].includes(pre)) return erro(res, 400, 'M-Pesa só funciona com números Vodacom (84 ou 85).');
+    if (metodo === 'emola' && !['86', '87'].includes(pre)) return erro(res, 400, 'e-Mola só funciona com números Movitel (86 ou 87).');
+  }
+  const pagId = await criar('pagamento', { 'Escola': req.escola, 'Estudante': ps[0].p['Estudante'] || undefined, 'Encarregado': ps[0].p['Encarregado'] || undefined,
+    'Propinas': ps.map(x => x.p._id), 'Metodo': metodo, 'Telefone': numero, 'Valor': total, 'Multa Incluida': multa, 'Estado': 'pendente' });
+  const produto = ps.length === 1 ? (ps[0].p['Descricao'] || 'Propina') : ps.length + ' mensalidades · ' + ((est && est['Nome']) || '');
+  try {
+    if (metodo === 'cartao') {
+      const d = await mozPedido(MOZ_CARD_PATH, { valor: String(total), nome_cliente: nome, carteira: MOZ_WALLET, nome_producto: produto.slice(0, 120) });
+      const link = acharLink(d);
+      if (!link) throw new Error('A MozPayment não devolveu o link de pagamento.');
+      const sessao = String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || '');
+      await mudar('pagamento', pagId, { 'Referencia': sessao, 'Raw': JSON.stringify(d).slice(0, 4000) });
+      return res.json({ ok: true, pagamento: pagId, estado: 'pendente', link, total });
+    }
+    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(total), number: numero, name: nome });
+    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
+    await mudar('pagamento', pagId, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
+    res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
+  } catch (e) {
+    console.error('[pagar]', e.message);
+    await mudar('pagamento', pagId, { 'Estado': 'falhado', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
+    erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(e.message).slice(0, 160));
+  }
+}));
+
+app.post('/pagar-balcao', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const { ps, total, multa } = await prepararCobranca(req, b.propinas);
+  const pagId = await criar('pagamento', { 'Escola': req.escola, 'Estudante': ps[0].p['Estudante'] || undefined, 'Encarregado': ps[0].p['Encarregado'] || undefined,
+    'Propinas': ps.map(x => x.p._id), 'Metodo': 'balcao', 'Valor': total, 'Multa Incluida': multa, 'Estado': 'pendente', 'Recebido Por': req.sessao.u,
+    'Referencia': 'CX-' + Date.now().toString(36).toUpperCase() });
+  const pag = await obter('pagamento', pagId);
+  const documento = await aplicarPago(pag, { 'Transacao': 'numerario' });
+  res.json({ ok: true, pagamento: pagId, estado: 'pago', documento, total });
+}));
+
+app.post('/pagamento-estado', exigeDireccao, rota(async (req, res) => {
+  const p = await daMinhaEscola('pagamento', String((req.body || {}).id || ''), req.escola);
+  res.json({ ok: true, estado: p['Estado'] || 'pendente', documento: p['Documento'] || null, valor: p['Valor'] || 0, metodo: p['Metodo'] || '' });
+}));
+
+app.post('/pagamentos', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [pags, est] = await Promise.all([procurarTodos('pagamento', f, 3000), procurarTodos('estudante', f)]);
+  res.json({ ok: true, pagamentos: pags.filter(p => p['Estado'] === 'pago').map(p => { const e = est.find(x => x._id === p['Estudante']);
+    return { id: p._id, documento: p['Documento'], data: p['Pago Em'], metodo: p['Metodo'], valor: p['Valor'], multa: p['Multa Incluida'] || 0, estudante: e ? e['Nome'] : '', numero: e ? e['Numero'] : '', referencia: p['Referencia'] || '', transacao: p['Transacao'] || '', telefone: p['Telefone'] || '' }; })
+    .sort((a, b) => String(b.data).localeCompare(String(a.data))) });
+}));
+
+// ============================================================
+//  WEBHOOK DA MOZPAYMENT
+//  POST /wh-moz/<MOZ_WEBHOOK_KEY>
+//  { transaction_id, reference, status, payment_method, wallet, amount, phone, client_name, product_name, reason, timestamp }
+//  O "reason" traz o idpayment (M-Pesa/e-Mola) ou o session_id (cartão) que guardámos em Pagamento.Referencia.
+// ============================================================
+function chaveCerta(c) {
+  if (!MOZ_WEBHOOK_KEY || !c) return false;
+  const a = Buffer.from(String(c)), b = Buffer.from(MOZ_WEBHOOK_KEY);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+function estadoMoz(s) {
+  s = String(s || '').trim().toUpperCase();
+  if (['PAID', 'SUCCESS', 'SUCCESSFUL', 'COMPLETED', 'APPROVED', 'PAGO'].includes(s)) return 'pago';
+  if (['FAILED', 'FAIL', 'ERROR', 'DECLINED', 'CANCELLED', 'CANCELED', 'REJECTED', 'FALHADO'].includes(s)) return 'falhado';
+  if (['EXPIRED', 'TIMEOUT', 'EXPIRADO'].includes(s)) return 'expirado';
+  return 'pendente';
+}
+app.get('/wh-moz/:chave', (req, res) => {
+  if (!chaveCerta(req.params.chave)) return res.sendStatus(404);
+  res.json({ ok: true, servico: 'gescolar', webhook: 'activo' });
+});
+app.post('/wh-moz/:chave', async (req, res) => {
+  if (!chaveCerta(req.params.chave)) return res.sendStatus(404);
+  const b = req.body || {};
+  const estado = estadoMoz(b.status);
+  const candidatos = [b.reason, b.reference, b.transaction_id].map(x => txt(x, 120)).filter(Boolean);
+  console.log('[webhook] reason=' + (b.reason || '') + ' reference=' + (b.reference || '') + ' status=' + b.status + ' metodo=' + (b.payment_method || '') + ' valor=' + (b.amount || ''));
+  try {
+    if (MOZ_WALLET && b.wallet && String(b.wallet) !== MOZ_WALLET) { console.warn('[webhook] carteira diferente: ' + b.wallet); return res.json({ ok: true, ignorado: 'carteira' }); }
+    let p = null;
+    for (const c of candidatos) { const l = await procurar('pagamento', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) { p = l[0]; break; } }
+    if (!p) { console.warn('[webhook] referência desconhecida: ' + candidatos.join(' / ')); return res.json({ ok: true, ignorado: 'referência desconhecida' }); }
+    if (p['Estado'] === 'pago') return res.json({ ok: true, ja: 'aplicado' });
+    const raw = JSON.stringify(b).slice(0, 4000);
+    const valor = Math.round(Number(String(b.amount || '').replace(',', '.')));
+    if (estado === 'pago' && valor !== Math.round(Number(p['Valor'] || 0))) {
+      console.warn('[webhook] valor diferente: esperado=' + p['Valor'] + ' recebido=' + b.amount);
+      await mudar('pagamento', p._id, { 'Estado': 'revisao', 'Transacao': txt(b.transaction_id, 120), 'Raw': raw });
+      return res.json({ ok: true, revisao: true });
+    }
+    if (estado !== 'pago') {
+      await mudar('pagamento', p._id, { 'Estado': estado, 'Transacao': txt(b.transaction_id, 120), 'Raw': raw });
+      return res.json({ ok: true, estado });
+    }
+    const documento = await aplicarPago(p, { 'Transacao': txt(b.transaction_id, 120), 'Raw': raw, 'Telefone': txt(b.phone, 30) || p['Telefone'] || '' });
+    res.json({ ok: true, estado: 'pago', documento });
+  } catch (e) {
+    console.error('[webhook]', e.message);
+    res.status(500).json({ ok: false });
+  }
+});
 
 app.use((req, res) => erro(res, 404, 'Rota não encontrada.'));
 app.listen(PORT, () => console.log(VERSAO + ' a ouvir na porta ' + PORT));
