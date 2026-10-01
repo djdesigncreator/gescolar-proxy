@@ -21,6 +21,7 @@
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//    Primário (v5.4): professor titular da turma (monodocência) · chamada do dia (Tempo 99) · Turma.Professor Titular (text)
 //                      (/autorizados /autorizado-guardar /autorizado-apagar · /p/autorizado-guardar /p/autorizado-apagar)
 //    Escola de condução 3 (v5.2): /exames /exame-marcar /exame-resultado · /prof/aula-estado · portal com aulas e exames
 //    Escola de condução 2 (v5.1): /viaturas /viatura-guardar /viatura-apagar /aulas-praticas /aula-marcar /aula-estado
@@ -44,7 +45,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.3.0';
+const VERSAO = 'gescolar-proxy 5.4.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -367,7 +368,7 @@ app.post('/painel', exigeDireccao, rota(async (req, res) => {
 // ---------- turmas ----------
 function turmaOut(t, estudantes) {
   return { id: t._id, nome: t['Nome'], codigo: t['Codigo'] || '', nivel: CODIGO_NIVEL[t['Nivel']] || t['Nivel'] || '', classe: t['Classe'] || '', turno: t['Turno'] || '',
-    sala: t['Sala'] || '', capacidade: t['Capacidade'] || 0, propina: t['Propina Mensal'] || 0, director: t['Director Turma'] || null, disciplinas: t['Disciplinas'] || [],
+    sala: t['Sala'] || '', capacidade: t['Capacidade'] || 0, propina: t['Propina Mensal'] || 0, director: t['Director Turma'] || null, titular: t['Professor Titular'] || null, disciplinas: t['Disciplinas'] || [],
     estudantes: estudantes ? estudantes.filter(e => e['Turma'] === t._id && (e['Estado'] || 'activo') === 'activo').length : undefined };
 }
 app.post('/turmas', exigeDireccao, rota(async (req, res) => {
@@ -391,6 +392,11 @@ app.post('/turma-guardar', exigeDireccao, rota(async (req, res) => {
     'Classe': txt(b.classe, 40), 'Turno': txt(b.turno, 20) || 'Manhã', 'Sala': txt(b.sala, 40), 'Capacidade': num(b.capacidade, 40), 'Propina Mensal': num(b.propina, 0),
     'Ano Lectivo': (escola && escola.ano) || String(new Date().getFullYear()), 'Disciplinas': discs, 'Activa': true };
   if (b.director) campos['Director Turma'] = String(b.director);
+  if (b.titular !== undefined) {
+    const tit = String(b.titular || '');
+    if (tit) { const p = await daMinhaEscola('professor', tit, req.escola).catch(() => null); if (!p) return erro(res, 400, 'O professor titular escolhido não é desta escola.'); }
+    campos['Professor Titular'] = tit;
+  }
   let id = b.id ? String(b.id) : null;
   if (id) { await daMinhaEscola('turma', id, req.escola); await mudar('turma', id, campos); }
   else id = await criar('turma', campos);
@@ -1299,6 +1305,13 @@ async function pautaDe(escola, turma, disciplina, trimestre) {
   return l[0] || null;
 }
 // quem dá cada disciplina em cada turma: pelo horário; se a disciplina não tem professor no horário, pelas disciplinas do professor
+// ---------- monodocência (v5.4) ----------
+const TEMPO_DIA = 99;   // chamada única do dia, feita pelo professor titular
+function titularActivo(t, profs) {
+  const id = t && t['Professor Titular']; if (!id) return null;
+  const p = profs.find(x => x._id === id);
+  return p && p['Activo'] !== false ? id : null;
+}
 async function atribuicoes(escola) {
   const f = daEscola(escola);
   const [turmas, profs, hs] = await Promise.all([procurarTodos('turma', f), procurarTodos('professor', f), procurarTodos('horario', f)]);
@@ -1309,7 +1322,9 @@ async function atribuicoes(escola) {
     if (g) for (const a of Object.values(g.aulas || {})) { if (!a.d) continue; (doHorario[a.d] = doHorario[a.d] || new Set()); if (a.p) doHorario[a.d].add(a.p); }
     const discs = new Set([...(t['Disciplinas'] || []), ...Object.keys(doHorario)]);
     for (const d of discs) {
-      let ps = doHorario[d] && doHorario[d].size ? doHorario[d] : new Set(profs.filter(p => p['Activo'] !== false && (p['Disciplinas'] || []).includes(d)).map(p => p._id));
+      // horário manda; sem horário, o titular (primário/escolinha) dá todas; senão, quem tem a disciplina na ficha
+      const tit = titularActivo(t, profs);
+      let ps = doHorario[d] && doHorario[d].size ? doHorario[d] : tit ? new Set([tit]) : new Set(profs.filter(p => p['Activo'] !== false && (p['Disciplinas'] || []).includes(d)).map(p => p._id));
       pares.push({ turma: t._id, disciplina: d, professores: ps });
     }
   }
@@ -1373,6 +1388,9 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
       estudantes: ests.filter(e => e['Turma'] === p.turma && (e['Estado'] || 'activo') === 'activo').length }))
       .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt')),
     aulas,
+    titular: a.turmas.filter(t => t['Activa'] !== false && t['Professor Titular'] === req.sessao.u).map(t => ({ turma: t._id, turma_nome: t['Nome'] || '', esc: ehESC(t),
+      estudantes: ests.filter(e => e['Turma'] === t._id && (e['Estado'] || 'activo') === 'activo').length, chamada: hoje.dia !== 0 && feitas.includes(t._id + '|' + TEMPO_DIA) }))
+      .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt')),
     conducao: await praticasDoInstrutor(req.escola, req.sessao.u).catch(err => { console.error('[prof] condução', err.message); return null; }),
     comunicados: cs.filter(c => !c['Turma']).map(c => comOut(c)).sort((x, y) => String(y.data || '').localeCompare(String(x.data || ''))).slice(0, 10) });
 }));
@@ -1468,6 +1486,12 @@ const dataOk = d => /^\d{4}-\d{2}-\d{2}$/.test(String(d || '')) && diaDaSemana(d
 const dmCurto = d => d.slice(8, 10) + '/' + d.slice(5, 7);
 // a aula (turma, data, tempo) existe no horário? devolve {disciplina, professor, i, f}
 async function aulaDoHorario(escola, turmaId, data, tempo) {
+  if (Number(tempo) === TEMPO_DIA) {
+    if (diaDaSemana(data) === 0) return null;   // domingo
+    const t = await obter('turma', turmaId).catch(() => null);
+    if (!t || t['Escola'] !== escola || !t['Professor Titular']) return null;
+    return { disciplina: '', professor: t['Professor Titular'], i: '', f: '', dia: true };
+  }
   const h = (await procurar('horario', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }], 1))[0];
   const g = h && lerGrelha(h['Grelha']); if (!g) return null;
   const a = (g.aulas || {})[diaDaSemana(data) + '-' + Number(tempo)], t = (g.tempos || [])[Number(tempo)];
@@ -1480,12 +1504,12 @@ async function chamadaDe(escola, turma, data, tempo) {
 async function dadosChamada(escola, turmaId, data, tempo) {
   const turma = await daMinhaEscola('turma', turmaId, escola);
   const aula = await aulaDoHorario(escola, turmaId, data, tempo);
-  if (!aula) { const e = new Error('Não há aula desta turma nesse dia e tempo no horário.'); e.publico = 404; throw e; }
-  const [disc, ests, ch] = await Promise.all([obter('disciplina', aula.disciplina).catch(() => null),
+  if (!aula) { const e = new Error(Number(tempo) === TEMPO_DIA ? 'Esta turma não tem professor titular, ou o dia é domingo.' : 'Não há aula desta turma nesse dia e tempo no horário.'); e.publico = 404; throw e; }
+  const [disc, ests, ch] = await Promise.all([aula.dia ? null : obter('disciplina', aula.disciplina).catch(() => null),
     procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }]), chamadaDe(escola, turmaId, data, tempo)]);
   const faltas = ch ? await procurarTodos('falta', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Chamada', constraint_type: 'equals', value: ch._id }]) : [];
   return { turma: { id: turma._id, nome: turma['Nome'] || '' }, data, tempo: Number(tempo), i: aula.i, f: aula.f, professor: aula.professor,
-    disciplina: { id: aula.disciplina, nome: (disc && disc['Nome']) || '', cor: (disc && disc['Cor']) || '#0A64DC' },
+    dia: !!aula.dia, disciplina: { id: aula.disciplina, nome: aula.dia ? 'Chamada do dia' : ((disc && disc['Nome']) || ''), cor: (disc && disc['Cor']) || '#0A64DC' },
     estudantes: ests.filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt')).map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })),
     feita: !!ch, chamada_id: ch ? ch._id : null, sumario: ch ? (ch['Sumario'] || '') : '', feita_por: ch ? (ch['Feita Por'] || '') : '',
     marcas: Object.fromEntries(faltas.map(f => [f['Estudante'], f['Tipo'] || 'F'])) };
@@ -1524,7 +1548,7 @@ async function guardarChamada(req, res, quem, podeJustificar) {
       const est = await obter('estudante', f['Estudante']).catch(() => null);
       const enc = est && est['Encarregado'] ? await obter('encarregado', est['Encarregado']).catch(() => null) : null;
       if (!enc || enc['Recebe SMS'] === false || tel9(enc['Telefone']).length !== 9) continue;
-      const r = await enviarSMS([enc['Telefone']], (esc['Nome'] || 'Escola') + ': ' + est['Nome'] + ' faltou hoje a ' + d.disciplina.nome + ' (' + d.i + '). Se a falta tiver justificacao, contacte a escola.');
+      const r = await enviarSMS([enc['Telefone']], (esc['Nome'] || 'Escola') + ': ' + est['Nome'] + (d.dia ? ' faltou hoje as aulas' : ' faltou hoje a ' + d.disciplina.nome + ' (' + d.i + ')') + '. Se a falta tiver justificacao, contacte a escola.');
       if (r.ok) { sms++; await mudar('falta', f._id, { 'SMS': true }).catch(() => {}); }
     }
   }
@@ -1537,7 +1561,7 @@ app.post('/prof/chamada', exigeProfessor, rota(async (req, res) => {
   const b = req.body || {};
   if (!dataOk(b.data)) return erro(res, 400, 'Data inválida.');
   const d = await dadosChamada(req.escola, String(b.turma || ''), b.data, b.tempo);
-  if (d.professor !== req.sessao.u) return erro(res, 403, 'Esta aula não é sua no horário.');
+  if (d.professor !== req.sessao.u) return erro(res, 403, d.dia ? 'Não é o professor titular desta turma.' : 'Esta aula não é sua no horário.');
   res.json({ ok: true, chamada: d });
 }));
 app.post('/prof/chamada-guardar', exigeProfessor, rota(async (req, res) => {
@@ -1546,7 +1570,7 @@ app.post('/prof/chamada-guardar', exigeProfessor, rota(async (req, res) => {
   if (b.data > hojeMZ().data) return erro(res, 400, 'Não pode fazer a chamada de um dia que ainda não chegou.');
   if (b.data < hojeMZ(-14).data) return erro(res, 400, 'Só pode corrigir chamadas dos últimos 14 dias. Para datas anteriores, fale com a Direcção.');
   const aula = await aulaDoHorario(req.escola, String(b.turma || ''), b.data, b.tempo);
-  if (!aula || aula.professor !== req.sessao.u) return erro(res, 403, 'Esta aula não é sua no horário.');
+  if (!aula || aula.professor !== req.sessao.u) return erro(res, 403, Number(b.tempo) === TEMPO_DIA ? 'Não é o professor titular desta turma.' : 'Esta aula não é sua no horário.');
   const eu = await obter('professor', req.sessao.u).catch(() => null);
   await guardarChamada(req, res, 'Prof. ' + ((eu && eu['Nome']) || ''), false);
 }));
@@ -1567,6 +1591,13 @@ app.post('/chamadas-dia', exigeDireccao, rota(async (req, res) => {
       aulas.push({ turma: h['Turma'], turma_nome: TM[h['Turma']]['Nome'] || '', tempo: ti, i: g.tempos[ti].i, f: g.tempos[ti].f, disciplina: (DM[a.d] || {})['Nome'] || '', cor: (DM[a.d] || {})['Cor'] || '#0A64DC',
         professor: PM[a.p] || '', feita: !!ch, faltas: fx.filter(x => x['Tipo'] === 'F').length, atrasos: fx.filter(x => x['Tipo'] === 'A').length, sumario: ch ? (ch['Sumario'] || '') : '' });
     }
+  }
+  if (dia !== 0) for (const t of Object.values(TM)) {
+    if (!t['Professor Titular']) continue;
+    const ch = chs.find(c => c['Turma'] === t._id && Number(c['Tempo']) === TEMPO_DIA);
+    const fx = ch ? fs.filter(x => x['Chamada'] === ch._id) : [];
+    aulas.push({ turma: t._id, turma_nome: t['Nome'] || '', tempo: TEMPO_DIA, dia: true, i: '', f: '', disciplina: 'Chamada do dia', cor: '#5B6B82',
+      professor: PM[t['Professor Titular']] || '', feita: !!ch, faltas: fx.filter(x => x['Tipo'] === 'F').length, atrasos: fx.filter(x => x['Tipo'] === 'A').length, sumario: ch ? (ch['Sumario'] || '') : '' });
   }
   aulas.sort((a, b) => a.i.localeCompare(b.i) || a.turma_nome.localeCompare(b.turma_nome, 'pt'));
   res.json({ ok: true, data, dia, aulas });
@@ -1597,7 +1628,7 @@ app.post('/presencas', exigeDireccao, rota(async (req, res) => {
       const m = fx.filter(x => x['Estudante'] === e._id);
       const F = m.filter(x => x['Tipo'] === 'F').length, J = m.filter(x => x['Tipo'] === 'J').length, A = m.filter(x => x['Tipo'] === 'A').length;
       return { id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', faltas: F, justificadas: J, atrasos: A, presenca: aulas ? Math.round((aulas - F - J) * 100 / aulas) : null,
-        lista: m.sort((a, b) => String(b['Data']).localeCompare(String(a['Data'])) || Number(b['Tempo']) - Number(a['Tempo'])).map(x => ({ id: x._id, data: x['Data'], tempo: Number(x['Tempo']), disciplina: DM[x['Disciplina']] || '', tipo: x['Tipo'] || 'F' })) };
+        lista: m.sort((a, b) => String(b['Data']).localeCompare(String(a['Data'])) || Number(b['Tempo']) - Number(a['Tempo'])).map(x => ({ id: x._id, data: x['Data'], tempo: Number(x['Tempo']), disciplina: Number(x['Tempo']) === TEMPO_DIA ? 'Chamada do dia' : (DM[x['Disciplina']] || ''), tipo: x['Tipo'] || 'F' })) };
     }) });
 }));
 app.post('/falta-justificar', exigeDireccao, rota(async (req, res) => {
@@ -1612,7 +1643,7 @@ app.post('/falta-justificar', exigeDireccao, rota(async (req, res) => {
 async function faltasDoEstudante(escola, estId, cache) {
   if (!cache.discAll) cache.discAll = Object.fromEntries((await procurarTodos('disciplina', daEscola(escola))).map(d => [d._id, d]));
   const fs = await procurarTodos('falta', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Estudante', constraint_type: 'equals', value: estId }], 1000);
-  return fs.map(x => ({ data: x['Data'], tempo: Number(x['Tempo']), disciplina: (cache.discAll[x['Disciplina']] || {})['Nome'] || '', tipo: x['Tipo'] || 'F' }))
+  return fs.map(x => ({ data: x['Data'], tempo: Number(x['Tempo']), disciplina: Number(x['Tempo']) === TEMPO_DIA ? 'Chamada do dia' : ((cache.discAll[x['Disciplina']] || {})['Nome'] || ''), tipo: x['Tipo'] || 'F' }))
     .sort((a, b) => String(b.data).localeCompare(String(a.data)) || b.tempo - a.tempo);
 }
 
@@ -1661,6 +1692,11 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
       aulasHoje.push({ turma: TM[h['Turma']]['Nome'] || '', turma_id: h['Turma'], tempo: ti, i: g.tempos[ti].i, f: g.tempos[ti].f, disciplina: (DM[x.d] || {})['Nome'] || '', professor: PM[x.p] || '',
         feita: chsHoje.some(c => c['Turma'] === h['Turma'] && Number(c['Tempo']) === ti) });
     }
+  }
+  if (hoje.dia >= 1 && hoje.dia <= 5) for (const t of a.turmas) {
+    if (t['Activa'] === false || !titularActivo(t, a.profs)) continue;
+    aulasHoje.push({ turma: t['Nome'] || '', turma_id: t._id, tempo: TEMPO_DIA, dia: true, i: '08:00', f: '', disciplina: 'Chamada do dia', professor: PM[t['Professor Titular']] || '',
+      feita: chsHoje.some(c => c['Turma'] === t._id && Number(c['Tempo']) === TEMPO_DIA) });
   }
   aulasHoje.sort((x, y) => x.i.localeCompare(y.i));
   const agora = new Date(Date.now() + 2 * 3600e3).toISOString().slice(11, 16);
