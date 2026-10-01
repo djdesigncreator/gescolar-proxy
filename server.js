@@ -20,6 +20,7 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Escola de condução 2 (v5.1): /viaturas /viatura-guardar /viatura-apagar /aulas-praticas /aula-marcar /aula-estado
 //    Escola de condução 1 (v5.0): /cursos /curso-guardar /curso-apagar /instruendos /inscrever /inscricao-estado
 //    Convites aos professores (v4.10): SMS automático ao registar · /professor-convite /professores-convite
 //    Palavra-passe e equipa (v4.9): /senha-pedir /senha-nova (código por SMS) · /equipa /equipa-criar /equipa-estado
@@ -40,7 +41,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.0.0';
+const VERSAO = 'gescolar-proxy 5.1.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1675,6 +1676,16 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
     notas: { trimestre: tri, pares: pares.length, com_notas: comNotas,
       publicadas: pt.filter(x => x['Publicado']).length, aproveitamento, sem_notas: Object.values(semNotas).sort((x, y) => y.pendentes.length - x.pendentes.length).slice(0, 8) },
     estudantes: activos.length };
+  if ((escola && escola.niveis || []).includes('CON')) {
+    const [vs, aps, ins] = await Promise.all([procurarTodos('viatura', f), procurarTodos('aulapratica', f, 20000), procurarTodos('inscricaoconducao', f)]);
+    const hojeA = aps.filter(x => x['Data'] === hoje.data && x['Estado'] !== 'cancelada');
+    const alertas = [];
+    vs.filter(v => v['Activa'] !== false).forEach(v => { for (const [k, n] of [['Inspecao Ate', 'Inspecção'], ['Seguro Ate', 'Seguro']]) { const dd = diasAte(v[k]); if (dd !== null && dd <= 30) alertas.push({ matricula: v['Matricula'] || '', tipo: n, dias: dd, ate: v[k] }); } });
+    const activas = ins.filter(i => (i['Estado'] || 'activa') === 'activa');
+    d.conducao = { aulas_hoje: hojeA.length, feitas_hoje: hojeA.filter(x => x['Estado'] === 'feita').length, instruendos: activas.length,
+      sem_aula: activas.filter(i => !aps.some(x => x['Inscricao'] === i._id && x['Estado'] === 'marcada' && x['Data'] >= hoje.data)).length,
+      alertas: alertas.sort((x, y) => x.dias - y.dias).slice(0, 8) };
+  }
   cachePainel.set(req.escola, { t: Date.now(), d });
   res.json(d);
 }));
@@ -2027,7 +2038,7 @@ app.post('/curso-apagar', exigeDireccao, rota(async (req, res) => {
 function idadeEm(nasc) { const n = new Date(nasc), h = new Date(); let a = h.getUTCFullYear() - n.getUTCFullYear(); if (h.getUTCMonth() < n.getUTCMonth() || (h.getUTCMonth() === n.getUTCMonth() && h.getUTCDate() < n.getUTCDate())) a--; return a; }
 app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
   const f = daEscola(req.escola);
-  const [ins, cs, ests, props, esc] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola)]);
+  const [ins, cs, ests, props, esc, aulas] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola), procurarTodos('aulapratica', f, 20000)]);
   const CM = Object.fromEntries(cs.map(c => [c._id, c])), EM = Object.fromEntries(ests.map(e => [e._id, e]));
   const regras = (esc && esc.regras) || {};
   res.json({ ok: true, instruendos: ins.map(i => {
@@ -2038,7 +2049,8 @@ app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
     return { id: i._id, estudante: i['Estudante'], nome: e['Nome'] || '', numero: e['Numero'] || '', telefone: e['Telefone'] || '', nascimento: e['Data Nascimento'] || null,
       curso: c['Nome'] || '', categoria: i['Categoria'] || c['Categoria'] || '', data: i['Data Inscricao'] || i['Created Date'] || null, estado: i['Estado'] || 'activa',
       preco: Number(i['Preco'] || 0), pago, total, em_atraso: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
-      proxima: prox ? { valor: prox.total, vencimento: prox.vencimento } : null };
+      proxima: prox ? { valor: prox.total, vencimento: prox.vencimento } : null,
+      praticas: { feitas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'feita').length, marcadas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) } };
   }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
 }));
 app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
@@ -2096,6 +2108,118 @@ app.post('/inscricao-estado', exigeDireccao, rota(async (req, res) => {
     const ps = await procurarTodos('propina', daEscola(req.escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: i['Estudante'] }, { key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]));
     for (const p of ps.filter(x => x['Estado'] !== 'paga')) await mudar('propina', p._id, { 'Estado': 'anulada' }).catch(() => {});
   }
+  res.json({ ok: true, estado });
+}));
+
+// ============================================================
+//  ESCOLA DE CONDUÇÃO · PARTE 2: VIATURAS E AULAS PRÁTICAS (v5.1)
+//  Bubble:
+//   Viatura:      Escola (Escola) · Matricula (text) · Marca Modelo (text) · Categoria (text) · Ano (number)
+//                 · Inspecao Ate (date) · Seguro Ate (date) · Activa (yes/no) · Notas (text)
+//   Aula Pratica: Escola (Escola) · Estudante (text) · Inscricao (text) · Instrutor (text) · Viatura (text)
+//                 · Data (text AAAA-MM-DD) · Inicio (text HH:MM) · Fim (text HH:MM) · Minutos (number)
+//                 · Estado (text: marcada | feita | faltou | cancelada) · Notas (text)
+// ============================================================
+const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
+const minDe = h => Number(h.slice(0, 2)) * 60 + Number(h.slice(3, 5));
+const hhmmDe = m => String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+const catCompativel = (viatura, carta) => !viatura || !carta || viatura === carta || (carta === 'A1' && viatura === 'A') || (carta === 'BE' && viatura === 'B') || (carta === 'CE' && viatura === 'C');
+function diasAte(iso) { return iso ? Math.ceil((new Date(iso).getTime() - Date.now()) / 864e5) : null; }
+const viaturaOut = v => ({ id: v._id, matricula: v['Matricula'] || '', modelo: v['Marca Modelo'] || '', categoria: v['Categoria'] || '', ano: v['Ano'] || null,
+  inspecao: v['Inspecao Ate'] || null, seguro: v['Seguro Ate'] || null, dias_inspecao: diasAte(v['Inspecao Ate']), dias_seguro: diasAte(v['Seguro Ate']), notas: v['Notas'] || '', activa: v['Activa'] !== false });
+app.post('/viaturas', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [vs, aulas] = await Promise.all([procurarTodos('viatura', f), procurarTodos('aulapratica', f, 20000)]);
+  res.json({ ok: true, viaturas: vs.filter(v => v['Activa'] !== false).map(v => Object.assign(viaturaOut(v), {
+    aulas_feitas: aulas.filter(a => a['Viatura'] === v._id && a['Estado'] === 'feita').length,
+    minutos: aulas.filter(a => a['Viatura'] === v._id && a['Estado'] === 'feita').reduce((x, a) => x + Number(a['Minutos'] || 0), 0) })).sort((a, b) => a.matricula.localeCompare(b.matricula)) });
+}));
+app.post('/viatura-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const mat = txt(b.matricula, 20).toUpperCase().replace(/\s+/g, '-');
+  if (mat.length < 5) return erro(res, 400, 'Escreva a matrícula (ex.: AFG-123-MC).');
+  const cat = String(b.categoria || '').toUpperCase();
+  if (!CATEGORIAS[cat]) return erro(res, 400, 'Escolha a categoria da viatura.');
+  const campos = { 'Escola': req.escola, 'Matricula': mat, 'Marca Modelo': txt(b.modelo, 60), 'Categoria': cat, 'Notas': txt(b.notas, 300), 'Activa': true };
+  if (b.ano) campos['Ano'] = Math.round(Number(b.ano)) || undefined;
+  for (const [k, c] of [['inspecao', 'Inspecao Ate'], ['seguro', 'Seguro Ate']]) if (b[k] && !isNaN(Date.parse(b[k]))) campos[c] = new Date(b[k] + 'T23:59:00Z').toISOString();
+  let id = b.id ? String(b.id) : null;
+  if (!id) { const ja = (await procurarTodos('viatura', daEscola(req.escola))).find(v => v['Matricula'] === mat && v['Activa'] !== false); if (ja) return erro(res, 409, 'Já existe uma viatura com esta matrícula.'); }
+  if (id) { await daMinhaEscola('viatura', id, req.escola); await mudar('viatura', id, campos); } else id = await criar('viatura', campos);
+  res.json({ ok: true, id });
+}));
+app.post('/viatura-apagar', exigeDireccao, rota(async (req, res) => {
+  const v = await daMinhaEscola('viatura', String((req.body || {}).id || ''), req.escola);
+  await mudar('viatura', v._id, { 'Activa': false });
+  res.json({ ok: true });
+}));
+async function dadosAulas(escola) {
+  const f = daEscola(escola);
+  const [aulas, profs, vs, ins, ests, cs] = await Promise.all([procurarTodos('aulapratica', f, 20000), procurarTodos('professor', f), procurarTodos('viatura', f), procurarTodos('inscricaoconducao', f), procurarTodos('estudante', f), procurarTodos('cursoconducao', f)]);
+  return { aulas, profs, vs, ins, ests, cs, PM: Object.fromEntries(profs.map(p => [p._id, p])), VM: Object.fromEntries(vs.map(v => [v._id, v])), EM: Object.fromEntries(ests.map(e => [e._id, e])), CM: Object.fromEntries(cs.map(c => [c._id, c])), IM: Object.fromEntries(ins.map(i => [i._id, i])) };
+}
+function aulaOut(a, D) {
+  const e = D.EM[a['Estudante']] || {}, p = D.PM[a['Instrutor']] || {}, v = D.VM[a['Viatura']] || {}, i = D.IM[a['Inscricao']] || {};
+  return { id: a._id, data: a['Data'], inicio: a['Inicio'], fim: a['Fim'], minutos: Number(a['Minutos'] || 0), estado: a['Estado'] || 'marcada', notas: a['Notas'] || '',
+    estudante: a['Estudante'], instruendo: e['Nome'] || '', numero: e['Numero'] || '', telefone: e['Telefone'] || '', categoria: i['Categoria'] || '',
+    instrutor_id: a['Instrutor'], instrutor: p['Nome'] || '', viatura_id: a['Viatura'], viatura: v['Matricula'] || '', modelo: v['Marca Modelo'] || '' };
+}
+function progressoInscricao(i, D) {
+  const c = D.CM[i['Curso']] || {}, minhas = D.aulas.filter(a => a['Inscricao'] === i._id);
+  return { feitas: minhas.filter(a => a['Estado'] === 'feita').length, faltou: minhas.filter(a => a['Estado'] === 'faltou').length, marcadas: minhas.filter(a => a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) };
+}
+app.post('/aulas-praticas', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const de = dataOk(b.de) ? b.de : hojeMZ().data, ate = dataOk(b.ate) ? b.ate : de;
+  const D = await dadosAulas(req.escola);
+  res.json({ ok: true, de, ate, hoje: hojeMZ().data,
+    aulas: D.aulas.filter(a => a['Data'] >= de && a['Data'] <= ate).map(a => aulaOut(a, D)).sort((x, y) => (x.data + x.inicio).localeCompare(y.data + y.inicio)),
+    instrutores: D.profs.filter(p => p['Activo'] !== false).map(p => ({ id: p._id, nome: p['Nome'] || '', licenca: p['Licenca Instrutor'] || '' })).sort((x, y) => x.nome.localeCompare(y.nome, 'pt')),
+    viaturas: D.vs.filter(v => v['Activa'] !== false).map(viaturaOut),
+    inscricoes: D.ins.filter(i => (i['Estado'] || 'activa') === 'activa').map(i => Object.assign({ id: i._id, estudante: i['Estudante'], nome: (D.EM[i['Estudante']] || {})['Nome'] || '', numero: (D.EM[i['Estudante']] || {})['Numero'] || '', categoria: i['Categoria'] || '' }, progressoInscricao(i, D))).sort((x, y) => x.nome.localeCompare(y.nome, 'pt')),
+    semana: (() => { const out = []; for (let k = 0; k < 7; k++) { const d = new Date(de + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + k); const ds = d.toISOString().slice(0, 10); out.push({ data: ds, aulas: D.aulas.filter(a => a['Data'] === ds && a['Estado'] !== 'cancelada').length }); } return out; })() });
+}));
+async function marcarAula(req, res, b) {
+  const D = await dadosAulas(req.escola);
+  const i = D.IM[String(b.inscricao || '')];
+  if (!i || i['Escola'] !== req.escola) return erro(res, 404, 'Escolha o instruendo.');
+  if ((i['Estado'] || 'activa') !== 'activa') return erro(res, 400, 'Esta inscrição já não está em curso.');
+  const p = D.PM[String(b.instrutor || '')]; if (!p || p['Escola'] !== req.escola || p['Activo'] === false) return erro(res, 400, 'Escolha o instrutor.');
+  const v = D.VM[String(b.viatura || '')]; if (!v || v['Escola'] !== req.escola || v['Activa'] === false) return erro(res, 400, 'Escolha a viatura.');
+  if (!dataOk(b.data)) return erro(res, 400, 'Escolha a data.');
+  if (b.data < hojeMZ().data) return erro(res, 400, 'Não pode marcar aulas em dias que já passaram.');
+  if (!HHMM.test(b.inicio || '')) return erro(res, 400, 'Escolha a hora de início.');
+  const dur = Math.max(30, Math.min(240, Math.round(Number(b.duracao) || 60)));
+  const ini = minDe(b.inicio), fim = ini + dur;
+  if (fim > 22 * 60) return erro(res, 400, 'A aula termina demasiado tarde.');
+  if (!catCompativel(v['Categoria'], i['Categoria'])) return erro(res, 400, 'A viatura ' + v['Matricula'] + ' é da categoria ' + v['Categoria'] + ' e o instruendo tira a carta ' + i['Categoria'] + '.');
+  if (v['Inspecao Ate'] && new Date(v['Inspecao Ate']).toISOString().slice(0, 10) < b.data) return erro(res, 400, 'A inspecção da viatura ' + v['Matricula'] + ' termina antes desta data. Renove-a primeiro.');
+  if (v['Seguro Ate'] && new Date(v['Seguro Ate']).toISOString().slice(0, 10) < b.data) return erro(res, 400, 'O seguro da viatura ' + v['Matricula'] + ' termina antes desta data. Renove-o primeiro.');
+  const sobrepoe = D.aulas.filter(a => a['Data'] === b.data && a['Estado'] !== 'cancelada' && a._id !== b.ignorar && minDe(a['Inicio']) < fim && ini < minDe(a['Fim']));
+  const c1 = sobrepoe.find(a => a['Instrutor'] === p._id), c2 = sobrepoe.find(a => a['Viatura'] === v._id), c3 = sobrepoe.find(a => a['Estudante'] === i['Estudante']);
+  if (c1) return erro(res, 409, p['Nome'] + ' já tem aula das ' + c1['Inicio'] + ' às ' + c1['Fim'] + ' nesse dia.');
+  if (c2) return erro(res, 409, 'A viatura ' + v['Matricula'] + ' já está ocupada das ' + c2['Inicio'] + ' às ' + c2['Fim'] + '.');
+  if (c3) return erro(res, 409, 'O instruendo já tem aula das ' + c3['Inicio'] + ' às ' + c3['Fim'] + ' nesse dia.');
+  const id = await criar('aulapratica', { 'Escola': req.escola, 'Estudante': i['Estudante'], 'Inscricao': i._id, 'Instrutor': p._id, 'Viatura': v._id, 'Data': b.data,
+    'Inicio': b.inicio, 'Fim': hhmmDe(fim), 'Minutos': dur, 'Estado': 'marcada', 'Notas': txt(b.notas, 300) });
+  let sms = false;
+  const e = D.EM[i['Estudante']] || {};
+  if (b.sms && tel9(e['Telefone']).length === 9) {
+    const esc = await obter('escola', req.escola).catch(() => null);
+    const d = new Date(b.data + 'T12:00:00Z'), dia = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'][d.getUTCDay()];
+    const r = await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': aula pratica marcada para ' + dia + ' ' + dmCurto(b.data) + ', ' + b.inicio + '-' + hhmmDe(fim) + '. Instrutor ' + (p['Nome'] || '').split(' ')[0] + ', viatura ' + v['Matricula'] + '.');
+    sms = r.ok;
+  }
+  return res.json({ ok: true, id, fim: hhmmDe(fim), sms });
+}
+app.post('/aula-marcar', exigeDireccao, rota(async (req, res) => marcarAula(req, res, req.body || {})));
+app.post('/aula-estado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, estado = String(b.estado || '');
+  if (!['marcada', 'feita', 'faltou', 'cancelada'].includes(estado)) return erro(res, 400, 'Estado inválido.');
+  const a = await daMinhaEscola('aulapratica', String(b.id || ''), req.escola);
+  if (estado === 'feita' && a['Data'] > hojeMZ().data) return erro(res, 400, 'Esta aula ainda não aconteceu.');
+  const mud = { 'Estado': estado }; if (b.notas !== undefined) mud['Notas'] = txt(b.notas, 300);
+  await mudar('aulapratica', a._id, mud);
   res.json({ ok: true, estado });
 }));
 
