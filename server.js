@@ -20,6 +20,8 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Assinatura e plataforma (v4.8): /assinatura /assinatura-pagar /assinatura-estado · /pl/resumo /pl/escola /pl/escola-guardar
+//                                    /pl/transferencia /pl/transferencia-apagar  (PLATAFORMA_EMAILS)
 //    Painel (v4.7): /painel-indicadores — dinheiro, chamadas de hoje, faltas, notas por trimestre
 //    Presenças (v4.6): /prof/chamada /prof/chamada-guardar · Direcção: /presencas /chamadas-dia /falta-justificar · portal: faltas
 //
@@ -35,7 +37,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.7.0';
+const VERSAO = 'gescolar-proxy 4.8.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -152,20 +154,23 @@ async function resumoEscola(id) {
   if (!e) return null;
   return {
     id: e._id, nome: e['Nome'], subdominio: e['Subdominio'], estado: e['Estado'], plano: e['Plano'],
-    niveis: (e['Niveis'] || []).map(n => CODIGO_NIVEL[n] || n), ano: e['Ano Lectivo'], teste_ate: e['Teste Ate'] || null,
+    niveis: (e['Niveis'] || []).map(n => CODIGO_NIVEL[n] || n), ano: e['Ano Lectivo'], teste_ate: e['Teste Ate'] || null, valida_ate: e['Valida Ate'] || null,
+    situacao: situacaoEscola(e),
     regras: { dia_limite: e['Dia Limite'], multa: e['Multa Percent'], multa_max: e['Multa Max'], aprovacao: e['Nota Aprovacao'], dispensa: e['Nota Dispensa'], formula: e['Formula Media'] }
   };
 }
-async function abrirSessao(userId) {
+const PLATAFORMA_EMAILS = (process.env.PLATAFORMA_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
+async function abrirSessao(userId, pl) {
   const user = await obter('user', userId);
   if (!user) { const e = new Error('Conta não encontrada.'); e.publico = 404; throw e; }
   if (user['Activo'] === false) { const e = new Error('Esta conta está desactivada. Fale com a escola.'); e.publico = 403; throw e; }
   const papel = user['Papel'] || null;
   const escola = await resumoEscola(user['Escola']);
-  if (escola && escola.estado === 'suspensa' && papel !== 'Plataforma') { const e = new Error('O acesso desta escola está suspenso. A Direcção deve regularizar a subscrição.'); e.publico = 402; throw e; }
+  if (escola && escola.estado === 'suspensa' && papel !== 'Plataforma' && !pl) { const e = new Error('O acesso desta escola está suspenso. A Direcção deve regularizar a subscrição.'); e.publico = 402; throw e; }
   mudar('user', userId, { 'Ultimo Acesso': new Date().toISOString() }).catch(() => {});
-  const token = assinar({ u: userId, e: escola ? escola.id : null, p: papel });
-  return { ok: true, token, nome: user['Nome Completo'] || '', papel, pagina: PAPEIS[papel] || 'registo', escola, expira_dias: SESSAO_DIAS };
+  const plataforma = !!pl || papel === 'Plataforma';
+  const token = assinar(Object.assign({ u: userId, e: escola ? escola.id : null, p: papel }, plataforma ? { pl: 1 } : {}));
+  return { ok: true, token, nome: user['Nome Completo'] || '', papel, pagina: (papel !== 'Plataforma' && escola) ? (PAPEIS[papel] || 'registo') : (plataforma ? 'plataforma' : (PAPEIS[papel] || 'registo')), escola, plataforma, expira_dias: SESSAO_DIAS };
 }
 
 // ============================================================
@@ -264,7 +269,7 @@ app.post('/login', async (req, res) => {
       throw e;
     }
     if (!userId) throw new Error('login não devolveu user_id');
-    res.json(await abrirSessao(userId));
+    res.json(await abrirSessao(userId, PLATAFORMA_EMAILS.includes(email)));
   } catch (e) {
     console.error('[login]', e.message);
     erro(res, e.publico || 500, e.publico ? e.message : 'Não foi possível entrar agora. Tente de novo.');
@@ -277,7 +282,7 @@ app.post('/login', async (req, res) => {
 app.post('/sessao', async (req, res) => {
   const s = sessaoDo(req);
   if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
-  try { res.json(s.t === 'portal' ? await abrirSessaoPortal(s) : await abrirSessao(s.u)); }
+  try { res.json(s.t === 'portal' ? await abrirSessaoPortal(s) : await abrirSessao(s.u, s.pl === 1)); }
   catch (e) { console.error('[sessao]', e.message); erro(res, e.publico || 500, e.publico ? e.message : 'Não foi possível confirmar a sessão.'); }
 });
 
@@ -1664,6 +1669,179 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
 }));
 
 // ============================================================
+//  ASSINATURA DO GESCOLAR E ÁREA DA PLATAFORMA (v4.8)
+//  Bubble:
+//   Escola: campo novo  Valida Ate (date)
+//   Subscricao: Escola (Escola) · Plano (text) · Meses (number) · Valor (number) · Metodo (text) · Telefone (text) · Estado (text)
+//               · Referencia (text) · Transacao (text) · Raw (text) · Pago Em (date) · Valida Ate (date)
+//   Transferencia: Escola (Escola) · Valor (number) · Data (date) · Referencia (text) · Metodo (text) · Notas (text) · Feita Por (text)
+//  Render: PLATAFORMA_EMAILS (emails com acesso à área da plataforma, separados por vírgulas)
+//          TAXA_PROPINAS_PCT (opcional, % que o Gescolar retém das propinas pagas online; por defeito 0)
+//          PRECO_ESSENCIAL, PRECO_PRO (opcionais, MT por mês; por defeito 4900 e 12500)
+// ============================================================
+const PRECOS = { Essencial: Number(process.env.PRECO_ESSENCIAL || 4900), Pro: Number(process.env.PRECO_PRO || 12500), Rede: 0 };
+const LIMITES = { Essencial: 300, Pro: 1000, Rede: 0 };
+const TAXA_PROPINAS = Math.max(0, Math.min(50, Number(process.env.TAXA_PROPINAS_PCT || 0)));
+const TOLERANCIA_DIAS = 7;
+function situacaoEscola(e) {
+  if (!e) return { estado: 'desconhecida' };
+  if (e['Estado'] === 'suspensa') return { estado: 'suspensa', ate: null, dias: null };
+  const fim = e['Valida Ate'] || (e['Estado'] === 'teste' ? e['Teste Ate'] : null) || e['Teste Ate'];
+  if (!fim) return { estado: e['Estado'] || 'activa', ate: null, dias: null };
+  const dias = Math.ceil((new Date(fim).getTime() - Date.now()) / 864e5);
+  const base = e['Valida Ate'] ? 'activa' : 'teste';
+  return { estado: dias >= 0 ? base : (dias >= -TOLERANCIA_DIAS ? 'tolerancia' : 'expirada'), ate: fim, dias };
+}
+function somaMeses(iso, meses) { const d = new Date(iso); d.setUTCMonth(d.getUTCMonth() + meses); return d.toISOString(); }
+function novaValidade(e, meses) {
+  const fim = e['Valida Ate'] || e['Teste Ate'];
+  const base = fim && new Date(fim).getTime() > Date.now() ? fim : new Date().toISOString();
+  return somaMeses(base, meses);
+}
+const subOut = x => ({ id: x._id, plano: x['Plano'] || '', meses: Number(x['Meses'] || 0), valor: Number(x['Valor'] || 0), metodo: x['Metodo'] || '', estado: x['Estado'] || 'pendente', data: x['Pago Em'] || x['Created Date'] || null, valida_ate: x['Valida Ate'] || null, referencia: x['Referencia'] || '' });
+
+app.post('/assinatura', exigeDireccao, rota(async (req, res) => {
+  const [e, subs, ests] = await Promise.all([obter('escola', req.escola), procurarTodos('subscricao', daEscola(req.escola), 300), procurarTodos('estudante', daEscola(req.escola))]);
+  const plano = e['Plano'] || 'Essencial', activos = ests.filter(x => (x['Estado'] || 'activo') === 'activo').length;
+  res.json({ ok: true, plano, preco: PRECOS[plano] || 0, limite: LIMITES[plano] || 0, estudantes: activos, situacao: situacaoEscola(e), tolerancia: TOLERANCIA_DIAS,
+    planos: Object.keys(PRECOS).map(k => ({ nome: k, preco: PRECOS[k], limite: LIMITES[k] })),
+    historico: subs.map(subOut).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/assinatura-pagar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, metodo = String(b.metodo || '').toLowerCase();
+  if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
+  if (!MOZ_WALLET) return erro(res, 500, 'O servidor ainda não tem a carteira configurada (MOZ_WALLET).');
+  const meses = [1, 3, 6, 12].includes(Number(b.meses)) ? Number(b.meses) : 1;
+  const e = await obter('escola', req.escola);
+  const plano = PRECOS[b.plano] !== undefined && b.plano !== 'Rede' ? b.plano : (e['Plano'] || 'Essencial');
+  if (plano === 'Rede' || !PRECOS[plano]) return erro(res, 400, 'O plano Rede é combinado com a equipa do Gescolar. Fale connosco.');
+  const ests = await procurarTodos('estudante', daEscola(req.escola));
+  const activos = ests.filter(x => (x['Estado'] || 'activo') === 'activo').length;
+  if (LIMITES[plano] && activos > LIMITES[plano]) return erro(res, 400, 'A escola tem ' + activos + ' estudantes e o plano ' + plano + ' vai até ' + LIMITES[plano] + '. Escolha um plano maior.');
+  const valor = PRECOS[plano] * meses, numero = soDigitos(b.numero).replace(/^258(?=\d{9}$)/, '');
+  if (metodo !== 'cartao') {
+    if (numero.length !== 9) return erro(res, 400, 'O número tem 9 dígitos, por exemplo 84 123 4567.');
+    const pre = numero.slice(0, 2);
+    if (metodo === 'mpesa' && !['84', '85'].includes(pre)) return erro(res, 400, 'M-Pesa só funciona com números Vodacom (84 ou 85).');
+    if (metodo === 'emola' && !['86', '87'].includes(pre)) return erro(res, 400, 'e-Mola só funciona com números Movitel (86 ou 87).');
+  }
+  const id = await criar('subscricao', { 'Escola': req.escola, 'Plano': plano, 'Meses': meses, 'Valor': valor, 'Metodo': metodo, 'Telefone': numero, 'Estado': 'pendente' });
+  const produto = 'Gescolar ' + plano + ' · ' + meses + (meses === 1 ? ' mês' : ' meses') + ' · ' + (e['Nome'] || '');
+  try {
+    if (metodo === 'cartao') {
+      const d = await mozPedido(MOZ_CARD_PATH, { valor: String(valor), nome_cliente: (e['Nome'] || 'Escola').slice(0, 80), carteira: MOZ_WALLET, nome_producto: produto.slice(0, 120) });
+      const link = acharLink(d);
+      if (!link) throw new Error('sem link na resposta: ' + JSON.stringify(d).slice(0, 220));
+      await mudar('subscricao', id, { 'Referencia': String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || ''), 'Raw': JSON.stringify(d).slice(0, 4000) });
+      return res.json({ ok: true, id, link, total: valor });
+    }
+    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(valor), number: numero, name: (e['Nome'] || 'Escola').slice(0, 80) });
+    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
+    await mudar('subscricao', id, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
+    res.json({ ok: true, id, total: valor, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.' });
+  } catch (err) {
+    console.error('[assinatura]', err.message);
+    await mudar('subscricao', id, { 'Estado': 'falhado', 'Raw': String(err.message).slice(0, 2000) }).catch(() => {});
+    erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(err.message).slice(0, 300));
+  }
+}));
+app.post('/assinatura-estado', exigeDireccao, rota(async (req, res) => {
+  const x = await daMinhaEscola('subscricao', String((req.body || {}).id || ''), req.escola);
+  res.json({ ok: true, estado: x['Estado'] || 'pendente', valida_ate: x['Valida Ate'] || null, valor: Number(x['Valor'] || 0) });
+}));
+// chamado pelo webhook quando a referência é de uma assinatura
+async function aplicarSubscricao(x, b, estado) {
+  if (x['Estado'] === 'pago') return { ok: true, ja: 'aplicado' };
+  const raw = JSON.stringify(b).slice(0, 4000), trx = txt(b.transaction_id, 120);
+  const valor = Math.round(Number(String(b.amount || '').replace(',', '.')));
+  if (estado === 'pago' && valor !== Math.round(Number(x['Valor'] || 0))) { await mudar('subscricao', x._id, { 'Estado': 'revisao', 'Transacao': trx, 'Raw': raw }); return { ok: true, revisao: true }; }
+  if (estado !== 'pago') { await mudar('subscricao', x._id, { 'Estado': estado, 'Transacao': trx, 'Raw': raw }); return { ok: true, estado }; }
+  const e = await obter('escola', x['Escola']);
+  const ate = novaValidade(e, Number(x['Meses'] || 1));
+  await mudar('subscricao', x._id, { 'Estado': 'pago', 'Transacao': trx, 'Raw': raw, 'Pago Em': new Date().toISOString(), 'Valida Ate': ate });
+  await mudar('escola', x['Escola'], { 'Valida Ate': ate, 'Estado': 'activa', 'Plano': x['Plano'] || e['Plano'] });
+  cachePainel.delete(x['Escola']);
+  return { ok: true, estado: 'pago', valida_ate: ate };
+}
+
+// ---------- área da plataforma ----------
+function exigePlataforma(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
+  if (s.pl !== 1 && s.p !== 'Plataforma') return erro(res, 403, 'Só a equipa do Gescolar tem acesso.');
+  req.sessao = s; next();
+}
+const ONLINE = m => ['mpesa', 'emola', 'cartao'].includes(String(m || '').toLowerCase());
+app.post('/pl/resumo', exigePlataforma, rota(async (req, res) => {
+  const [escolas, pags, subs, trs, ests] = await Promise.all([procurarTodos('escola', [], 5000), procurarTodos('pagamento', [], 50000), procurarTodos('subscricao', [], 20000), procurarTodos('transferencia', [], 20000), procurarTodos('estudante', [], 100000)]);
+  const lista = escolas.map(e => {
+    const online = pags.filter(p => p['Escola'] === e._id && p['Estado'] === 'pago' && ONLINE(p['Metodo']));
+    const bruto = online.reduce((x, p) => x + Number(p['Valor'] || 0), 0), taxa = Math.round(bruto * TAXA_PROPINAS / 100);
+    const transferido = trs.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0);
+    const assin = subs.filter(x => x['Escola'] === e._id && x['Estado'] === 'pago');
+    return { id: e._id, nome: e['Nome'] || '', subdominio: e['Subdominio'] || '', cidade: e['Cidade'] || '', provincia: e['Provincia'] || '', telefone: e['Telefone'] || '', email: e['Email'] || '', nuit: e['NUIT'] || '',
+      plano: e['Plano'] || '', situacao: situacaoEscola(e), criada: e['Created Date'] || null,
+      estudantes: ests.filter(x => x['Escola'] === e._id && (x['Estado'] || 'activo') === 'activo').length,
+      propinas_online: bruto, taxa, transferido, saldo: bruto - taxa - transferido, pagamentos: online.length,
+      assinaturas: assin.reduce((x, s2) => x + Number(s2['Valor'] || 0), 0), ultimo_pagamento: online.map(p => p['Pago Em']).sort().pop() || null };
+  }).sort((a, b) => b.saldo - a.saldo || a.nome.localeCompare(b.nome, 'pt'));
+  const mes = new Date().toISOString().slice(0, 7);
+  res.json({ ok: true, taxa_pct: TAXA_PROPINAS, precos: PRECOS, escolas: lista,
+    totais: { escolas: lista.length, activas: lista.filter(x => ['activa', 'tolerancia'].includes(x.situacao.estado)).length, teste: lista.filter(x => x.situacao.estado === 'teste').length,
+      estudantes: lista.reduce((x, e) => x + e.estudantes, 0), a_transferir: lista.reduce((x, e) => x + Math.max(0, e.saldo), 0),
+      propinas_online: lista.reduce((x, e) => x + e.propinas_online, 0), assinaturas: lista.reduce((x, e) => x + e.assinaturas, 0),
+      assinaturas_mes: subs.filter(x => x['Estado'] === 'pago' && String(x['Pago Em'] || '').slice(0, 7) === mes).reduce((x, s2) => x + Number(s2['Valor'] || 0), 0) } });
+}));
+app.post('/pl/escola', exigePlataforma, rota(async (req, res) => {
+  const id = String((req.body || {}).id || '');
+  const e = await obter('escola', id);
+  if (!e) return erro(res, 404, 'Escola não encontrada.');
+  const f = daEscola(id);
+  const [pags, subs, trs, ests] = await Promise.all([procurarTodos('pagamento', f, 20000), procurarTodos('subscricao', f, 500), procurarTodos('transferencia', f, 2000), procurarTodos('estudante', f)]);
+  const EM = Object.fromEntries(ests.map(x => [x._id, x['Nome']]));
+  const movimentos = pags.filter(p => p['Estado'] === 'pago' && ONLINE(p['Metodo'])).map(p => ({ tipo: 'entrada', data: p['Pago Em'], valor: Number(p['Valor'] || 0), taxa: Math.round(Number(p['Valor'] || 0) * TAXA_PROPINAS / 100),
+      texto: (EM[p['Estudante']] || '') + ' · ' + (p['Documento'] || ''), metodo: p['Metodo'] || '' }))
+    .concat(trs.map(t => ({ tipo: 'transferencia', id: t._id, data: t['Data'] || t['Created Date'], valor: Number(t['Valor'] || 0), texto: [t['Metodo'], t['Referencia'], t['Notas']].filter(Boolean).join(' · '), feita_por: t['Feita Por'] || '' })))
+    .sort((a, b) => String(b.data || '').localeCompare(String(a.data || '')));
+  res.json({ ok: true, escola: { id: e._id, nome: e['Nome'] || '', plano: e['Plano'] || '', situacao: situacaoEscola(e), valida_ate: e['Valida Ate'] || null, teste_ate: e['Teste Ate'] || null, estado: e['Estado'] || '' },
+    movimentos: movimentos.slice(0, 400), assinaturas: subs.map(subOut).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/pl/escola-guardar', exigePlataforma, rota(async (req, res) => {
+  const b = req.body || {};
+  const e = await obter('escola', String(b.id || ''));
+  if (!e) return erro(res, 404, 'Escola não encontrada.');
+  const mud = {};
+  if (b.plano !== undefined) { if (!PLANOS.includes(b.plano)) return erro(res, 400, 'Plano inválido.'); mud['Plano'] = b.plano; }
+  if (b.estado !== undefined) { if (!['teste', 'activa', 'suspensa'].includes(b.estado)) return erro(res, 400, 'Estado inválido.'); mud['Estado'] = b.estado; }
+  if (b.valida_ate !== undefined) { if (b.valida_ate && isNaN(Date.parse(b.valida_ate))) return erro(res, 400, 'Data inválida.'); if (b.valida_ate) mud['Valida Ate'] = new Date(b.valida_ate + 'T23:59:00Z').toISOString(); }
+  if (b.mais_meses) mud['Valida Ate'] = novaValidade(e, Math.max(1, Math.min(24, Number(b.mais_meses) || 1)));
+  if (!Object.keys(mud).length) return erro(res, 400, 'Nada para guardar.');
+  if (mud['Valida Ate'] && !mud['Estado'] && e['Estado'] !== 'suspensa') mud['Estado'] = 'activa';
+  await mudar('escola', e._id, mud);
+  cachePainel.delete(e._id);
+  res.json({ ok: true, situacao: situacaoEscola(Object.assign({}, e, mud)) });
+}));
+app.post('/pl/transferencia', exigePlataforma, rota(async (req, res) => {
+  const b = req.body || {};
+  const e = await obter('escola', String(b.escola || ''));
+  if (!e) return erro(res, 404, 'Escola não encontrada.');
+  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  if (!(valor > 0)) return erro(res, 400, 'Escreva o valor transferido.');
+  const data = b.data && !isNaN(Date.parse(b.data)) ? new Date(b.data + 'T12:00:00Z').toISOString() : new Date().toISOString();
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  const id = await criar('transferencia', { 'Escola': e._id, 'Valor': valor, 'Data': data, 'Referencia': txt(b.referencia, 80), 'Metodo': txt(b.metodo, 40), 'Notas': txt(b.notas, 300), 'Feita Por': (eu && eu['Nome Completo']) || 'Plataforma' });
+  if (b.sms && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: transferimos ' + mt(valor) + ' para ' + (e['Nome'] || 'a escola') + ' (propinas pagas online)' + (b.referencia ? '. Ref. ' + txt(b.referencia, 40) : '') + '.').catch(() => {});
+  res.json({ ok: true, id });
+}));
+app.post('/pl/transferencia-apagar', exigePlataforma, rota(async (req, res) => {
+  const id = String((req.body || {}).id || '');
+  const t = await obter('transferencia', id).catch(() => null);
+  if (!t) return erro(res, 404, 'Transferência não encontrada.');
+  await apagar('transferencia', id);
+  res.json({ ok: true });
+}));
+
+// ============================================================
 //  WEBHOOK DA MOZPAYMENT
 //  POST /wh-moz/<MOZ_WEBHOOK_KEY>
 //  { transaction_id, reference, status, payment_method, wallet, amount, phone, client_name, product_name, reason, timestamp }
@@ -1695,7 +1873,10 @@ app.post('/wh-moz/:chave', async (req, res) => {
     if (MOZ_WALLET && b.wallet && String(b.wallet) !== MOZ_WALLET) { console.warn('[webhook] carteira diferente: ' + b.wallet); return res.json({ ok: true, ignorado: 'carteira' }); }
     let p = null;
     for (const c of candidatos) { const l = await procurar('pagamento', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) { p = l[0]; break; } }
-    if (!p) { console.warn('[webhook] referência desconhecida: ' + candidatos.join(' / ')); return res.json({ ok: true, ignorado: 'referência desconhecida' }); }
+    if (!p) {
+      for (const c of candidatos) { const l = await procurar('subscricao', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) return res.json(await aplicarSubscricao(l[0], b, estado)); }
+      console.warn('[webhook] referência desconhecida: ' + candidatos.join(' / ')); return res.json({ ok: true, ignorado: 'referência desconhecida' });
+    }
     if (p['Estado'] === 'pago') return res.json({ ok: true, ja: 'aplicado' });
     const raw = JSON.stringify(b).slice(0, 4000);
     const valor = Math.round(Number(String(b.amount || '').replace(',', '.')));
