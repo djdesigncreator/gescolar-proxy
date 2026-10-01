@@ -13,6 +13,7 @@
 //                   /professor-apagar /estudantes /matricular
 //    Propinas e pagamentos (v4): /propinas-gerar /propinas /pagar /pagar-balcao /pagamento-estado /pagamentos
 //                                GET|POST /wh-moz/<MOZ_WEBHOOK_KEY>  — webhook da MozPayment
+//    SMS (v4.1): /sms-teste  — e recibo por SMS ao encarregado sempre que um pagamento fica pago
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -20,12 +21,13 @@
 //    SESSION_SECRET  frase longa e aleatória que assina as sessões
 //    ORIGENS         endereços das páginas, separados por vírgulas
 //    MOZ_EMAIL, MOZ_SENHA, MOZ_WALLET, MOZ_WEBHOOK_KEY, MOZ_CARD_PATH (ver secção PAGAMENTOS)
+//    SMS_TOKEN, SMS_ORIGEM (ver secção SMS)
 // ============================================================
 'use strict';
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.0.1';
+const VERSAO = 'gescolar-proxy 4.1.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -159,7 +161,7 @@ async function abrirSessao(userId) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -653,6 +655,75 @@ async function prepararCobranca(req, ids) {
   const total = ps.reduce((s, x) => s + x.c.total, 0), multa = ps.reduce((s, x) => s + x.c.multa, 0);
   return { escola, ps, total, multa };
 }
+// ============================================================
+//  SMS (Turbo Host)
+//  POST https://my.turbo.host/api/international-sms/submit
+//  { user_token, origin, message, numbers:[ "2588XXXXXXXX" ] }
+//  Variáveis: SMS_TOKEN (user_token), SMS_ORIGEM (origin), SMS_URL (opcional)
+//  Todos os números saem com o prefixo 258.
+// ============================================================
+const SMS_URL = process.env.SMS_URL || 'https://my.turbo.host/api/international-sms/submit';
+const SMS_TOKEN = process.env.SMS_TOKEN || '';
+const SMS_ORIGEM = process.env.SMS_ORIGEM || '';
+// 84 123 4567 / +258 84 123 4567 / 00258841234567  →  258841234567
+function numeroSMS(t) {
+  let d = String(t || '').replace(/\D/g, '');
+  if (d.indexOf('00258') === 0) d = d.slice(2);
+  if (d.length === 9 && d[0] === '8') d = '258' + d;
+  return /^2588[2-7]\d{7}$/.test(d) ? d : null;
+}
+// tira acentos e caracteres especiais para a mensagem caber num SMS normal (160 caracteres)
+function textoSMS(m) {
+  return String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[ºª]/g, '').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim().slice(0, 459);
+}
+async function enviarSMS(numeros, mensagem) {
+  if (!SMS_TOKEN || !SMS_ORIGEM) return { ok: false, erro: 'SMS_TOKEN ou SMS_ORIGEM em falta no container' };
+  const lista = [...new Set((Array.isArray(numeros) ? numeros : [numeros]).map(numeroSMS).filter(Boolean))];
+  if (!lista.length) return { ok: false, erro: 'nenhum número válido' };
+  const message = textoSMS(mensagem);
+  if (!message) return { ok: false, erro: 'mensagem vazia' };
+  try {
+    const r = await fetch(SMS_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ user_token: SMS_TOKEN, origin: SMS_ORIGEM, message, numbers: lista }) });
+    const t = await r.text();
+    console.log('[sms] ' + lista.join(',') + ' → ' + r.status + ' ' + t.slice(0, 300));
+    let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
+    const falhou = !r.ok || (d && (d.success === false || d.ok === false || /error|erro|fail|invalid/i.test(String(d.status || ''))));
+    if (falhou) return { ok: false, erro: String(achar(d, ['message', 'mensagem', 'error', 'erro']) || ('o serviço de SMS respondeu ' + r.status)).slice(0, 200), numeros: lista };
+    return { ok: true, numeros: lista, resposta: d };
+  } catch (e) {
+    console.error('[sms]', e.message);
+    return { ok: false, erro: e.message, numeros: lista };
+  }
+}
+const mt = v => Number(v || 0).toLocaleString('pt-PT').replace(/\s/g, ' ') + ' MT';
+// recibo por SMS: ao encarregado (se aceita SMS) e a quem pagou pelo telemóvel
+async function smsRecibo(pag, documento) {
+  try {
+    const escola = await obter('escola', pag['Escola']).catch(() => null);
+    const est = pag['Estudante'] ? await obter('estudante', pag['Estudante']).catch(() => null) : null;
+    const enc = pag['Encarregado'] ? await obter('encarregado', pag['Encarregado']).catch(() => null) : null;
+    const numeros = [];
+    if (enc && enc['Recebe SMS'] !== false && enc['Telefone']) numeros.push(enc['Telefone']);
+    if (['mpesa', 'emola'].includes(String(pag['Metodo'] || '').toLowerCase()) && pag['Telefone']) numeros.push(pag['Telefone']);
+    if (!numeros.length) return;
+    const qtd = (pag['Propinas'] || []).length;
+    const msg = (escola ? escola['Nome'] + ': ' : '') + 'recebemos ' + mt(pag['Valor']) +
+      (est ? ' de ' + est['Nome'] : '') + (qtd > 1 ? ' (' + qtd + ' mensalidades)' : '') +
+      '. Recibo ' + documento + '. Obrigado. Gescolar';
+    const r = await enviarSMS(numeros, msg);
+    if (!r.ok) console.warn('[sms] recibo ' + documento + ' não enviado: ' + r.erro);
+  } catch (e) { console.error('[sms] recibo', e.message); }
+}
+app.post('/sms-teste', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!numeroSMS(b.numero)) return erro(res, 400, 'Número inválido. Use 9 dígitos, por exemplo 84 123 4567.');
+  const escola = await resumoEscola(req.escola);
+  const r = await enviarSMS([b.numero], txt(b.mensagem, 300) || ((escola ? escola.nome + ': ' : '') + 'teste de SMS do Gescolar. Se recebeu esta mensagem, esta tudo a funcionar.'));
+  if (!r.ok) return erro(res, 502, 'O SMS não foi enviado: ' + r.erro);
+  res.json({ ok: true, enviado_para: r.numeros });
+}));
+
 async function aplicarPago(pag, extra) {
   const agora = new Date().toISOString();
   const documento = await proximoDocumento(pag['Escola']);
@@ -663,6 +734,7 @@ async function aplicarPago(pag, extra) {
     const c = p ? calcPropina(p, (escola && escola.regras) || {}) : { multa: 0, total: 0 };
     await mudar('propina', pid, { 'Estado': 'paga', 'Pago Em': agora, 'Pagamento': pag._id, 'Multa': c.multa, 'Total': c.total }).catch(e => console.error('[pago] propina ' + pid + ': ' + e.message));
   }
+  smsRecibo(Object.assign({}, pag, extra || {}), documento);   // não espera: o SMS nunca atrasa o pagamento
   return documento;
 }
 async function proximoDocumento(escola) {
