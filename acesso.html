@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="pt-MZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Encarregados e estudantes · Gescolar</title>
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap">
+<link rel="stylesheet" href="gescolar.css">
+<style>
+body{background:var(--bg);margin:0}
+.ac{min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:28px 16px 48px;box-sizing:border-box}
+.ac-brand{display:flex;align-items:center;gap:10px;margin-bottom:22px;text-decoration:none;color:var(--ink)}
+.ac-brand img{width:44px;height:44px;border-radius:50%;background:#fff}
+.ac-brand b{font-family:var(--f-display);font-weight:800;font-size:22px;letter-spacing:-.02em}
+.ac-brand b i{font-style:normal;color:var(--sun)}
+.ac-card{width:100%;max-width:430px;background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);padding:26px 22px}
+.ac-card h1{font-family:var(--f-display);font-size:23px;font-weight:800;margin:0;letter-spacing:-.01em}
+.ac-card p.sub{color:var(--muted);margin:6px 0 20px;font-size:15px}
+.ac-tipo{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--surface2,#EEF2F8);border-radius:12px;padding:5px;margin-bottom:18px}
+.ac-tipo button{border:0;background:none;border-radius:9px;padding:10px 8px;font:700 14px var(--f-body);color:var(--muted);cursor:pointer}
+.ac-tipo button.on{background:var(--surface);color:var(--ink);box-shadow:0 1px 4px rgba(10,30,60,.12)}
+.ac-card .field{margin-bottom:14px}
+.ac-card .inp{height:46px;font-size:16px}
+.ac-card .btn.pri{width:100%;height:48px;justify-content:center;font-size:16px}
+.ac-cod{font-family:var(--f-mono)!important;font-size:28px!important;letter-spacing:.42em;text-align:center;height:60px!important}
+.ac-msg{border-radius:10px;padding:10px 12px;font-size:14px;font-weight:600;margin-bottom:14px}
+.ac-msg.err{background:var(--bad-soft);color:var(--bad)}
+.ac-msg.ok{background:var(--ok-soft);color:var(--ok)}
+.ac-row{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:16px;font-size:14px}
+.ac-row button,.ac-row a{background:none;border:0;padding:0;color:var(--blue);font:600 14px var(--f-body);cursor:pointer;text-decoration:none}
+.ac-row button[disabled]{color:var(--muted);cursor:default}
+.ac-foot{max-width:430px;text-align:center;color:var(--muted);font-size:13px;margin-top:18px;line-height:1.5}
+.ac-foot a{color:var(--blue);font-weight:600;text-decoration:none}
+.ac-hint{font-size:12.5px;color:var(--muted);font-weight:500}
+</style>
+</head>
+<body>
+<div class="ac">
+  <a class="ac-brand" href="index.html"><img src="logo.png" alt=""><b>G<i>e</i>scolar</b></a>
+  <div class="ac-card" id="card"></div>
+  <div class="ac-foot">É da Direcção ou da Secretaria? <a href="entrar.html">Entrar com email</a></div>
+</div>
+<script>
+(function(){
+'use strict';
+var PROXY='https://gescolar-proxy.onrender.com';
+function $(s){ return document.querySelector(s); }
+function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+function guardar(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+function ler(k){ try{ return localStorage.getItem(k)||''; }catch(e){ return ''; } }
+
+/* já tem sessão do portal? vai directo */
+try{ var ja=JSON.parse(ler('gs_sessao')||'null'); if(ja && ja.token && ja.pagina==='portal'){ location.replace('portal.html'); return; } }catch(e){}
+
+/* código da escola: ?e=josina · josina.gescolar.co.mz · última escola usada */
+var codigo='';
+try{ codigo=new URLSearchParams(location.search).get('e')||''; }catch(e){}
+if(!codigo){ var m=location.hostname.match(/^([a-z0-9-]+)\.gescolar\.co\.mz$/i); if(m && m[1]!=='www') codigo=m[1]; }
+if(!codigo) codigo=ler('gs_escola');
+var fixo=!!codigo;
+
+var S={ tipo: ler('gs_tipo')==='estudante'?'estudante':'encarregado', valor:'', pedido:'', destino:'', escolaNome:'', espera:0, timer:null };
+
+function post(rota,corpo){
+  return fetch(PROXY+rota,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(corpo||{})})
+    .then(function(r){ return r.json().catch(function(){ return {ok:false,erro:'Resposta inválida do servidor.'}; }); })
+    .catch(function(){ return {ok:false,erro:'Sem ligação ao servidor. Verifique a internet. Na primeira vez do dia pode demorar alguns segundos.'}; });
+}
+function carregar(btn,sim,txt){ if(sim){ btn.disabled=true; btn.dataset.t=btn.innerHTML; btn.innerHTML='<span class="spinner" style="width:18px;height:18px;border-width:2px;margin:0"></span>'+(txt||''); } else { btn.disabled=false; if(btn.dataset.t) btn.innerHTML=btn.dataset.t; } }
+
+function passo1(erroMsg){
+  clearInterval(S.timer);
+  var enc=S.tipo==='encarregado';
+  $('#card').innerHTML=
+    '<h1>Acompanhe a escola no telemóvel</h1><p class="sub">Propinas, recibos, notas e horários. Sem palavra-passe: enviamos um código por SMS.</p>'+
+    (erroMsg?'<div class="ac-msg err">'+esc(erroMsg)+'</div>':'')+
+    '<div class="ac-tipo"><button type="button" data-t="encarregado" class="'+(enc?'on':'')+'">Sou encarregado</button><button type="button" data-t="estudante" class="'+(!enc?'on':'')+'">Sou estudante</button></div>'+
+    '<form id="f1" novalidate>'+
+    (fixo?'<input type="hidden" id="a-esc" value="'+esc(codigo)+'">':'<label class="field">Código da escola<input class="inp" id="a-esc" autocomplete="organization" autocapitalize="none" spellcheck="false" placeholder="Ex.: josina" value="'+esc(codigo)+'"><span class="ac-hint">A secretaria da escola dá-lhe este código.</span></label>')+
+    (enc
+      ? '<label class="field">O seu número de telemóvel<input class="inp mono" id="a-val" type="tel" inputmode="numeric" autocomplete="tel-national" maxlength="13" placeholder="84 123 4567" value="'+esc(S.valor)+'"><span class="ac-hint">O número que deu à escola na matrícula.</span></label>'
+      : '<label class="field">Número de estudante<input class="inp mono" id="a-val" autocapitalize="characters" spellcheck="false" placeholder="Ex.: 2026-0001" value="'+esc(S.valor)+'"><span class="ac-hint">O código vai para o seu telemóvel ou para o do encarregado.</span></label>')+
+    '<button class="btn pri" id="b1" type="submit">Receber código por SMS</button></form>'+
+    (fixo?'<div class="ac-row"><span class="muted">Escola: <b class="mono" style="color:var(--ink)">'+esc(codigo)+'</b></span><button type="button" id="outra">Outra escola</button></div>':'');
+  Array.prototype.forEach.call(document.querySelectorAll('[data-t]'),function(b){ b.onclick=function(){ S.tipo=b.getAttribute('data-t'); S.valor=''; guardar('gs_tipo',S.tipo); passo1(); }; });
+  var o=$('#outra'); if(o) o.onclick=function(){ fixo=false; codigo=''; passo1(); };
+  $('#f1').onsubmit=function(ev){ ev.preventDefault(); pedir(); };
+  setTimeout(function(){ var f=fixo?$('#a-val'):($('#a-esc').value?$('#a-val'):$('#a-esc')); if(f) f.focus(); },30);
+}
+
+function pedir(reenviar){
+  var btn=reenviar?$('#reenv'):$('#b1');
+  if(!reenviar){
+    codigo=($('#a-esc').value||'').trim().toLowerCase();
+    S.valor=($('#a-val').value||'').trim();
+    if(!codigo) return passo1('Escreva o código da escola.');
+    if(S.tipo==='encarregado' && S.valor.replace(/\D/g,'').replace(/^258/,'').length!==9) return passo1('Escreva o seu número de telemóvel com 9 dígitos.');
+    if(S.tipo==='estudante' && !S.valor) return passo1('Escreva o seu número de estudante.');
+  }
+  if(btn) carregar(btn,true,reenviar?'':' A enviar…');
+  var corpo={escola:codigo, tipo:S.tipo}; if(S.tipo==='encarregado') corpo.telefone=S.valor; else corpo.numero=S.valor;
+  post('/acesso-codigo',corpo).then(function(r){
+    if(!r.ok){ if(reenviar){ passo2(r.erro); } else passo1(r.erro); return; }
+    guardar('gs_escola',codigo);
+    S.pedido=r.pedido; S.destino=r.destino; S.escolaNome=r.escola; S.espera=60;
+    passo2(null, reenviar?'Enviámos um código novo.':'');
+  });
+}
+
+function passo2(erroMsg, okMsg){
+  $('#card').innerHTML=
+    '<h1>Escreva o código</h1><p class="sub">Enviámos um SMS com 6 números para <b class="mono" style="color:var(--ink)">'+esc(S.destino)+'</b>'+(S.escolaNome?' · '+esc(S.escolaNome):'')+'.</p>'+
+    (erroMsg?'<div class="ac-msg err">'+esc(erroMsg)+'</div>':'')+(okMsg?'<div class="ac-msg ok">'+esc(okMsg)+'</div>':'')+
+    '<form id="f2" novalidate><label class="field" style="margin-bottom:16px">Código do SMS<input class="inp ac-cod" id="a-cod" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="······"></label>'+
+    '<button class="btn pri" id="b2" type="submit">Entrar</button></form>'+
+    '<div class="ac-row"><button type="button" id="voltar">← Mudar o número</button><button type="button" id="reenv" disabled>Reenviar</button></div>';
+  $('#voltar').onclick=function(){ passo1(); };
+  $('#reenv').onclick=function(){ pedir(true); };
+  var ci=$('#a-cod');
+  ci.oninput=function(){ ci.value=ci.value.replace(/\D/g,'').slice(0,6); if(ci.value.length===6) entrar(); };
+  $('#f2').onsubmit=function(ev){ ev.preventDefault(); entrar(); };
+  setTimeout(function(){ ci.focus(); },30);
+  clearInterval(S.timer);
+  function tic(){ var b=$('#reenv'); if(!b){ clearInterval(S.timer); return; } if(S.espera>0){ b.disabled=true; b.textContent='Reenviar em '+S.espera+' s'; S.espera--; } else { b.disabled=false; b.textContent='Reenviar o código'; clearInterval(S.timer); } }
+  tic(); S.timer=setInterval(tic,1000);
+}
+
+var aEntrar=false;
+function entrar(){
+  if(aEntrar) return;
+  var cod=($('#a-cod').value||'').replace(/\D/g,'');
+  if(cod.length!==6){ return; }
+  aEntrar=true; var btn=$('#b2'); carregar(btn,true,' A entrar…');
+  post('/acesso-entrar',{pedido:S.pedido, codigo:cod}).then(function(r){
+    aEntrar=false;
+    if(!r.ok){
+      if(/expirou|Demasiadas/.test(r.erro||'')){ passo1(r.erro); return; }
+      carregar(btn,false); var c=$('#a-cod'); c.value=''; c.focus();
+      var box=document.querySelector('.ac-msg'); if(box) box.remove();
+      $('#f2').insertAdjacentHTML('beforebegin','<div class="ac-msg err">'+esc(r.erro)+'</div>'); return;
+    }
+    clearInterval(S.timer);
+    guardar('gs_sessao',JSON.stringify({token:r.token,nome:r.nome,papel:r.papel,pagina:'portal',escola:r.escola,criada:Date.now()}));
+    location.replace('portal.html');
+  });
+}
+
+passo1();
+})();
+</script>
+</body>
+</html>

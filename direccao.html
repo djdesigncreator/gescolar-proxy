@@ -254,12 +254,13 @@ function pEstudantes(){
     S.turmas=r[1].ok?r[1].turmas:[]; var tm={}; S.turmas.forEach(function(t){ tm[t.id]=t; });
     var L=d.estudantes;
     $('#page').innerHTML=ph('Arranque','Estudantes', L.length? L.length+' estudantes'+(S.filtroTurma&&tm[S.filtroTurma]?' em '+esc(tm[S.filtroTurma].nome):' matriculados')+'.' : 'Matricule os estudantes. Cada um recebe um número e fica ligado ao encarregado.',
-      '<select class="sel" id="e-f"><option value="">Todas as turmas</option>'+S.turmas.map(function(t){ return '<option value="'+t.id+'"'+(t.id===S.filtroTurma?' selected':'')+'>'+esc(t.nome)+'</option>'; }).join('')+'</select><button class="btn pri" id="mat">'+ic('plus')+'Matricular</button>')+
+      '<select class="sel" id="e-f"><option value="">Todas as turmas</option>'+S.turmas.map(function(t){ return '<option value="'+t.id+'"'+(t.id===S.filtroTurma?' selected':'')+'>'+esc(t.nome)+'</option>'; }).join('')+'</select><button class="btn" id="fam">'+ic('users')+'Acesso das famílias</button><button class="btn pri" id="mat">'+ic('plus')+'Matricular</button>')+
       (L.length? '<section class="card"><div class="tbl-wrap"><table><thead><tr><th>Estudante</th><th>Turma</th><th>Encarregado</th><th>Nascimento</th></tr></thead><tbody>'+
         L.map(function(e){ return '<tr><td><div class="person">'+av(e.nome)+'<div><b>'+esc(e.nome)+'</b><small class="mono">'+esc(e.numero||'')+'</small></div></div></td><td>'+(tm[e.turma]?'<span class="tag">'+esc(tm[e.turma].nome)+'</span>':'—')+'</td><td class="small">'+(e.encarregado?esc(e.encarregado.nome)+'<div class="mono muted">'+esc(e.encarregado.telefone)+'</div>':'<span class="muted">—</span>')+'</td><td class="small num">'+data(e.nascimento)+'</td></tr>'; }).join('')+'</tbody></table></div></section>'
         : (S.turmas.length? vazio('users','Matricule o primeiro estudante','Precisa do nome, da turma e do contacto do encarregado.') : vazio('layers','Crie primeiro uma turma','Os estudantes são matriculados numa turma. Vá a "Turmas e salas".')));
     $('#e-f').onchange=function(){ S.filtroTurma=this.value; pEstudantes(); };
     $('#mat').onclick=function(){ if(!S.turmas.length){ toast('Crie primeiro uma turma'); ir('turmas'); return; } formMatricula(); };
+    $('#fam').onclick=acessoFamilias;
   });
 }
 function formMatricula(){
@@ -270,13 +271,37 @@ function formMatricula(){
     '<div class="frow"><label class="field">Nome completo<input class="inp" id="m-enc" placeholder="Ex.: Rosa Tembe"></label><label class="field">Telemóvel<input class="inp mono" id="m-tel" inputmode="numeric" placeholder="84 000 0000"></label></div>'+
     '<div class="frow"><label class="field">Parentesco<select class="sel" id="m-par"><option>Mãe</option><option>Pai</option><option>Avó</option><option>Avô</option><option>Tia</option><option>Tio</option><option>Irmã</option><option>Irmão</option><option>Outro</option></select></label><label class="field">Email (opcional)<input class="inp" id="m-email" type="email"></label></div>'+
     '<p class="small muted" style="margin:0">Se o telemóvel já pertencer a um encarregado da escola, o estudante fica ligado a ele (irmãos na mesma família).</p>'+
-    '<label class="field">Notas de saúde (opcional)<input class="inp" id="m-saude" placeholder="Alergias ou cuidados especiais"></label>'+
+    '<div class="frow"><label class="field">Telemóvel do estudante (opcional)<input class="inp mono" id="m-tel-est" inputmode="numeric" placeholder="84 000 0000"><span class="small muted" style="font-weight:400">Para estudantes com telemóvel próprio entrarem no portal.</span></label><label class="field">Notas de saúde (opcional)<input class="inp" id="m-saude" placeholder="Alergias ou cuidados especiais"></label></div>'+
     '<div id="m-err"></div></div><div class="modal-f"><button class="btn" data-fechar>Cancelar</button><button class="btn pri" id="m-ok">'+ic('save')+'Matricular</button></div>');
   $('#m-ok').onclick=function(){ var btn=this; aGravar(btn,true);
-    api('/matricular',{ nome:$('#m-nome').value, turma:$('#m-turma').value, sexo:$('#m-sexo').value, nascimento:$('#m-nasc').value, enc_nome:$('#m-enc').value, enc_telefone:$('#m-tel').value, enc_parentesco:$('#m-par').value, enc_email:$('#m-email').value, saude:$('#m-saude').value })
+    api('/matricular',{ nome:$('#m-nome').value, turma:$('#m-turma').value, sexo:$('#m-sexo').value, nascimento:$('#m-nasc').value, enc_nome:$('#m-enc').value, enc_telefone:$('#m-tel').value, enc_parentesco:$('#m-par').value, enc_email:$('#m-email').value, saude:$('#m-saude').value, telefone:$('#m-tel-est').value })
       .then(function(r){ if(r.ok){ fechar(); toast('Matriculado · Nº '+r.numero); S.filtroTurma=$('#m-turma')?$('#m-turma').value:S.filtroTurma; pEstudantes(); } else { aGravar(btn,false); $('#m-err').innerHTML=erroCaixa(r.erro); } }); };
 }
 
+
+function acessoFamilias(){
+  modal('<div class="modal-h"><h3>Acesso das famílias</h3><button class="icon-btn" data-fechar>'+ic('x')+'</button></div><div class="modal-b" id="fa-b"><div class="carregar" style="padding:30px"><div class="spinner"></div>A carregar…</div></div>');
+  api('/familias-link').then(function(r){
+    var b=$('#fa-b'); if(!b) return;
+    if(!r.ok){ b.innerHTML=erroCaixa(r.erro); return; }
+    b.innerHTML='<p style="margin:0">Encarregados e estudantes entram no portal <b>sem palavra-passe</b>: escrevem o telemóvel (ou o número de estudante) e recebem um código por SMS. Lá vêem as propinas, pagam por M-Pesa, e-Mola ou cartão e descarregam os recibos.</p>'+
+      '<label class="field">Link do portal da escola<div style="display:flex;gap:8px"><input class="inp mono" id="fa-l" readonly value="'+esc(r.link)+'" style="flex:1;min-width:0;font-size:13px"><button class="btn" id="fa-c">Copiar</button></div></label>'+
+      '<p class="small muted" style="margin:0">Código da escola: <b class="mono" style="color:var(--ink)">'+esc(r.codigo)+'</b> · '+r.com_telefone+' de '+r.encarregados+' encarregados com telemóvel registado.</p>'+
+      '<div class="card card-b" style="background:var(--blue-soft);border-color:transparent"><b>Convidar por SMS</b><div class="small muted" style="margin:4px 0 10px">Envia um SMS a todos os encarregados com o link do portal. Pode ser enviado uma vez por hora.</div>'+
+      '<button class="btn pri" id="fa-s"'+(r.com_telefone?'':' disabled')+'>Enviar convite a '+r.com_telefone+' encarregados</button><div id="fa-r" style="margin-top:10px"></div></div>';
+    $('#fa-c').onclick=function(){ var i=$('#fa-l'); i.select(); try{ navigator.clipboard.writeText(r.link).then(function(){ toast('Link copiado'); },function(){ document.execCommand('copy'); toast('Link copiado'); }); }catch(e){ document.execCommand('copy'); toast('Link copiado'); } };
+    $('#fa-s').onclick=function(){
+      var btn=this; if(btn.dataset.conf!=='1'){ btn.dataset.conf='1'; btn.textContent='Confirmar: enviar '+r.com_telefone+' SMS'; btn.classList.add('sun'); btn.classList.remove('pri'); return; }
+      aGravar(btn,true);
+      api('/familias-convite').then(function(x){
+        aGravar(btn,false);
+        if(!x.ok){ $('#fa-r').innerHTML=erroCaixa(x.erro); return; }
+        btn.disabled=true; btn.textContent='Convite enviado';
+        $('#fa-r').innerHTML='<div class="small" style="color:var(--ok);font-weight:700">Enviado a '+x.enviados+' encarregados'+(x.falhas?' · '+x.falhas+' falharam':'')+'.</div>';
+      });
+    };
+  });
+}
 
 /* ================= PROPINAS ================= */
 var MESES_C=['','Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];

@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="pt-MZ">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0B2A4A">
+<title>Gescolar · Família</title>
+<link rel="icon" href="logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Source+Sans+3:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap">
+<link rel="stylesheet" href="gescolar.css">
+<style>
+body{background:var(--bg);margin:0}
+.pt{min-height:100vh;padding-bottom:calc(84px + env(safe-area-inset-bottom,0px))}
+.pt-top{background:var(--navy);color:#fff;padding:14px 16px 0}
+.pt-top .in{max-width:860px;margin:0 auto}
+.pt-row{display:flex;align-items:center;gap:12px}
+.pt-logo{width:42px;height:42px;border-radius:11px;background:#fff;display:grid;place-items:center;overflow:hidden;flex:none}
+.pt-logo img{max-width:38px;max-height:38px;object-fit:contain}
+.pt-logo.ini{background:rgba(255,255,255,.14);color:#fff;font:800 15px var(--f-display)}
+.pt-esc{min-width:0;flex:1}
+.pt-esc b{display:block;font:800 16px/1.2 var(--f-display);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pt-esc small{color:rgba(255,255,255,.7);font-size:13px}
+.pt-sair{background:none;border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:9px;height:34px;padding:0 12px;font:600 13px var(--f-body);display:flex;align-items:center;gap:6px;cursor:pointer}
+.pt-sair svg{width:14px;height:14px}
+.pt-kids{display:flex;gap:8px;overflow-x:auto;padding:14px 0 0;scrollbar-width:none}
+.pt-kids::-webkit-scrollbar{display:none}
+.pt-kid{flex:none;border:1px solid rgba(255,255,255,.22);background:transparent;color:#fff;border-radius:99px;padding:6px 14px 6px 6px;display:flex;align-items:center;gap:8px;font:600 14px var(--f-body);cursor:pointer}
+.pt-kid .av{width:26px;height:26px;font-size:11px}
+.pt-kid.on{background:#fff;color:var(--navy);border-color:#fff}
+.pt-tabs{display:flex;gap:4px;margin-top:12px}
+.pt-tabs button{background:none;border:0;color:rgba(255,255,255,.72);font:600 14px var(--f-body);padding:12px 12px 13px;border-bottom:3px solid transparent;cursor:pointer;display:flex;align-items:center;gap:7px}
+.pt-tabs button svg{width:16px;height:16px}
+.pt-tabs button.on{color:#fff;border-bottom-color:var(--sun)}
+.pt-main{max-width:860px;margin:0 auto;padding:18px 16px}
+.pt-nav{display:none}
+@media (max-width:720px){
+  .pt-tabs{display:none}
+  .pt-nav{display:grid;grid-template-columns:repeat(5,1fr);position:fixed;left:0;right:0;bottom:0;z-index:50;background:var(--surface);border-top:1px solid var(--line);padding:6px 4px calc(6px + env(safe-area-inset-bottom,0px))}
+  .pt-nav button{background:none;border:0;display:flex;flex-direction:column;align-items:center;gap:3px;font:600 11.5px var(--f-body);color:var(--muted);padding:6px 0;cursor:pointer;position:relative}
+  .pt-nav button svg{width:22px;height:22px}
+  .pt-nav button.on{color:var(--blue)}
+  .pt-nav .bdg{position:absolute;top:2px;left:calc(50% + 6px);min-width:16px;height:16px;border-radius:8px;background:var(--bad);color:#fff;font-size:10px;display:grid;place-items:center;padding:0 4px}
+}
+.pt-hero{border-radius:16px;padding:18px;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow);display:flex;gap:14px;align-items:center;margin-bottom:14px}
+.pt-hero .av{width:52px;height:52px;font-size:18px;flex:none}
+.pt-hero b{display:block;font:800 19px/1.2 var(--f-display)}
+.pt-hero .info{color:var(--muted);font-size:14px}
+.saldo{border-radius:16px;padding:20px;color:#fff;background:linear-gradient(135deg,var(--navy),#0A64DC);margin-bottom:14px;position:relative;overflow:hidden}
+.saldo.ok{background:linear-gradient(135deg,#0F6B41,#168A52)}
+.saldo.bad{background:linear-gradient(135deg,#7A1F1F,#C0392B)}
+.saldo .l{font-size:13.5px;opacity:.85;font-weight:600}
+.saldo .v{font:800 32px/1.15 var(--f-display);margin:4px 0 2px;letter-spacing:-.02em}
+.saldo .d{font-size:14px;opacity:.9}
+.saldo .btn{margin-top:14px;background:#fff;color:var(--navy);border-color:#fff;height:44px;font-size:15px}
+.pt-g2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+.mini{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.mini .l{font-size:12.5px;color:var(--muted);font-weight:600}
+.mini .v{font:800 19px var(--f-display);margin-top:4px}
+.mini .d{font-size:13px;color:var(--muted);margin-top:2px}
+.sec-t{font:800 16px var(--f-display);margin:22px 0 10px;display:flex;justify-content:space-between;align-items:center}
+.sec-t a,.sec-t button{font:600 14px var(--f-body);color:var(--blue);background:none;border:0;cursor:pointer;text-decoration:none}
+.lista{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.pt-it{display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.pt-it:last-child{border-bottom:0}
+.pt-it .cx{width:22px;height:22px;flex:none;accent-color:var(--blue)}
+.pt-it .tx{flex:1;min-width:0}
+.pt-it .tx b{display:block;font-size:15px}
+.pt-it .tx small{color:var(--muted);font-size:13px}
+.pt-it .vl{text-align:right;flex:none}
+.pt-it .vl b{display:block;font-family:var(--f-mono);font-size:14.5px}
+.pt-it .vl small{color:var(--muted);font-size:12px}
+.pt-it.marcado{background:var(--blue-soft)}
+label.pt-it{cursor:pointer}
+.vazio{text-align:center;padding:36px 20px;color:var(--muted);background:var(--surface);border:1px dashed var(--line);border-radius:14px}
+.vazio .ic{width:54px;height:54px;border-radius:14px;background:var(--blue-soft);color:var(--blue);display:grid;place-items:center;margin:0 auto 12px}
+.vazio .ic svg{width:26px;height:26px}
+.vazio b{display:block;color:var(--ink);font-size:16px;margin-bottom:4px}
+.barra-pagar{position:sticky;bottom:calc(76px + env(safe-area-inset-bottom,0px));margin-top:14px;background:var(--navy);color:#fff;border-radius:14px;padding:12px 14px 12px 18px;display:flex;align-items:center;gap:12px;box-shadow:0 12px 30px -10px rgba(6,14,28,.5)}
+@media (min-width:721px){.barra-pagar{bottom:16px}}
+.barra-pagar .tx{flex:1}
+.barra-pagar small{display:block;opacity:.8;font-size:12.5px}
+.barra-pagar b{font:800 19px var(--f-display)}
+.barra-pagar .btn{background:var(--sun);border-color:var(--sun);color:#2c2000;height:44px;font-size:15px}
+.carregar{display:flex;align-items:center;justify-content:center;gap:12px;padding:60px 16px;color:var(--muted)}
+.carregar .spinner{margin:0;width:28px;height:28px;border-width:3px}
+.msg-err{background:var(--bad-soft);color:var(--bad);border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600}
+.method{cursor:pointer}
+.modal .btn.pri{justify-content:center}
+</style>
+</head>
+<body>
+<div id="root"><div class="carregar"><div class="spinner"></div>A abrir…</div></div>
+<div class="toasts" id="toasts"></div>
+<script>
+(function(){
+'use strict';
+var PROXY='https://gescolar-proxy.onrender.com';
+
+/* ---------- utilidades ---------- */
+function $(s,r){ return (r||document).querySelector(s); }
+function $$(s,r){ return Array.prototype.slice.call((r||document).querySelectorAll(s)); }
+function esc(v){ return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+function grp(n){ return String(Math.round(n||0)).replace(/\B(?=(\d{3})+(?!\d))/g,' '); }
+function mt(n){ return grp(n)+' MT'; }
+function data(iso){ if(!iso) return '—'; var d=new Date(iso); return isNaN(d)?'—':String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+d.getFullYear(); }
+function iniciais(n){ var p=String(n||'?').trim().split(/\s+/); return ((p[0]||'?')[0]+((p.length>1?p[p.length-1]:'')[0]||'')).toUpperCase(); }
+var CORES=['#0A64DC','#0E7C86','#7B4DD6','#C2410C','#168A52','#B4235A','#0B2A4A','#8A6D00'];
+function av(n){ var h=0; n=String(n||'?'); for(var i=0;i<n.length;i++) h=(h*31+n.charCodeAt(i))>>>0; return '<span class="av" style="background:'+CORES[h%CORES.length]+'">'+esc(iniciais(n))+'</span>'; }
+var IC={home:'M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z',wallet:'M20 7H5a2 2 0 0 1 0-4h13v4M3 5v14a2 2 0 0 0 2 2h15V7M16 14h.01',receipt:'M4 2v20l3-2 3 2 3-2 3 2 3-2 1 .7V2l-1 .7-3-2-3 2-3-2-3 2-3-2zM8 8h8M8 12h8M8 16h5',grade:'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M9 15l2 2 4-4',cal:'M8 2v4M16 2v4M3 8h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z',mega:'M3 11v2a1 1 0 0 0 1 1h3l5 4V6L7 10H4a1 1 0 0 0-1 1zM16 9a3 3 0 0 1 0 6M19 6a7 7 0 0 1 0 12',x:'M18 6 6 18M6 6l12 12',check:'M20 6 9 17l-5-5',out:'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9',download:'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3'};
+function ic(n,x){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" '+(x||'')+'><path d="'+IC[n]+'"/></svg>'; }
+function toast(m){ var t=document.createElement('div'); t.className='toast'; t.innerHTML='<i></i><span>'+esc(m)+'</span>'; $('#toasts').appendChild(t); setTimeout(function(){ t.remove(); },3600); }
+function erroCaixa(m){ return '<div class="msg-err">'+esc(m)+'</div>'; }
+var METODO={mpesa:['M-Pesa','#E60000'],emola:['e-Mola','#F28C00'],cartao:['Visa / Mastercard','#1A1F71'],balcao:['Numerário','#5A6A80']};
+
+/* ---------- sessão ---------- */
+var SES=null; try{ SES=JSON.parse(localStorage.getItem('gs_sessao')||'null'); }catch(e){}
+if(!SES || !SES.token){ location.replace('acesso.html'); return; }
+function sair(){ try{ localStorage.removeItem('gs_sessao'); }catch(e){} location.replace('acesso.html'); }
+function api(rota,corpo){
+  return fetch(PROXY+rota,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SES.token},body:JSON.stringify(corpo||{})})
+    .then(function(r){ return r.json().catch(function(){ return {ok:false,erro:'Resposta inválida do servidor.'}; }).then(function(d){ if(r.status===401) sair(); return d; }); })
+    .catch(function(){ return {ok:false,erro:'Sem ligação ao servidor. Verifique a internet e tente de novo.'}; });
+}
+
+/* ---------- modal ---------- */
+function modal(html){ fechar(); var s=document.createElement('div'); s.className='scrim'; s.id='ov'; s.innerHTML='<div class="modal" role="dialog" aria-modal="true">'+html+'</div>'; s.addEventListener('mousedown',function(e){ if(e.target===s) fechar(); }); document.body.appendChild(s); $$('[data-fechar]',s).forEach(function(b){ b.onclick=fechar; }); }
+function fechar(){ var o=$('#ov'); if(o) o.remove(); }
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') fechar(); });
+
+/* ---------- estado ---------- */
+var S={ d:null, atual:null, aba:'inicio', sel:{} };
+try{ var h=(location.hash||'').slice(1); if(h) S.aba=h; }catch(e){}
+var ABAS=[['inicio','Início','home'],['propinas','Propinas','wallet'],['recibos','Recibos','receipt'],['notas','Notas','grade'],['horario','Horário','cal']];
+function educando(){ var L=(S.d&&S.d.educandos)||[]; return L.filter(function(e){ return e.id===S.atual; })[0] || L[0] || null; }
+
+function carregar(depois){
+  api('/p/inicio').then(function(d){
+    if(!d.ok){ $('#root').innerHTML='<div class="carregar">'+esc(d.erro||'Não foi possível abrir.')+' <a class="link" href="">Tentar de novo</a></div>'; return; }
+    S.d=d;
+    if(!S.atual || !d.educandos.some(function(e){ return e.id===S.atual; })){ try{ S.atual=localStorage.getItem('gs_educando')||''; }catch(e){} if(!d.educandos.some(function(e){ return e.id===S.atual; })) S.atual=d.educandos[0]?d.educandos[0].id:null; }
+    casca(); if(depois) depois();
+  });
+}
+
+function casca(){
+  var d=S.d, E=d.escola||{}, e=educando(), enc=d.eu.papel==='Encarregado';
+  var atraso=e?e.propinas.filter(function(p){ return p.estado==='atrasada'; }).length:0;
+  $('#root').innerHTML='<div class="pt"><header class="pt-top"><div class="in">'+
+    '<div class="pt-row">'+(E.logotipo?'<div class="pt-logo"><img src="'+esc(E.logotipo)+'" alt=""></div>':'<div class="pt-logo ini">'+esc(iniciais(E.nome))+'</div>')+
+      '<div class="pt-esc"><b>'+esc(E.nome)+'</b><small>'+esc(enc?'Encarregado · '+d.eu.nome:'Estudante · '+d.eu.nome)+'</small></div>'+
+      '<button class="pt-sair" id="sair">'+ic('out')+'Sair</button></div>'+
+    (enc && d.educandos.length>1 ? '<div class="pt-kids">'+d.educandos.map(function(x){ return '<button class="pt-kid'+(e&&x.id===e.id?' on':'')+'" data-kid="'+esc(x.id)+'">'+av(x.nome)+esc(x.nome.split(' ')[0])+'</button>'; }).join('')+'</div>' : '')+
+    '<nav class="pt-tabs">'+ABAS.map(function(a){ return '<button class="'+(S.aba===a[0]?'on':'')+'" data-aba="'+a[0]+'">'+ic(a[2])+a[1]+'</button>'; }).join('')+'</nav>'+
+    '</div></header><main class="pt-main" id="pg"></main>'+
+    '<nav class="pt-nav">'+ABAS.map(function(a){ return '<button class="'+(S.aba===a[0]?'on':'')+'" data-aba="'+a[0]+'">'+ic(a[2])+a[1]+(a[0]==='propinas'&&atraso?'<span class="bdg">'+atraso+'</span>':'')+'</button>'; }).join('')+'</nav></div>';
+  $('#sair').onclick=sair;
+  $$('[data-kid]').forEach(function(b){ b.onclick=function(){ S.atual=b.getAttribute('data-kid'); S.sel={}; try{ localStorage.setItem('gs_educando',S.atual); }catch(x){} casca(); }; });
+  $$('[data-aba]').forEach(function(b){ b.onclick=function(){ ir(b.getAttribute('data-aba')); }; });
+  pagina();
+}
+function ir(a){ S.aba=a; try{ history.replaceState(null,'','#'+a); }catch(e){} casca(); window.scrollTo(0,0); }
+function pagina(){ var f={inicio:pInicio,propinas:pPropinas,recibos:pRecibos,notas:pNotas,horario:pHorario}[S.aba]||pInicio; f(); }
+function vazio(i,t,s){ return '<div class="vazio"><div class="ic">'+ic(i)+'</div><b>'+esc(t)+'</b>'+esc(s)+'</div>'; }
+
+/* ================= INÍCIO ================= */
+function pInicio(){
+  var e=educando(), d=S.d;
+  if(!e){ $('#pg').innerHTML=vazio('home','Ainda sem educandos','A escola ainda não ligou nenhum estudante a este número. Fale com a secretaria.'); return; }
+  var abertas=e.propinas.filter(function(p){ return p.estado!=='paga'; });
+  var prox=abertas[0], ult=e.recibos[0];
+  var cls=e.divida>0?'bad':(e.em_aberto>0?'':'ok');
+  $('#pg').innerHTML=
+    '<div class="pt-hero">'+av(e.nome)+'<div><b>'+esc(e.nome)+'</b><span class="info">Nº <span class="mono">'+esc(e.numero)+'</span>'+(e.turma?' · Turma '+esc(e.turma):'')+'</span></div></div>'+
+    '<div class="saldo '+cls+'">'+
+      (e.divida>0 ? '<div class="l">Em atraso</div><div class="v">'+mt(e.divida)+'</div><div class="d">'+e.propinas.filter(function(p){ return p.estado==='atrasada'; }).length+' mensalidade(s) com multa a crescer. Pague hoje para parar a multa.</div>'
+       : e.em_aberto>0 ? '<div class="l">Próxima mensalidade</div><div class="v">'+mt(prox.total)+'</div><div class="d">'+esc(prox.descricao||'Propina')+' · vence a '+data(prox.vencimento)+'</div>'
+       : '<div class="l">Propinas</div><div class="v">Tudo em dia</div><div class="d">Não há mensalidades por pagar. Obrigado!</div>')+
+      (e.em_aberto>0?'<button class="btn" id="pg-pagar">'+ic('wallet')+'Pagar agora</button>':'')+
+    '</div>'+
+    '<div class="pt-g2"><div class="mini"><div class="l">Por pagar</div><div class="v num">'+mt(e.em_aberto)+'</div><div class="d">'+abertas.length+' mensalidade(s)</div></div>'+
+      '<div class="mini"><div class="l">Último pagamento</div><div class="v num">'+(ult?mt(ult.valor):'—')+'</div><div class="d">'+(ult?data(ult.data)+' · '+esc((METODO[ult.metodo]||[ult.metodo])[0]):'Ainda sem pagamentos')+'</div></div></div>'+
+    '<div class="sec-t">Comunicados da escola</div>'+vazio('mega','Sem comunicados','Quando a escola publicar avisos, aparecem aqui.')+
+    '<div class="sec-t">Contactos da escola</div><div class="lista"><div class="pt-it"><div class="tx"><b>'+esc(d.escola.nome)+'</b><small>'+esc([d.escola.telefone,d.escola.email].filter(Boolean).join(' · ')||'—')+'</small></div>'+(d.escola.telefone?'<a class="btn sm" href="tel:'+esc(String(d.escola.telefone).replace(/[^\d+]/g,''))+'">Ligar</a>':'')+'</div></div>';
+  var b=$('#pg-pagar'); if(b) b.onclick=function(){ S.sel={}; abertas.forEach(function(p){ if(p.estado==='atrasada') S.sel[p.id]=1; }); if(!Object.keys(S.sel).length && prox) S.sel[prox.id]=1; ir('propinas'); };
+}
+
+/* ================= PROPINAS ================= */
+function pPropinas(){
+  var e=educando();
+  if(!e){ $('#pg').innerHTML=vazio('wallet','Sem propinas',''); return; }
+  var L=e.propinas;
+  if(!L.length){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Propinas de '+esc(e.nome.split(' ')[0])+'</div>'+vazio('wallet','Ainda sem mensalidades','A escola ainda não lançou as mensalidades deste ano.'); return; }
+  Object.keys(S.sel).forEach(function(id){ if(!L.some(function(p){ return p.id===id && p.estado!=='paga'; })) delete S.sel[id]; });
+  var abertas=L.filter(function(p){ return p.estado!=='paga'; }), pagas=L.filter(function(p){ return p.estado==='paga'; });
+  function linha(p){
+    var pill = p.estado==='paga'?'<span class="pill ok">Paga</span>' : p.estado==='atrasada'?'<span class="pill bad">Em atraso</span>' : '<span class="pill info">Por pagar</span>';
+    var cx = p.estado!=='paga' ? '<input type="checkbox" class="cx" data-p="'+esc(p.id)+'"'+(S.sel[p.id]?' checked':'')+'>' : '<span style="width:22px;height:22px;flex:none;color:var(--ok)">'+ic('check','width="22" height="22"')+'</span>';
+    var tag = p.estado!=='paga' ? 'label' : 'div';
+    return '<'+tag+' class="pt-it'+(S.sel[p.id]?' marcado':'')+'">'+cx+'<div class="tx"><b>'+esc(p.descricao||'Propina')+'</b><small>'+(p.estado==='paga'?'Paga a '+data(p.pago_em):'Vence a '+data(p.vencimento))+(p.multa?' · multa '+mt(p.multa):'')+'</small></div><div class="vl"><b>'+mt(p.total)+'</b>'+pill+'</div></'+tag+'>';
+  }
+  $('#pg').innerHTML=
+    (abertas.length? '<div class="sec-t" style="margin-top:4px">Por pagar <button type="button" id="todas">'+(abertas.every(function(p){ return S.sel[p.id]; })?'Limpar':'Escolher todas')+'</button></div><div class="lista">'+abertas.map(linha).join('')+'</div>'
+      : '<div class="saldo ok" style="margin-top:4px"><div class="l">Propinas</div><div class="v">Tudo em dia</div><div class="d">Não há mensalidades por pagar.</div></div>')+
+    (pagas.length? '<div class="sec-t">Pagas</div><div class="lista">'+pagas.slice().reverse().map(linha).join('')+'</div>' : '')+
+    '<div id="barra"></div>'+
+    (S.d.escola.regras && S.d.escola.regras.multa ? '<p class="small muted" style="margin:14px 2px 0">As mensalidades vencem no dia '+esc(S.d.escola.regras.dia_limite||10)+'. Depois disso a multa é de '+esc(S.d.escola.regras.multa)+'% por mês, até ao máximo de '+esc(S.d.escola.regras.multa_max||S.d.escola.regras.multa)+'%.</p>' : '');
+  $$('[data-p]').forEach(function(c){ c.onchange=function(){ var id=c.getAttribute('data-p'); if(c.checked) S.sel[id]=1; else delete S.sel[id]; c.closest('.pt-it').classList.toggle('sel',c.checked); barra(); }; });
+  var t=$('#todas'); if(t) t.onclick=function(){ var todas=abertas.every(function(p){ return S.sel[p.id]; }); S.sel={}; if(!todas) abertas.forEach(function(p){ S.sel[p.id]=1; }); pPropinas(); };
+  barra();
+  function barra(){
+    var ids=Object.keys(S.sel), tot=abertas.filter(function(p){ return S.sel[p.id]; }).reduce(function(s,p){ return s+p.total; },0);
+    $('#barra').innerHTML = ids.length ? '<div class="barra-pagar"><div class="tx"><small>'+ids.length+' mensalidade(s)</small><b class="num">'+mt(tot)+'</b></div><button class="btn" id="b-pagar">Pagar</button></div>' : '';
+    var b=$('#b-pagar'); if(b) b.onclick=function(){ pagar(e, abertas.filter(function(p){ return S.sel[p.id]; })); };
+  }
+}
+
+function pagar(e, ps){
+  var met='mpesa', tel=(S.d.eu.telefone||'').replace(/\D/g,'');
+  var total=ps.reduce(function(s,p){ return s+p.total; },0);
+  function desenhar(errMsg){
+    modal('<div class="modal-h"><h3>Pagar '+mt(total)+'</h3><button class="icon-btn" data-fechar aria-label="Fechar">'+ic('x')+'</button></div><div class="modal-b">'+
+      '<div class="small muted">'+esc(e.nome)+' · '+ps.map(function(p){ return esc(p.descricao||'Propina'); }).join(', ')+'</div>'+
+      '<div class="methods">'+['mpesa','emola','cartao'].map(function(k){ return '<button type="button" class="method '+(met===k?'on':'')+'" data-m="'+k+'"><span class="lg" style="background:'+METODO[k][1]+';font-size:12px">'+(k==='cartao'?'VISA':METODO[k][0])+'</span>'+METODO[k][0].replace(' / ','/')+'</button>'; }).join('')+'</div>'+
+      (met!=='cartao' ? '<label class="field">Número '+METODO[met][0]+'<input class="inp mono" id="c-tel" type="tel" inputmode="numeric" maxlength="12" value="'+esc(tel)+'" placeholder="'+(met==='mpesa'?'84 000 0000':'86 000 0000')+'"><span class="small" id="c-tel-h" style="font-weight:500"></span></label><p class="small muted" style="margin:0">Vai receber um pedido no telemóvel. Confirme com o seu PIN '+METODO[met][0]+'.</p>'
+        : '<p class="small muted" style="margin:0">Vai abrir a página segura da MozPayment para pagar com cartão Visa ou Mastercard.</p>')+
+      '<div id="c-err">'+(errMsg?erroCaixa(errMsg):'')+'</div></div>'+
+      '<div class="modal-f"><button class="btn" data-fechar>Cancelar</button><button class="btn pri" id="c-ok">'+(met==='cartao'?'Continuar para o cartão':'Enviar pedido de pagamento')+'</button></div>');
+    $$('[data-m]').forEach(function(b){ b.onclick=function(){ var ti=$('#c-tel'); if(ti) tel=ti.value.replace(/\D/g,''); met=b.getAttribute('data-m'); desenhar(); }; });
+    var ti=$('#c-tel'), valida=function(){ return true; };
+    if(ti){ valida=function(){ tel=ti.value.replace(/\D/g,'').replace(/^258(?=\d{9}$)/,''); var p=tel.slice(0,2), m=tel.length!==9?'O número tem 9 dígitos.':(met==='mpesa'&&p!=='84'&&p!=='85')?'M-Pesa só com números 84 ou 85.':(met==='emola'&&p!=='86'&&p!=='87')?'e-Mola só com números 86 ou 87.':''; var h=$('#c-tel-h'); h.textContent=m||'Número válido.'; h.style.color=m?'var(--bad)':'var(--ok)'; return !m; }; ti.oninput=valida; if(tel) valida(); }
+    $('#c-ok').onclick=function(){
+      if(!valida()){ $('#c-err').innerHTML=erroCaixa('Confirme o número de telemóvel.'); return; }
+      var btn=this; btn.disabled=true; btn.innerHTML='A enviar…';
+      api('/p/pagar',{propinas:ps.map(function(p){ return p.id; }), metodo:met, numero:tel, nome:S.d.eu.nome}).then(function(r){
+        if(!r.ok){ desenhar(r.erro); return; }
+        if(r.link){ try{ window.open(r.link,'_blank','noopener'); }catch(x){} }
+        esperar(r, met);
+      });
+    };
+  }
+  desenhar();
+}
+function esperar(r, met){
+  var fim=Date.now()+4*60e3, parado=false;
+  modal('<div class="modal-b" style="text-align:center;padding:26px 20px"><div class="spinner"></div><h3 style="margin-top:10px">'+(met==='cartao'?'À espera do pagamento com cartão':'Confirme no telemóvel')+'</h3>'+
+    '<p class="muted">'+(met==='cartao'?'Pague na página da MozPayment. Esta janela actualiza sozinha quando o pagamento for confirmado.':esc(r.mensagem||'Pedido enviado.'))+'</p>'+
+    (r.link?'<a class="btn pri" href="'+esc(r.link)+'" target="_blank" rel="noopener" style="text-decoration:none;justify-content:center;margin:6px 0 10px">Abrir a página de pagamento</a>':'')+
+    '<p class="small muted" id="w-st">A aguardar confirmação · '+mt(r.total)+'</p></div><div class="modal-f"><button class="btn" id="w-x">Fechar e ver depois</button></div>');
+  $('#w-x').onclick=function(){ parado=true; fechar(); carregar(); };
+  (function verificar(){
+    if(parado) return;
+    if(Date.now()>fim){ var s=$('#w-st'); if(s) s.textContent='Ainda sem confirmação. Pode fechar: quando o pagamento for confirmado, a mensalidade fica paga sozinha e recebe o recibo por SMS.'; return; }
+    api('/p/pagamento-estado',{id:r.pagamento}).then(function(x){
+      if(parado) return;
+      if(x.ok && x.estado==='pago'){ parado=true; sucesso(x, met, r.pagamento); return; }
+      if(x.ok && (x.estado==='falhado'||x.estado==='expirado')){ var s=$('#w-st'); if(s) s.innerHTML='<b style="color:var(--bad)">'+(x.estado==='falhado'?'O pagamento falhou ou foi cancelado.':'O pedido expirou sem confirmação.')+'</b> Pode tentar outra vez.'; return; }
+      setTimeout(verificar, 4000);
+    });
+  })();
+}
+function sucesso(x, met, pid){
+  S.sel={};
+  modal('<div class="modal-b" style="text-align:center;padding:26px 20px"><div style="width:64px;height:64px;border-radius:50%;background:var(--ok);display:grid;place-items:center;margin:0 auto;color:#fff">'+ic('check','width="30" height="30"')+'</div>'+
+    '<h3 style="margin-top:14px;font-size:20px">Pagamento confirmado</h3><p class="muted">'+mt(x.valor)+' · '+esc((METODO[met]||[met])[0])+'<br>Factura-recibo <b class="mono" style="color:var(--ink)">'+esc(x.documento||'')+'</b></p></div>'+
+    '<div class="modal-f"><button class="btn" id="s-pdf">'+ic('download')+'Recibo PDF</button><button class="btn pri" id="s-ok">Concluir</button></div>');
+  $('#s-pdf').onclick=function(){ abrirRecibo(pid); };
+  $('#s-ok').onclick=function(){ fechar(); carregar(); };
+}
+function abrirRecibo(id){ var u='recibo.html?id='+encodeURIComponent(id), w=window.open(u,'_blank'); if(!w) location.href=u; }
+
+/* ================= RECIBOS ================= */
+function pRecibos(){
+  var e=educando(); var L=e?e.recibos:[];
+  $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Facturas-recibo'+(e?' · '+esc(e.nome.split(' ')[0]):'')+'</div>'+
+    (L.length? '<div class="lista">'+L.map(function(p){ var m=METODO[p.metodo]||[p.metodo,'#5A6A80']; return '<div class="pt-it"><div class="tx"><b class="mono" style="font-size:14px">'+esc(p.documento)+'</b><small>'+data(p.data)+' · <span style="color:'+m[1]+';font-weight:700">'+esc(m[0])+'</span>'+(p.multa?' · multa '+mt(p.multa):'')+'</small></div><div class="vl"><b>'+mt(p.valor)+'</b></div><button class="btn sm" data-pdf="'+esc(p.id)+'">'+ic('download')+'PDF</button></div>'; }).join('')+'</div>'
+      : vazio('receipt','Ainda sem recibos','Cada pagamento confirmado gera uma factura-recibo que pode descarregar em PDF.'));
+  $$('[data-pdf]').forEach(function(b){ b.onclick=function(){ abrirRecibo(b.getAttribute('data-pdf')); }; });
+}
+
+/* ================= NOTAS E HORÁRIO (próxima fase) ================= */
+function pNotas(){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Notas e pautas</div>'+vazio('grade','As notas ainda não foram publicadas','Quando os professores lançarem as notas, aparecem aqui por disciplina e trimestre.'); }
+function pHorario(){ $('#pg').innerHTML='<div class="sec-t" style="margin-top:4px">Horário da turma</div>'+vazio('cal','O horário ainda não foi publicado','Quando a escola publicar o horário da turma, aparece aqui.'); }
+
+/* ---------- arranque ---------- */
+fetch(PROXY+'/sessao',{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+SES.token}})
+  .then(function(r){ return r.json().then(function(d){ return {st:r.status,d:d}; }); })
+  .then(function(x){
+    var d=x.d;
+    if(x.st===401){ return sair(); }
+    if(!d.ok){ $('#root').innerHTML='<div class="carregar">'+esc(d.erro||'Não foi possível abrir.')+' <a class="link" href="acesso.html">Entrar outra vez</a></div>'; return; }
+    if(d.pagina!=='portal'){ location.replace((d.pagina||'entrar')+'.html'); return; }
+    SES.token=d.token; try{ localStorage.setItem('gs_sessao',JSON.stringify({token:d.token,nome:d.nome,papel:d.papel,pagina:'portal',escola:d.escola,criada:Date.now()})); }catch(e){}
+    carregar();
+  })
+  .catch(function(){ $('#root').innerHTML='<div class="carregar">Sem ligação ao servidor do Gescolar. Na primeira vez do dia pode demorar alguns segundos. <a class="link" href="">Tentar de novo</a></div>'; });
+})();
+</script>
+</body>
+</html>
