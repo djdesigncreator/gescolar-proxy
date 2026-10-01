@@ -17,6 +17,7 @@
 //    Facturas (v4.2): /escola-dados /escola-guardar (logótipo e dados da factura) /recibo (dados da factura-recibo em PDF)
 //    Portal das famílias (v4.3): /acesso-codigo /acesso-entrar (entrada por código SMS, sem palavra-passe)
 //                                /p/inicio /p/pagar /p/pagamento-estado  ·  /familias-link /familias-convite (Direcção)
+//    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -30,7 +31,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.3.0';
+const VERSAO = 'gescolar-proxy 4.4.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -86,6 +87,7 @@ const workflow = (nome, body) => pedido(BUBBLE_WF + '/' + nome, 'POST', body);
 const obter = (tipo, id) => bubble('GET', '/' + tipo + '/' + encodeURIComponent(id)).then(d => d && d.response);
 const criar = (tipo, campos) => bubble('POST', '/' + tipo, campos).then(d => d && d.id);
 const mudar = (tipo, id, campos) => bubble('PATCH', '/' + tipo + '/' + encodeURIComponent(id), campos);
+const apagar = (tipo, id) => bubble('DELETE', '/' + tipo + '/' + encodeURIComponent(id));
 async function procurar(tipo, filtros, limite) {
   const q = '?constraints=' + encodeURIComponent(JSON.stringify(filtros || [])) + '&limit=' + (limite || 100);
   const d = await bubble('GET', '/' + tipo + q);
@@ -684,7 +686,7 @@ function numeroSMS(t) {
 }
 // tira acentos e caracteres especiais para a mensagem caber num SMS normal (160 caracteres)
 function textoSMS(m) {
-  return String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[ºª]/g, '').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim().slice(0, 459);
+  return String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/º/g, 'o').replace(/ª/g, 'a').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim().slice(0, 459);
 }
 async function enviarSMS(numeros, mensagem) {
   if (!SMS_TOKEN || !SMS_ORIGEM) return { ok: false, erro: 'SMS_TOKEN ou SMS_ORIGEM em falta no container' };
@@ -996,6 +998,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
   const ests = (await Promise.all(req.educandos.map(id => obter('estudante', id).catch(() => null)))).filter(Boolean);
   const turmaIds = [...new Set(ests.map(e => e['Turma']).filter(Boolean))];
   const turmas = {}; (await Promise.all(turmaIds.map(id => obter('turma', id).catch(() => null)))).filter(Boolean).forEach(t => { turmas[t._id] = t; });
+  const cache = {};
   const educandos = await Promise.all(ests.map(async e => {
     const f = [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Estudante', constraint_type: 'equals', value: e._id }];
     const [props, pags] = await Promise.all([procurarTodos('propina', f, 600), procurarTodos('pagamento', f, 600)]);
@@ -1004,6 +1007,8 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
     const t = turmas[e['Turma']];
     return {
       id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', turma: t ? (t['Nome'] || '') : '',
+      horario: await horarioDaTurma(req.escola, e['Turma'], cache).catch(err => { console.error('[portal] horário', err.message); return null; }),
+      comunicados: await comunicadosPara(req.escola, [e['Turma']].filter(Boolean), cache).catch(err => { console.error('[portal] comunicados', err.message); return []; }),
       propinas: ps,
       divida: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
       em_aberto: ps.filter(p => p.estado !== 'paga').reduce((x, p) => x + p.total, 0),
@@ -1046,6 +1051,142 @@ app.post('/familias-convite', exigeDireccao, rota(async (req, res) => {
   if (!enviados) return erro(res, 502, 'Não foi possível enviar os SMS agora. Tente mais tarde.');
   res.json({ ok: true, enviados, falhas });
 }));
+
+// ============================================================
+//  HORÁRIOS (v4.4)
+//  Bubble, data type Horario: Escola (Escola) · Turma (text) · Grelha (text) · Publicado (yes/no)
+//  Um registo por turma. A grelha é um JSON:
+//   { dias:[1..6], tempos:[{i:"07:00",f:"07:45"}], aulas:{ "<dia>-<tempo>": { d:<disciplina>, p:<professor>, s:"sala" } } }
+// ============================================================
+const HORA = /^([01]\d|2[0-3]):[0-5]\d$/;
+const DIAS_N = ['', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
+function lerGrelha(t) { try { const g = JSON.parse(t || ''); return g && typeof g === 'object' ? g : null; } catch (e) { return null; } }
+function validarGrelha(g, discIds, profIds) {
+  if (!g || typeof g !== 'object') return 'Horário inválido.';
+  const dias = Array.isArray(g.dias) ? [...new Set(g.dias.map(Number))].filter(d => d >= 1 && d <= 6).sort() : [];
+  if (!dias.length) return 'Escolha os dias de aulas.';
+  const tempos = Array.isArray(g.tempos) ? g.tempos : [];
+  if (!tempos.length || tempos.length > 14) return 'O horário tem de ter entre 1 e 14 tempos.';
+  for (let k = 0; k < tempos.length; k++) {
+    const t = tempos[k] || {};
+    if (!HORA.test(t.i || '') || !HORA.test(t.f || '') || t.i >= t.f) return 'O ' + (k + 1) + 'º tempo tem horas inválidas (use 07:30 a 08:15).';
+    if (k && tempos[k - 1].f > t.i) return 'O ' + (k + 1) + 'º tempo começa antes do anterior acabar.';
+  }
+  const aulas = {};
+  for (const [chave, a] of Object.entries(g.aulas || {})) {
+    const m = /^([1-6])-(\d{1,2})$/.exec(chave);
+    if (!m || !dias.includes(Number(m[1])) || Number(m[2]) >= tempos.length || !a) continue;
+    if (!a.d || !discIds.has(String(a.d))) continue;
+    aulas[chave] = { d: String(a.d), p: a.p && profIds.has(String(a.p)) ? String(a.p) : '', s: txt(a.s, 30) };
+  }
+  return { dias, tempos: tempos.map(t => ({ i: t.i, f: t.f })), aulas };
+}
+// professor em duas turmas à mesma hora?
+function conflitos(grelha, turmaId, outros, nomes) {
+  const out = [];
+  for (const [chave, a] of Object.entries(grelha.aulas)) {
+    if (!a.p) continue;
+    const [dia, ti] = chave.split('-').map(Number), t = grelha.tempos[ti];
+    for (const o of outros) {
+      if (o.turma === turmaId || !o.grelha) continue;
+      for (const [ck, b] of Object.entries(o.grelha.aulas || {})) {
+        if (b.p !== a.p) continue;
+        const [od, oti] = ck.split('-').map(Number), ot = (o.grelha.tempos || [])[oti];
+        if (od !== dia || !ot || !(t.i < ot.f && ot.i < t.f)) continue;
+        out.push((nomes.prof[a.p] || 'Um professor') + ' já tem aula na turma ' + (nomes.turma[o.turma] || '?') + ' à ' + DIAS_N[dia] + ', ' + ot.i + '–' + ot.f + '.');
+      }
+    }
+  }
+  return [...new Set(out)];
+}
+app.post('/horarios', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [turmas, discs, profs, hs] = await Promise.all([procurarTodos('turma', f), procurarTodos('disciplina', f), procurarTodos('professor', f), procurarTodos('horario', f)]);
+  res.json({ ok: true,
+    turmas: turmas.filter(t => t['Activa'] !== false).map(t => turmaOut(t)).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')),
+    disciplinas: discs.map(discOut).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')),
+    professores: profs.filter(p => p['Activo'] !== false).map(p => ({ id: p._id, nome: p['Nome'] || '', disciplinas: p['Disciplinas'] || [] })).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')),
+    horarios: hs.map(h => ({ id: h._id, turma: h['Turma'], publicado: !!h['Publicado'], grelha: lerGrelha(h['Grelha']), actualizado: h['Modified Date'] || null })).filter(h => h.grelha) });
+}));
+app.post('/horario-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, f = daEscola(req.escola);
+  const turma = await daMinhaEscola('turma', String(b.turma || ''), req.escola);
+  const [discs, profs, hs, turmas] = await Promise.all([procurarTodos('disciplina', f), procurarTodos('professor', f), procurarTodos('horario', f), procurarTodos('turma', f)]);
+  const g = validarGrelha(b.grelha, new Set(discs.map(d => d._id)), new Set(profs.map(p => p._id)));
+  if (typeof g === 'string') return erro(res, 400, g);
+  const nomes = { prof: Object.fromEntries(profs.map(p => [p._id, p['Nome']])), turma: Object.fromEntries(turmas.map(t => [t._id, t['Nome']])) };
+  const cf = conflitos(g, turma._id, hs.map(h => ({ turma: h['Turma'], grelha: lerGrelha(h['Grelha']) })), nomes);
+  if (cf.length) return res.status(409).json({ ok: false, erro: 'Há professores com aulas sobrepostas.', conflitos: cf.slice(0, 8) });
+  const campos = { 'Escola': req.escola, 'Turma': turma._id, 'Grelha': JSON.stringify(g), 'Publicado': !!b.publicado };
+  const ja = hs.find(h => h['Turma'] === turma._id);
+  const id = ja ? (await mudar('horario', ja._id, campos), ja._id) : await criar('horario', campos);
+  res.json({ ok: true, id, grelha: g, publicado: !!b.publicado, aulas: Object.keys(g.aulas).length });
+}));
+// horário pronto a mostrar (nomes em vez de ids) — usado pelo portal
+async function horarioDaTurma(escola, turmaId, cache) {
+  if (!turmaId) return null;
+  const hs = cache.hs || (cache.hs = await procurarTodos('horario', daEscola(escola)));
+  const h = hs.find(x => x['Turma'] === turmaId && x['Publicado']);
+  const g = h && lerGrelha(h['Grelha']);
+  if (!g) return null;
+  if (!cache.disc) {
+    const [discs, profs] = await Promise.all([procurarTodos('disciplina', daEscola(escola)), procurarTodos('professor', daEscola(escola))]);
+    cache.disc = Object.fromEntries(discs.map(d => [d._id, { nome: d['Nome'] || '', cor: d['Cor'] || '#0A64DC', sigla: d['Sigla'] || '' }]));
+    cache.prof = Object.fromEntries(profs.map(p => [p._id, p['Nome'] || '']));
+  }
+  const aulas = {};
+  for (const [k, a] of Object.entries(g.aulas || {})) { const d = cache.disc[a.d]; if (d) aulas[k] = { disciplina: d.nome, sigla: d.sigla, cor: d.cor, professor: cache.prof[a.p] || '', sala: a.s || '' }; }
+  return { dias: g.dias, tempos: g.tempos, aulas };
+}
+
+// ============================================================
+//  COMUNICADOS (v4.4)
+//  Bubble, data type Comunicado: Escola (Escola) · Titulo (text) · Texto (text) · Turma (text, vazio = toda a escola)
+//                               · Autor (text) · Publicado Em (date) · SMS Enviados (number)
+// ============================================================
+const comOut = (c, turmas) => ({ id: c._id, titulo: c['Titulo'] || '', texto: c['Texto'] || '', turma: c['Turma'] || '', turma_nome: c['Turma'] ? ((turmas || {})[c['Turma']] || '') : '', autor: c['Autor'] || '', data: c['Publicado Em'] || c['Created Date'] || null, sms: Number(c['SMS Enviados'] || 0) });
+app.post('/comunicados', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [cs, turmas] = await Promise.all([procurarTodos('comunicado', f, 500), procurarTodos('turma', f)]);
+  const tn = Object.fromEntries(turmas.map(t => [t._id, t['Nome']]));
+  res.json({ ok: true, comunicados: cs.map(c => comOut(c, tn)).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/comunicado-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const titulo = txt(b.titulo, 120), texto = txt(b.texto, 3000);
+  if (titulo.length < 3) return erro(res, 400, 'Escreva um título.');
+  if (texto.length < 3) return erro(res, 400, 'Escreva o texto do comunicado.');
+  let turma = null;
+  if (b.turma) turma = await daMinhaEscola('turma', String(b.turma), req.escola);
+  const [esc, eu] = await Promise.all([obter('escola', req.escola), obter('user', req.sessao.u).catch(() => null)]);
+  const id = await criar('comunicado', { 'Escola': req.escola, 'Titulo': titulo, 'Texto': texto, 'Turma': turma ? turma._id : '', 'Autor': (eu && eu['Nome Completo']) || 'Direcção', 'Publicado Em': new Date().toISOString(), 'SMS Enviados': 0 });
+  let sms = 0, aviso = '';
+  if (b.sms) {
+    if (travao('com-sms|' + req.escola, 6, 60)) aviso = 'O comunicado foi publicado, mas o SMS não foi enviado: limite de 6 envios por hora.';
+    else {
+      const f = daEscola(req.escola);
+      const [ests, encs] = await Promise.all([procurarTodos('estudante', turma ? f.concat([{ key: 'Turma', constraint_type: 'equals', value: turma._id }]) : f), procurarTodos('encarregado', f)]);
+      const encIds = new Set(ests.filter(e => (e['Estado'] || 'activo') === 'activo').map(e => e['Encarregado']).filter(Boolean));
+      const nums = [...new Set(encs.filter(e => encIds.has(e._id) && e['Activo'] !== false && e['Recebe SMS'] !== false).map(e => tel9(e['Telefone'])).filter(t => t.length === 9))];
+      const curto = texto.length > 120 ? texto.slice(0, 117).replace(/\s+\S*$/, '') + '...' : texto;
+      const msg = (esc['Nome'] || 'Escola') + ': ' + titulo + '. ' + curto + (texto.length > 120 ? ' Veja tudo em ' + linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '') : '');
+      for (let i = 0; i < nums.length; i += 50) { const r = await enviarSMS(nums.slice(i, i + 50), msg); if (r.ok) sms += r.numeros.length; }
+      if (sms) await mudar('comunicado', id, { 'SMS Enviados': sms }).catch(() => {});
+      else if (!nums.length) aviso = 'O comunicado foi publicado. Não há encarregados com telemóvel para receber o SMS.';
+      else aviso = 'O comunicado foi publicado, mas o SMS falhou. Tente mais tarde.';
+    }
+  }
+  res.json({ ok: true, id, sms, aviso });
+}));
+app.post('/comunicado-apagar', exigeDireccao, rota(async (req, res) => {
+  const c = await daMinhaEscola('comunicado', String((req.body || {}).id || ''), req.escola);
+  await apagar('comunicado', c._id);
+  res.json({ ok: true });
+}));
+async function comunicadosPara(escola, turmaIds, cache) {
+  const cs = cache.cs || (cache.cs = await procurarTodos('comunicado', daEscola(escola), 500));
+  return cs.filter(c => !c['Turma'] || turmaIds.includes(c['Turma'])).map(c => comOut(c)).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))).slice(0, 30);
+}
 
 // ============================================================
 //  WEBHOOK DA MOZPAYMENT
