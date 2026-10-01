@@ -18,6 +18,8 @@
 //    Portal das famílias (v4.3): /acesso-codigo /acesso-entrar (entrada por código SMS, sem palavra-passe)
 //                                /p/inicio /p/pagar /p/pagamento-estado  ·  /familias-link /familias-convite (Direcção)
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
+//    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
+//                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //
 //  Variáveis de ambiente:
 //    BUBBLE_BASE     https://<app>.bubbleapps.io/version-test/api/1.1/obj   (sem / no fim)
@@ -31,7 +33,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 4.4.0';
+const VERSAO = 'gescolar-proxy 4.5.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -918,20 +920,20 @@ async function educandosDe(s) {
   return l.filter(e => (e['Estado'] || 'activo') === 'activo').map(e => e._id);
 }
 async function abrirSessaoPortal(s) {
-  const tipo = s.p === 'Estudante' ? 'estudante' : 'encarregado';
+  const tipo = s.p === 'Estudante' ? 'estudante' : s.p === 'Professor' ? 'professor' : 'encarregado';
   const eu = await obter(tipo, s.u).catch(() => null);
   if (!eu || eu['Escola'] !== s.e) { const e = new Error('Conta não encontrada. Entre outra vez.'); e.publico = 401; throw e; }
-  if (tipo === 'encarregado' && eu['Activo'] === false) { const e = new Error('Este acesso foi desactivado. Fale com a escola.'); e.publico = 403; throw e; }
+  if ((tipo === 'encarregado' || tipo === 'professor') && eu['Activo'] === false) { const e = new Error('Este acesso foi desactivado. Fale com a escola.'); e.publico = 403; throw e; }
   if (tipo === 'estudante' && (eu['Estado'] || 'activo') !== 'activo') { const e = new Error('Este estudante já não está activo na escola.'); e.publico = 403; throw e; }
   const escola = await resumoEscola(s.e);
   if (escola && escola.estado === 'suspensa') { const e = new Error('O acesso desta escola está suspenso. Fale com a escola.'); e.publico = 402; throw e; }
   const token = assinar({ u: s.u, e: s.e, p: s.p, t: 'portal' }, PORTAL_DIAS);
-  return { ok: true, token, nome: eu['Nome'] || '', papel: s.p, pagina: 'portal', escola, expira_dias: PORTAL_DIAS };
+  return { ok: true, token, nome: eu['Nome'] || '', papel: s.p, pagina: tipo === 'professor' ? 'professor' : 'portal', escola, expira_dias: PORTAL_DIAS };
 }
 async function exigePortal(req, res, next) {
   const s = sessaoDo(req);
   if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
-  if (s.t !== 'portal' || !s.e) return erro(res, 403, 'Esta página é para encarregados e estudantes.');
+  if (s.t !== 'portal' || !s.e || (s.p !== 'Estudante' && s.p !== 'Encarregado')) return erro(res, 403, 'Esta página é para encarregados e estudantes.');
   try { req.sessao = s; req.escola = s.e; req.educandos = await educandosDe(s); next(); }
   catch (e) { console.error('[portal]', e.message); erro(res, 500, 'Não foi possível concluir. Tente de novo.'); }
 }
@@ -945,13 +947,20 @@ function exigeQualquer(req, res, next) {
 app.post('/acesso-codigo', rota(async (req, res) => {
   if (!SESSION_SECRET) return erro(res, 500, 'O servidor ainda não está configurado (SESSION_SECRET).');
   const b = req.body || {};
-  const tipo = b.tipo === 'estudante' ? 'estudante' : 'encarregado';
+  const tipo = b.tipo === 'estudante' ? 'estudante' : b.tipo === 'professor' ? 'professor' : 'encarregado';
   if (travao('acesso-ip|' + req.ip, 12, 15)) return erro(res, 429, 'Muitos pedidos seguidos. Espere 15 minutos.');
   const esc = await escolaPorCodigo(b.escola);
   if (!esc) return erro(res, 404, 'Não encontrámos essa escola. Confirme o código da escola com a secretaria.');
   if (esc['Estado'] === 'suspensa') return erro(res, 402, 'O acesso desta escola está suspenso. Fale com a escola.');
   let alvo = null, destino = '';
-  if (tipo === 'encarregado') {
+  if (tipo === 'professor') {
+    const tel = tel9(b.telefone);
+    if (tel.length !== 9) return erro(res, 400, 'Escreva o seu número de telemóvel com 9 dígitos.');
+    const profs = await procurarTodos('professor', daEscola(esc._id));
+    alvo = profs.find(x => tel9(x['Telefone']) === tel && x['Activo'] !== false);
+    if (!alvo) return erro(res, 404, 'Este número não está registado como professor nesta escola. Peça à Direcção para confirmar o seu número.');
+    destino = tel;
+  } else if (tipo === 'encarregado') {
     const tel = tel9(b.telefone);
     if (tel.length !== 9) return erro(res, 400, 'Escreva o seu número de telemóvel com 9 dígitos.');
     const encs = await procurarTodos('encarregado', daEscola(esc._id));
@@ -987,7 +996,7 @@ app.post('/acesso-entrar', rota(async (req, res) => {
   const a = Buffer.from(hashCodigo(chave + cod)), c = Buffer.from(pd.hash);
   if (cod.length !== 6 || a.length !== c.length || !crypto.timingSafeEqual(a, c)) return erro(res, 401, 'Código errado. Confirme o SMS e tente de novo (' + (5 - pd.tent) + ' tentativas restantes).');
   pedidosAcesso.delete(chave);
-  res.json(await abrirSessaoPortal({ u: pd.id, e: pd.escola, p: pd.tipo === 'estudante' ? 'Estudante' : 'Encarregado' }));
+  res.json(await abrirSessaoPortal({ u: pd.id, e: pd.escola, p: pd.tipo === 'estudante' ? 'Estudante' : pd.tipo === 'professor' ? 'Professor' : 'Encarregado' }));
 }));
 
 // tudo o que o portal mostra, num só pedido
@@ -1008,6 +1017,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
     return {
       id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '', turma: t ? (t['Nome'] || '') : '',
       horario: await horarioDaTurma(req.escola, e['Turma'], cache).catch(err => { console.error('[portal] horário', err.message); return null; }),
+      notas: await notasDoEstudante(req.escola, e, cache).catch(err => { console.error('[portal] notas', err.message); return []; }),
       comunicados: await comunicadosPara(req.escola, [e['Turma']].filter(Boolean), cache).catch(err => { console.error('[portal] comunicados', err.message); return []; }),
       propinas: ps,
       divida: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
@@ -1020,7 +1030,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
   if (telefone.length !== 9 && s.p === 'Estudante' && eu && eu['Encarregado']) { const en = await obter('encarregado', eu['Encarregado']).catch(() => null); telefone = en ? tel9(en['Telefone']) : ''; }
   res.json({ ok: true,
     eu: { nome: (eu && eu['Nome']) || '', papel: s.p, telefone: telefone.length === 9 ? telefone : '' },
-    escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', telefone: escRaw['Telefone'] || '', email: escRaw['Email'] || '', ano: escRaw['Ano Lectivo'] || '', regras },
+    escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', telefone: escRaw['Telefone'] || '', email: escRaw['Email'] || '', ano: escRaw['Ano Lectivo'] || '', regras: Object.assign({}, regras, { aprovacao: Number(regras.aprovacao || 10), dispensa: Number(regras.dispensa || 14) }) },
     educandos: educandos.sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
 }));
 app.post('/p/pagar', exigePortal, rota(cobrarOnline));
@@ -1186,6 +1196,212 @@ app.post('/comunicado-apagar', exigeDireccao, rota(async (req, res) => {
 async function comunicadosPara(escola, turmaIds, cache) {
   const cs = cache.cs || (cache.cs = await procurarTodos('comunicado', daEscola(escola), 500));
   return cs.filter(c => !c['Turma'] || turmaIds.includes(c['Turma'])).map(c => comOut(c)).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))).slice(0, 30);
+}
+
+// ============================================================
+//  PROFESSORES E NOTAS (v4.5)
+//  Bubble, data type novo Pauta: Escola (Escola) · Turma (text) · Disciplina (text) · Trimestre (number)
+//                                · Grelha (text) · Publicado (yes/no) · Actualizado Por (text)
+//  Uma pauta por turma × disciplina × trimestre. Grelha JSON:
+//   { colunas:[{id:"acs1",tipo:"ACS",nome:"ACS 1"}, …, {id:"acp",tipo:"ACP",nome:"ACP"}], notas:{ <estudante>:{ acs1:14, acp:12.5 } } }
+//  Média do trimestre (ensino geral em Moçambique): MT = (2 × MACS + ACP) / 3 ; sem ACP, MT = MACS
+// ============================================================
+function exigeProfessor(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
+  if (s.t !== 'portal' || s.p !== 'Professor' || !s.e) return erro(res, 403, 'Esta página é para professores.');
+  req.sessao = s; req.escola = s.e; next();
+}
+const r1 = n => Math.round(n * 10) / 10;
+function mediasPauta(g, estId) {
+  const n = ((g && g.notas) || {})[estId] || {};
+  const acs = (g.colunas || []).filter(c => c.tipo === 'ACS').map(c => n[c.id]).filter(v => typeof v === 'number');
+  const acpCol = (g.colunas || []).find(c => c.tipo === 'ACP');
+  const acp = acpCol && typeof n[acpCol.id] === 'number' ? n[acpCol.id] : null;
+  const macs = acs.length ? r1(acs.reduce((a, b) => a + b, 0) / acs.length) : null;
+  let mt = null;
+  if (macs !== null && acp !== null) mt = r1((2 * macs + acp) / 3);
+  else if (macs !== null) mt = macs;
+  else if (acp !== null) mt = acp;
+  return { macs, acp, mt, completa: macs !== null && acp !== null };
+}
+function validarPauta(g, estIds) {
+  if (!g || typeof g !== 'object') return 'Pauta inválida.';
+  const cols = Array.isArray(g.colunas) ? g.colunas : [];
+  const vistos = new Set(), colunas = [];
+  for (const c of cols) {
+    const id = String((c && c.id) || '').toLowerCase();
+    if (!/^[a-z0-9]{1,10}$/.test(id) || vistos.has(id)) continue;
+    const tipo = c.tipo === 'ACP' ? 'ACP' : 'ACS';
+    if (tipo === 'ACP' && colunas.some(x => x.tipo === 'ACP')) continue;
+    vistos.add(id); colunas.push({ id, tipo, nome: txt(c.nome, 16) || (tipo === 'ACP' ? 'ACP' : 'ACS') });
+  }
+  if (!colunas.length) return 'A pauta precisa de pelo menos uma coluna de avaliação.';
+  if (colunas.length > 10) return 'No máximo 10 colunas por trimestre.';
+  const notas = {}, ids = new Set(colunas.map(c => c.id));
+  for (const [est, linha] of Object.entries(g.notas || {})) {
+    if (!estIds.has(est) || !linha || typeof linha !== 'object') continue;
+    const l = {};
+    for (const [cid, v] of Object.entries(linha)) {
+      if (!ids.has(cid) || v === null || v === '' || v === undefined) continue;
+      const n = Number(String(v).replace(',', '.'));
+      if (!isFinite(n) || n < 0 || n > 20) return 'As notas vão de 0 a 20. Verifique a nota ' + v + '.';
+      l[cid] = r1(n);
+    }
+    if (Object.keys(l).length) notas[est] = l;
+  }
+  return { colunas, notas };
+}
+const PAUTA_NOVA = () => ({ colunas: [{ id: 'acs1', tipo: 'ACS', nome: 'ACS 1' }, { id: 'acs2', tipo: 'ACS', nome: 'ACS 2' }, { id: 'acs3', tipo: 'ACS', nome: 'ACS 3' }, { id: 'acp', tipo: 'ACP', nome: 'ACP' }], notas: {} });
+const trimestreOk = t => [1, 2, 3].includes(Number(t));
+async function pautaDe(escola, turma, disciplina, trimestre) {
+  const l = await procurar('pauta', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turma },
+    { key: 'Disciplina', constraint_type: 'equals', value: disciplina }, { key: 'Trimestre', constraint_type: 'equals', value: Number(trimestre) }], 1);
+  return l[0] || null;
+}
+// quem dá cada disciplina em cada turma: pelo horário; se a disciplina não tem professor no horário, pelas disciplinas do professor
+async function atribuicoes(escola) {
+  const f = daEscola(escola);
+  const [turmas, profs, hs] = await Promise.all([procurarTodos('turma', f), procurarTodos('professor', f), procurarTodos('horario', f)]);
+  const pares = [];  // {turma, disciplina, professores:Set}
+  for (const t of turmas.filter(x => x['Activa'] !== false)) {
+    const g = lerGrelha((hs.find(h => h['Turma'] === t._id) || {})['Grelha']);
+    const doHorario = {};
+    if (g) for (const a of Object.values(g.aulas || {})) { if (!a.d) continue; (doHorario[a.d] = doHorario[a.d] || new Set()); if (a.p) doHorario[a.d].add(a.p); }
+    const discs = new Set([...(t['Disciplinas'] || []), ...Object.keys(doHorario)]);
+    for (const d of discs) {
+      let ps = doHorario[d] && doHorario[d].size ? doHorario[d] : new Set(profs.filter(p => p['Activo'] !== false && (p['Disciplinas'] || []).includes(d)).map(p => p._id));
+      pares.push({ turma: t._id, disciplina: d, professores: ps });
+    }
+  }
+  return { turmas, profs, hs, pares };
+}
+async function dadosPauta(escola, turmaId, discId, tri) {
+  const [turma, disc, regrasEsc] = await Promise.all([daMinhaEscola('turma', turmaId, escola), daMinhaEscola('disciplina', discId, escola), resumoEscola(escola)]);
+  const ests = (await procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }]))
+    .filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt'));
+  const reg = await pautaDe(escola, turmaId, discId, tri);
+  const grelha = (reg && lerGrelha(reg['Grelha'])) || PAUTA_NOVA();
+  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC' }, trimestre: Number(tri),
+    estudantes: ests.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })), grelha, publicado: !!(reg && reg['Publicado']),
+    actualizado: reg ? (reg['Modified Date'] || null) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '',
+    regras: { aprovacao: Number((regrasEsc && regrasEsc.regras.aprovacao) || 10), dispensa: Number((regrasEsc && regrasEsc.regras.dispensa) || 14) } };
+}
+async function guardarPauta(req, res, quem) {
+  const b = req.body || {};
+  if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
+  const d = await dadosPauta(req.escola, String(b.turma || ''), String(b.disciplina || ''), b.trimestre);
+  const g = validarPauta(b.grelha, new Set(d.estudantes.map(e => e.id)));
+  if (typeof g === 'string') return erro(res, 400, g);
+  const campos = { 'Escola': req.escola, 'Turma': d.turma.id, 'Disciplina': d.disciplina.id, 'Trimestre': d.trimestre, 'Grelha': JSON.stringify(g), 'Publicado': !!b.publicado, 'Actualizado Por': quem };
+  const reg = await pautaDe(req.escola, d.turma.id, d.disciplina.id, d.trimestre);
+  if (reg) await mudar('pauta', reg._id, campos); else await criar('pauta', campos);
+  const lancadas = Object.keys(g.notas).length;
+  res.json({ ok: true, grelha: g, publicado: !!b.publicado, lancadas, total: d.estudantes.length });
+}
+
+// ---------- professor ----------
+async function podeLancar(req, turma, disc) {
+  const a = await atribuicoes(req.escola);
+  const par = a.pares.find(p => p.turma === turma && p.disciplina === disc);
+  return !!(par && par.professores.has(req.sessao.u));
+}
+app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
+  const eu = await obter('professor', req.sessao.u);
+  const [a, discs, escRaw, cs] = await Promise.all([atribuicoes(req.escola), procurarTodos('disciplina', daEscola(req.escola)), obter('escola', req.escola), procurarTodos('comunicado', daEscola(req.escola), 200)]);
+  const DM = Object.fromEntries(discs.map(d => [d._id, d])), TM = Object.fromEntries(a.turmas.map(t => [t._id, t]));
+  const meus = a.pares.filter(p => p.professores.has(req.sessao.u) && DM[p.disciplina] && TM[p.turma]);
+  const ests = await procurarTodos('estudante', daEscola(req.escola));
+  const aulas = [];
+  for (const h of a.hs) {
+    const g = lerGrelha(h['Grelha']); if (!g || !TM[h['Turma']]) continue;
+    for (const [k, x] of Object.entries(g.aulas || {})) {
+      if (x.p !== req.sessao.u) continue;
+      const [dia, ti] = k.split('-').map(Number), t = g.tempos[ti]; if (!t) continue;
+      aulas.push({ dia, i: t.i, f: t.f, turma: TM[h['Turma']]['Nome'] || '', turma_id: h['Turma'], disciplina: (DM[x.d] || {})['Nome'] || '', cor: (DM[x.d] || {})['Cor'] || '#0A64DC', sala: x.s || '' });
+    }
+  }
+  aulas.sort((x, y) => x.dia - y.dia || x.i.localeCompare(y.i));
+  res.json({ ok: true,
+    eu: { nome: eu['Nome'] || '', telefone: eu['Telefone'] || '' },
+    escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', ano: escRaw['Ano Lectivo'] || '' },
+    turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
+      estudantes: ests.filter(e => e['Turma'] === p.turma && (e['Estado'] || 'activo') === 'activo').length }))
+      .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt')),
+    aulas,
+    comunicados: cs.filter(c => !c['Turma']).map(c => comOut(c)).sort((x, y) => String(y.data || '').localeCompare(String(x.data || ''))).slice(0, 10) });
+}));
+app.post('/prof/pauta', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
+  if (!await podeLancar(req, String(b.turma || ''), String(b.disciplina || ''))) return erro(res, 403, 'Não dá esta disciplina nesta turma. Fale com a Direcção.');
+  res.json({ ok: true, pauta: await dadosPauta(req.escola, String(b.turma), String(b.disciplina), b.trimestre) });
+}));
+app.post('/prof/pauta-guardar', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!await podeLancar(req, String(b.turma || ''), String(b.disciplina || ''))) return erro(res, 403, 'Não dá esta disciplina nesta turma. Fale com a Direcção.');
+  const eu = await obter('professor', req.sessao.u).catch(() => null);
+  await guardarPauta(req, res, 'Prof. ' + ((eu && eu['Nome']) || ''));
+}));
+
+// ---------- Direcção ----------
+app.post('/pauta', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
+  res.json({ ok: true, pauta: await dadosPauta(req.escola, String(b.turma || ''), String(b.disciplina || ''), b.trimestre) });
+}));
+app.post('/pauta-guardar', exigeDireccao, rota(async (req, res) => {
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  await guardarPauta(req, res, (eu && eu['Nome Completo']) || 'Direcção');
+}));
+// resumo da turma no trimestre: estudantes × disciplinas com a média
+app.post('/pautas-turma', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, tri = Number(b.trimestre);
+  if (!trimestreOk(tri)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
+  const turma = await daMinhaEscola('turma', String(b.turma || ''), req.escola);
+  const f = daEscola(req.escola);
+  const [a, discs, ests, pautas, esc] = await Promise.all([atribuicoes(req.escola), procurarTodos('disciplina', f),
+    procurarTodos('estudante', f.concat([{ key: 'Turma', constraint_type: 'equals', value: turma._id }])),
+    procurarTodos('pauta', f.concat([{ key: 'Turma', constraint_type: 'equals', value: turma._id }])), resumoEscola(req.escola)]);
+  const DM = Object.fromEntries(discs.map(d => [d._id, d])), PM = Object.fromEntries(a.profs.map(p => [p._id, p['Nome']]));
+  const lista = a.pares.filter(p => p.turma === turma._id && DM[p.disciplina]).map(p => {
+    const reg = pautas.find(x => x['Disciplina'] === p.disciplina && Number(x['Trimestre']) === tri);
+    return { id: p.disciplina, nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC', professores: [...p.professores].map(id => PM[id]).filter(Boolean),
+      existe: !!reg, publicado: !!(reg && reg['Publicado']), grelha: reg ? lerGrelha(reg['Grelha']) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '' };
+  }).sort((x, y) => x.nome.localeCompare(y.nome, 'pt'));
+  const activos = ests.filter(e => (e['Estado'] || 'activo') === 'activo').sort((x, y) => String(x['Nome'] || '').localeCompare(String(y['Nome'] || ''), 'pt'));
+  res.json({ ok: true, turma: { id: turma._id, nome: turma['Nome'] || '' }, trimestre: tri,
+    regras: { aprovacao: Number((esc && esc.regras.aprovacao) || 10), dispensa: Number((esc && esc.regras.dispensa) || 14) },
+    disciplinas: lista.map(d => ({ id: d.id, nome: d.nome, cor: d.cor, professores: d.professores, existe: d.existe, publicado: d.publicado, actualizado_por: d.actualizado_por,
+      lancadas: d.grelha ? Object.keys(d.grelha.notas || {}).length : 0 })),
+    estudantes: activos.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '',
+      medias: Object.fromEntries(lista.map(d => [d.id, d.grelha ? mediasPauta(d.grelha, e._id).mt : null])) })) });
+}));
+app.post('/pautas-publicar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, tri = Number(b.trimestre);
+  if (!trimestreOk(tri)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
+  const turma = await daMinhaEscola('turma', String(b.turma || ''), req.escola);
+  const pautas = await procurarTodos('pauta', daEscola(req.escola).concat([{ key: 'Turma', constraint_type: 'equals', value: turma._id }]));
+  let n = 0;
+  for (const p of pautas.filter(x => Number(x['Trimestre']) === tri && !!x['Publicado'] !== !!b.publicado)) { await mudar('pauta', p._id, { 'Publicado': !!b.publicado }); n++; }
+  res.json({ ok: true, alteradas: n });
+}));
+
+// ---------- portal: notas publicadas da turma do educando ----------
+async function notasDoEstudante(escola, est, cache) {
+  if (!est['Turma']) return [];
+  const chave = 'p' + est['Turma'];
+  const pautas = cache[chave] || (cache[chave] = await procurarTodos('pauta', daEscola(escola).concat([{ key: 'Turma', constraint_type: 'equals', value: est['Turma'] }])));
+  if (!cache.discAll) cache.discAll = Object.fromEntries((await procurarTodos('disciplina', daEscola(escola))).map(d => [d._id, d]));
+  const out = {};
+  for (const p of pautas.filter(x => x['Publicado'])) {
+    const g = lerGrelha(p['Grelha']), d = cache.discAll[p['Disciplina']]; if (!g || !d) continue;
+    const linha = (g.notas || {})[est._id] || {};
+    const m = mediasPauta(g, est._id);
+    const o = out[d._id] = out[d._id] || { disciplina: d['Nome'] || '', cor: d['Cor'] || '#0A64DC', trimestres: {} };
+    o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa };
+  }
+  return Object.values(out).sort((a, b) => a.disciplina.localeCompare(b.disciplina, 'pt'));
 }
 
 // ============================================================
