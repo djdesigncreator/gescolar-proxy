@@ -20,6 +20,8 @@
 //    Horários e comunicados (v4.4): /horarios /horario-guardar · /comunicados /comunicado-guardar /comunicado-apagar
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
+//    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//                      (/autorizados /autorizado-guardar /autorizado-apagar · /p/autorizado-guardar /p/autorizado-apagar)
 //    Escola de condução 3 (v5.2): /exames /exame-marcar /exame-resultado · /prof/aula-estado · portal com aulas e exames
 //    Escola de condução 2 (v5.1): /viaturas /viatura-guardar /viatura-apagar /aulas-praticas /aula-marcar /aula-estado
 //    Escola de condução 1 (v5.0): /cursos /curso-guardar /curso-apagar /instruendos /inscrever /inscricao-estado
@@ -42,7 +44,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.2.0';
+const VERSAO = 'gescolar-proxy 5.3.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1039,6 +1041,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
       horario: await horarioDaTurma(req.escola, e['Turma'], cache).catch(err => { console.error('[portal] horário', err.message); return null; }),
       faltas: await faltasDoEstudante(req.escola, e._id, cache).catch(err => { console.error('[portal] faltas', err.message); return []; }),
       notas: await notasDoEstudante(req.escola, e, cache).catch(err => { console.error('[portal] notas', err.message); return []; }),
+      escolinha: ehESC(t) ? { diario: await diarioDoEstudante(req.escola, e._id).catch(() => []), autorizados: await autorizadosDe(req.escola, [e._id]).catch(() => []) } : null,
       conducao: await conducaoDoEstudante(req.escola, e._id, cache).catch(err => { console.error('[portal] condução', err.message); return null; }),
       comunicados: await comunicadosPara(req.escola, [e['Turma']].filter(Boolean), cache).catch(err => { console.error('[portal] comunicados', err.message); return []; }),
       propinas: ps,
@@ -1053,6 +1056,7 @@ app.post('/p/inicio', exigePortal, rota(async (req, res) => {
   res.json({ ok: true,
     eu: { nome: (eu && eu['Nome']) || '', papel: s.p, telefone: telefone.length === 9 ? telefone : '' },
     escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', telefone: escRaw['Telefone'] || '', email: escRaw['Email'] || '', ano: escRaw['Ano Lectivo'] || '', regras: Object.assign({}, regras, { aprovacao: Number(regras.aprovacao || 10), dispensa: Number(regras.dispensa || 14) }) },
+    hoje: hojeMZ().data,
     educandos: educandos.sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
 }));
 app.post('/p/pagar', exigePortal, rota(cobrarOnline));
@@ -1235,7 +1239,20 @@ function exigeProfessor(req, res, next) {
   req.sessao = s; req.escola = s.e; next();
 }
 const r1 = n => Math.round(n * 10) / 10;
+const NIVEIS_DESC = { A: 'Adquirido', E: 'Em aquisição', N: 'Não adquirido' };
+const ehESC = t => !!t && (t['Nivel'] === NIVEIS.ESC || t['Nivel'] === 'ESC');
+function validarDescritiva(g, estIds) {
+  const notas = {};
+  for (const [est, l] of Object.entries((g && g.notas) || {})) {
+    if (!estIds.has(est) || !l || typeof l !== 'object') continue;
+    const n = String(l.n || '').toUpperCase(), o = txt(l.o, 400);
+    if (n && !NIVEIS_DESC[n]) return 'Use A (adquirido), E (em aquisição) ou N (não adquirido).';
+    if (n || o) notas[est] = Object.assign(n ? { n } : {}, o ? { o } : {});
+  }
+  return { modo: 'descritiva', notas };
+}
 function mediasPauta(g, estId) {
+  if (g && g.modo === 'descritiva') { const l = (g.notas || {})[estId] || {}; return { macs: null, acp: null, mt: null, completa: !!l.n, nivel: l.n || null }; }
   const n = ((g && g.notas) || {})[estId] || {};
   const acs = (g.colunas || []).filter(c => c.tipo === 'ACS').map(c => n[c.id]).filter(v => typeof v === 'number');
   const acpCol = (g.colunas || []).find(c => c.tipo === 'ACP');
@@ -1303,8 +1320,10 @@ async function dadosPauta(escola, turmaId, discId, tri) {
   const ests = (await procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }]))
     .filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt'));
   const reg = await pautaDe(escola, turmaId, discId, tri);
-  const grelha = (reg && lerGrelha(reg['Grelha'])) || PAUTA_NOVA();
-  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC' }, trimestre: Number(tri),
+  const desc = ehESC(turma);
+  let grelha = (reg && lerGrelha(reg['Grelha'])) || (desc ? { modo: 'descritiva', notas: {} } : PAUTA_NOVA());
+  if (desc && grelha.modo !== 'descritiva') grelha = { modo: 'descritiva', notas: {} };
+  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC' }, trimestre: Number(tri), modo: desc ? 'descritiva' : 'numerica',
     estudantes: ests.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })), grelha, publicado: !!(reg && reg['Publicado']),
     actualizado: reg ? (reg['Modified Date'] || null) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '',
     regras: { aprovacao: Number((regrasEsc && regrasEsc.regras.aprovacao) || 10), dispensa: Number((regrasEsc && regrasEsc.regras.dispensa) || 14) } };
@@ -1313,7 +1332,7 @@ async function guardarPauta(req, res, quem) {
   const b = req.body || {};
   if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
   const d = await dadosPauta(req.escola, String(b.turma || ''), String(b.disciplina || ''), b.trimestre);
-  const g = validarPauta(b.grelha, new Set(d.estudantes.map(e => e.id)));
+  const g = d.modo === 'descritiva' ? validarDescritiva(b.grelha, new Set(d.estudantes.map(e => e.id))) : validarPauta(b.grelha, new Set(d.estudantes.map(e => e.id)));
   if (typeof g === 'string') return erro(res, 400, g);
   const campos = { 'Escola': req.escola, 'Turma': d.turma.id, 'Disciplina': d.disciplina.id, 'Trimestre': d.trimestre, 'Grelha': JSON.stringify(g), 'Publicado': !!b.publicado, 'Actualizado Por': quem };
   const reg = await pautaDe(req.escola, d.turma.id, d.disciplina.id, d.trimestre);
@@ -1350,7 +1369,7 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
   res.json({ ok: true, hoje,
     eu: { nome: eu['Nome'] || '', telefone: eu['Telefone'] || '' },
     escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', ano: escRaw['Ano Lectivo'] || '' },
-    turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
+    turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', esc: ehESC(TM[p.turma]), disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
       estudantes: ests.filter(e => e['Turma'] === p.turma && (e['Estado'] || 'activo') === 'activo').length }))
       .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt')),
     aulas,
@@ -1401,7 +1420,8 @@ app.post('/pautas-turma', exigeDireccao, rota(async (req, res) => {
     disciplinas: lista.map(d => ({ id: d.id, nome: d.nome, cor: d.cor, professores: d.professores, existe: d.existe, publicado: d.publicado, actualizado_por: d.actualizado_por,
       lancadas: d.grelha ? Object.keys(d.grelha.notas || {}).length : 0 })),
     estudantes: activos.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '',
-      medias: Object.fromEntries(lista.map(d => [d.id, d.grelha ? mediasPauta(d.grelha, e._id).mt : null])) })) });
+      medias: Object.fromEntries(lista.map(d => [d.id, d.grelha ? (d.grelha.modo === 'descritiva' ? (mediasPauta(d.grelha, e._id).nivel) : mediasPauta(d.grelha, e._id).mt) : null])) })),
+    modo: ehESC(turma) ? 'descritiva' : 'numerica' });
 }));
 app.post('/pautas-publicar', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {}, tri = Number(b.trimestre);
@@ -1425,6 +1445,7 @@ async function notasDoEstudante(escola, est, cache) {
     const linha = (g.notas || {})[est._id] || {};
     const m = mediasPauta(g, est._id);
     const o = out[d._id] = out[d._id] || { disciplina: d['Nome'] || '', cor: d['Cor'] || '#0A64DC', trimestres: {} };
+    if (g.modo === 'descritiva') { o.descritiva = true; o.trimestres[Number(p['Trimestre'])] = { descritiva: true, nivel: linha.n || null, nivel_nome: NIVEIS_DESC[linha.n] || '', obs: linha.o || '' }; continue; }
     o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa };
   }
   return Object.values(out).sort((a, b) => a.disciplina.localeCompare(b.disciplina, 'pt'));
@@ -2324,6 +2345,109 @@ async function conducaoDoEstudante(escola, estId, cache) {
     historico: minhas.filter(a => ['feita', 'faltou'].includes(a['Estado'])).sort((a, b) => (b['Data'] + b['Inicio']).localeCompare(a['Data'] + a['Inicio'])).slice(0, 20)
       .map(a => ({ data: a['Data'], inicio: a['Inicio'], estado: a['Estado'], instrutor: cache.profs[a['Instrutor']] || '', notas: a['Notas'] || '' })),
     exames: xs.filter(x => x['Inscricao'] === i._id).map(x => exameOut(x)).sort((a, b) => (b.data.localeCompare(a.data)) || (b.tentativa - a.tentativa) || b.hora.localeCompare(a.hora)) };
+}
+
+// ============================================================
+//  ESCOLINHA (v5.3): DIÁRIO DA CRIANÇA E AUTORIZADOS A RECOLHER
+//  Bubble:
+//   Diario Entrada:     Escola (Escola) · Estudante (text) · Turma (text) · Data (text AAAA-MM-DD) · Refeicao (text) · Sesta (text)
+//                       · Humor (text) · Actividades (text) · Recado (text) · Feito Por (text)
+//   Autorizado Recolha: Escola (Escola) · Estudante (text) · Nome (text) · Parentesco (text) · Telefone (text) · Activo (yes/no) · Criado Por (text)
+// ============================================================
+const OPC_DIARIO = { refeicao: ['Comeu tudo', 'Comeu metade', 'Comeu pouco', 'Não comeu'], sesta: ['Dormiu bem', 'Dormiu pouco', 'Não dormiu'], humor: ['Bem-disposto', 'Calmo', 'Agitado', 'Choroso', 'Doente'] };
+const autOut = a => ({ id: a._id, estudante: a['Estudante'], nome: a['Nome'] || '', parentesco: a['Parentesco'] || '', telefone: a['Telefone'] || '', criado_por: a['Criado Por'] || '' });
+async function autorizadosDe(escola, estIds) {
+  const l = await procurarTodos('autorizadorecolha', daEscola(escola), 5000);
+  return l.filter(a => a['Activo'] !== false && estIds.includes(a['Estudante'])).map(autOut);
+}
+async function guardarAutorizado(escola, estId, b, quem) {
+  const nome = txt(b.nome, 100), tel = tel9(b.telefone);
+  if (nome.split(/\s+/).length < 2) { const e = new Error('Escreva o nome completo de quem vai recolher.'); e.publico = 400; throw e; }
+  if (tel.length !== 9) { const e = new Error('O telemóvel tem 9 dígitos.'); e.publico = 400; throw e; }
+  const actuais = await autorizadosDe(escola, [estId]);
+  if (actuais.length >= 8) { const e = new Error('No máximo 8 pessoas autorizadas por criança.'); e.publico = 400; throw e; }
+  return criar('autorizadorecolha', { 'Escola': escola, 'Estudante': estId, 'Nome': nome, 'Parentesco': txt(b.parentesco, 30), 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Activo': true, 'Criado Por': quem });
+}
+// Direcção
+app.post('/autorizados', exigeDireccao, rota(async (req, res) => {
+  const e = await daMinhaEscola('estudante', String((req.body || {}).estudante || ''), req.escola);
+  const enc = e['Encarregado'] ? await obter('encarregado', e['Encarregado']).catch(() => null) : null;
+  res.json({ ok: true, estudante: { id: e._id, nome: e['Nome'] || '' }, encarregado: enc ? { nome: enc['Nome'] || '', telefone: enc['Telefone'] || '', parentesco: enc['Parentesco'] || '' } : null, autorizados: await autorizadosDe(req.escola, [e._id]) });
+}));
+app.post('/autorizado-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const e = await daMinhaEscola('estudante', String(b.estudante || ''), req.escola);
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  res.json({ ok: true, id: await guardarAutorizado(req.escola, e._id, b, (eu && eu['Nome Completo']) || 'Direcção') });
+}));
+app.post('/autorizado-apagar', exigeDireccao, rota(async (req, res) => {
+  const a = await daMinhaEscola('autorizadorecolha', String((req.body || {}).id || ''), req.escola);
+  await mudar('autorizadorecolha', a._id, { 'Activo': false });
+  res.json({ ok: true });
+}));
+// Encarregado (portal)
+function exigeEncarregado(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s || s.t !== 'portal' || s.p !== 'Encarregado') return erro(res, 403, 'Só o encarregado pode mudar quem recolhe a criança.');
+  exigePortal(req, res, next);
+}
+app.post('/p/autorizado-guardar', exigeEncarregado, rota(async (req, res) => {
+  const b = req.body || {}, est = String(b.estudante || '');
+  if (!req.educandos.includes(est)) return erro(res, 404, 'Registo não encontrado.');
+  const enc = await obter('encarregado', req.sessao.u).catch(() => null);
+  res.json({ ok: true, id: await guardarAutorizado(req.escola, est, b, 'Encarregado · ' + ((enc && enc['Nome']) || '')) });
+}));
+app.post('/p/autorizado-apagar', exigeEncarregado, rota(async (req, res) => {
+  const a = await daMinhaEscola('autorizadorecolha', String((req.body || {}).id || ''), req.escola);
+  if (!req.educandos.includes(a['Estudante'])) return erro(res, 404, 'Registo não encontrado.');
+  await mudar('autorizadorecolha', a._id, { 'Activo': false });
+  res.json({ ok: true });
+}));
+// Educadora (professor.html)
+async function turmaDoProfessor(req, turmaId) {
+  const a = await atribuicoes(req.escola);
+  if (!a.pares.some(p => p.turma === turmaId && p.professores.has(req.sessao.u))) { const e = new Error('Não é educador(a) desta turma.'); e.publico = 403; throw e; }
+  return a.turmas.find(t => t._id === turmaId);
+}
+app.post('/prof/diario', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {}, data = dataOk(b.data) ? b.data : hojeMZ().data;
+  const t = await turmaDoProfessor(req, String(b.turma || ''));
+  const f = daEscola(req.escola);
+  const ests = (await procurarTodos('estudante', f.concat([{ key: 'Turma', constraint_type: 'equals', value: t._id }]))).filter(e => (e['Estado'] || 'activo') === 'activo')
+    .sort((x, y) => String(x['Nome'] || '').localeCompare(String(y['Nome'] || ''), 'pt'));
+  const [ds, auts, encs] = await Promise.all([procurarTodos('diarioentrada', f.concat([{ key: 'Turma', constraint_type: 'equals', value: t._id }, { key: 'Data', constraint_type: 'equals', value: data }])),
+    autorizadosDe(req.escola, ests.map(e => e._id)), procurarTodos('encarregado', f)]);
+  const EN = Object.fromEntries(encs.map(x => [x._id, x]));
+  res.json({ ok: true, turma: { id: t._id, nome: t['Nome'] || '' }, data, hoje: hojeMZ().data, opcoes: OPC_DIARIO,
+    criancas: ests.map(e => { const d = ds.find(x => x['Estudante'] === e._id) || {}, en = EN[e['Encarregado']];
+      return { id: e._id, nome: e['Nome'] || '', saude: e['Saude Notas'] || '', encarregado: en ? { nome: en['Nome'] || '', telefone: en['Telefone'] || '', parentesco: en['Parentesco'] || '' } : null,
+        autorizados: auts.filter(a => a.estudante === e._id), refeicao: d['Refeicao'] || '', sesta: d['Sesta'] || '', humor: d['Humor'] || '', recado: d['Recado'] || '', actividades: d['Actividades'] || '', feito: !!d._id }; }) });
+}));
+app.post('/prof/diario-guardar', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {}, data = String(b.data || '');
+  if (!dataOk(data) || data > hojeMZ().data || data < hojeMZ(-7).data) return erro(res, 400, 'Só pode escrever o diário de hoje ou dos últimos 7 dias.');
+  const t = await turmaDoProfessor(req, String(b.turma || ''));
+  const f = daEscola(req.escola);
+  const [ests, ds, eu] = await Promise.all([procurarTodos('estudante', f.concat([{ key: 'Turma', constraint_type: 'equals', value: t._id }])),
+    procurarTodos('diarioentrada', f.concat([{ key: 'Turma', constraint_type: 'equals', value: t._id }, { key: 'Data', constraint_type: 'equals', value: data }])), obter('professor', req.sessao.u).catch(() => null)]);
+  const ids = new Set(ests.map(e => e._id)), act = txt(b.actividades, 600);
+  let n = 0;
+  for (const [est, l] of Object.entries(b.entradas || {})) {
+    if (!ids.has(est) || !l) continue;
+    const campos = { 'Escola': req.escola, 'Estudante': est, 'Turma': t._id, 'Data': data, 'Actividades': act, 'Feito Por': (eu && eu['Nome']) || 'Educadora',
+      'Refeicao': OPC_DIARIO.refeicao.includes(l.refeicao) ? l.refeicao : '', 'Sesta': OPC_DIARIO.sesta.includes(l.sesta) ? l.sesta : '', 'Humor': OPC_DIARIO.humor.includes(l.humor) ? l.humor : '', 'Recado': txt(l.recado, 400) };
+    if (!campos['Refeicao'] && !campos['Sesta'] && !campos['Humor'] && !campos['Recado'] && !act) continue;
+    const ja = ds.find(x => x['Estudante'] === est);
+    if (ja) await mudar('diarioentrada', ja._id, campos); else await criar('diarioentrada', campos);
+    n++;
+  }
+  res.json({ ok: true, guardados: n });
+}));
+async function diarioDoEstudante(escola, estId) {
+  const l = await procurarTodos('diarioentrada', daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: estId }]), 200);
+  const de = hojeMZ(-14).data;
+  return l.filter(x => x['Data'] >= de).map(x => ({ data: x['Data'], refeicao: x['Refeicao'] || '', sesta: x['Sesta'] || '', humor: x['Humor'] || '', actividades: x['Actividades'] || '', recado: x['Recado'] || '', por: x['Feito Por'] || '' }))
+    .sort((a, b) => b.data.localeCompare(a.data));
 }
 
 // ============================================================
