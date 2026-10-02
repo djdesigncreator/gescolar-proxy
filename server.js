@@ -21,6 +21,7 @@
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//    Superior e Técnico (v5.5): pautas semestrais (frequência, exame, recorrência), créditos das cadeiras
 //    Primário (v5.4): professor titular da turma (monodocência) · chamada do dia (Tempo 99) · Turma.Professor Titular (text)
 //                      (/autorizados /autorizado-guardar /autorizado-apagar · /p/autorizado-guardar /p/autorizado-apagar)
 //    Escola de condução 3 (v5.2): /exames /exame-marcar /exame-resultado · /prof/aula-estado · portal com aulas e exames
@@ -45,7 +46,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.4.0';
+const VERSAO = 'gescolar-proxy 5.5.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -164,7 +165,7 @@ async function resumoEscola(id) {
     id: e._id, nome: e['Nome'], subdominio: e['Subdominio'], estado: e['Estado'], plano: e['Plano'],
     niveis: (e['Niveis'] || []).map(n => CODIGO_NIVEL[n] || n), ano: e['Ano Lectivo'], teste_ate: e['Teste Ate'] || null, valida_ate: e['Valida Ate'] || null,
     situacao: situacaoEscola(e),
-    regras: { dia_limite: e['Dia Limite'], multa: e['Multa Percent'], multa_max: e['Multa Max'], aprovacao: e['Nota Aprovacao'], dispensa: e['Nota Dispensa'], formula: e['Formula Media'] }
+    regras: { dia_limite: e['Dia Limite'], multa: e['Multa Percent'], multa_max: e['Multa Max'], aprovacao: e['Nota Aprovacao'], dispensa: e['Nota Dispensa'], formula: e['Formula Media'], admissao: e['Nota Admissao'], peso_exame: e['Peso Exame'] }
   };
 }
 const PLATAFORMA_EMAILS = (process.env.PLATAFORMA_EMAILS || '').split(',').map(x => x.trim().toLowerCase()).filter(Boolean);
@@ -1257,7 +1258,70 @@ function validarDescritiva(g, estIds) {
   }
   return { modo: 'descritiva', notas };
 }
-function mediasPauta(g, estId) {
+// ---------- ensino superior e técnico (v5.5): pauta semestral ----------
+//  Grelha { modo:'semestral', colunas:[{id,tipo:'F',nome}…, {id:'ex',tipo:'EX'}, {id:'rc',tipo:'RC'}], notas }
+//  Frequência = média das avaliações F. Dispensado se freq ≥ dispensa (14); excluído se freq < admissão (10);
+//  admitido vai a exame: Final = freq × (1 − p) + exame × p (p = peso do exame, 50% por defeito). A recorrência substitui o exame.
+const ehSEM = t => !!t && [NIVEIS.SUP, NIVEIS.TEC, 'SUP', 'TEC'].includes(t['Nivel']);
+const PERIODOS = t => ehSEM(t) ? 2 : 3;
+function regrasPauta(esc) {
+  const r = (esc && esc.regras) || {};
+  const pe = Number(r.peso_exame); 
+  return { aprovacao: Number(r.aprovacao || 10), dispensa: Number(r.dispensa || 14), admissao: Number(r.admissao || 10), peso_exame: pe > 0 && pe < 100 ? pe : 50 };
+}
+const PAUTA_SEM = () => ({ modo: 'semestral', colunas: [{ id: 't1', tipo: 'F', nome: 'Teste 1' }, { id: 't2', tipo: 'F', nome: 'Teste 2' }, { id: 'tr1', tipo: 'F', nome: 'Trabalho' },
+  { id: 'ex', tipo: 'EX', nome: 'Exame' }, { id: 'rc', tipo: 'RC', nome: 'Recorrência' }], notas: {} });
+function mediasSem(g, estId, R) {
+  R = R || regrasPauta(null);
+  const n = ((g && g.notas) || {})[estId] || {};
+  const fs = (g.colunas || []).filter(c => c.tipo === 'F').map(c => n[c.id]).filter(v => typeof v === 'number');
+  const freq = fs.length ? r1(fs.reduce((a, b) => a + b, 0) / fs.length) : null;
+  const ex = typeof n.ex === 'number' ? n.ex : null, rc = typeof n.rc === 'number' ? n.rc : null;
+  const out = { freq, exame: ex, recorrencia: rc, final: null, estado: 'sem', completa: false };
+  if (freq === null) return Object.assign(out, { mt: null });
+  if (Math.round(freq) >= R.dispensa) Object.assign(out, { estado: 'dispensado', final: freq, completa: true });
+  else if (Math.round(freq) < R.admissao) Object.assign(out, { estado: 'excluido', final: freq, completa: true });
+  else {
+    const e = rc !== null ? rc : ex;
+    if (e === null) out.estado = 'admitido';
+    else {
+      out.final = r1(freq * (1 - R.peso_exame / 100) + e * R.peso_exame / 100);
+      out.estado = Math.round(out.final) >= R.aprovacao ? 'aprovado' : (rc !== null ? 'reprovado' : 'recorrencia');
+      out.completa = out.estado !== 'recorrencia';
+    }
+  }
+  out.mt = out.final;
+  out.aprovado = out.estado === 'dispensado' || out.estado === 'aprovado';
+  return out;
+}
+function validarSemestral(g, estIds) {
+  if (!g || typeof g !== 'object') return 'Pauta inválida.';
+  const vistos = new Set(['ex', 'rc']), colunas = [];
+  for (const c of (Array.isArray(g.colunas) ? g.colunas : [])) {
+    const id = String((c && c.id) || '').toLowerCase();
+    if (c && (c.tipo === 'EX' || c.tipo === 'RC')) continue;
+    if (!/^[a-z0-9]{1,10}$/.test(id) || vistos.has(id)) continue;
+    vistos.add(id); colunas.push({ id, tipo: 'F', nome: txt(c.nome, 16) || 'Avaliação' });
+  }
+  if (!colunas.length) return 'A pauta precisa de pelo menos um teste ou trabalho.';
+  if (colunas.length > 8) return 'No máximo 8 avaliações de frequência por semestre.';
+  colunas.push({ id: 'ex', tipo: 'EX', nome: 'Exame' }, { id: 'rc', tipo: 'RC', nome: 'Recorrência' });
+  const ids = new Set(colunas.map(c => c.id)), notas = {};
+  for (const [est, linha] of Object.entries(g.notas || {})) {
+    if (!estIds.has(est) || !linha || typeof linha !== 'object') continue;
+    const l = {};
+    for (const [cid, v] of Object.entries(linha)) {
+      if (!ids.has(cid) || v === null || v === '' || v === undefined) continue;
+      const n = Number(String(v).replace(',', '.'));
+      if (!isFinite(n) || n < 0 || n > 20) return 'As notas vão de 0 a 20. Verifique a nota ' + v + '.';
+      l[cid] = r1(n);
+    }
+    if (Object.keys(l).length) notas[est] = l;
+  }
+  return { modo: 'semestral', colunas, notas };
+}
+function mediasPauta(g, estId, R) {
+  if (g && g.modo === 'semestral') return mediasSem(g, estId, R);
   if (g && g.modo === 'descritiva') { const l = (g.notas || {})[estId] || {}; return { macs: null, acp: null, mt: null, completa: !!l.n, nivel: l.n || null }; }
   const n = ((g && g.notas) || {})[estId] || {};
   const acs = (g.colunas || []).filter(c => c.tipo === 'ACS').map(c => n[c.id]).filter(v => typeof v === 'number');
@@ -1335,19 +1399,22 @@ async function dadosPauta(escola, turmaId, discId, tri) {
   const ests = (await procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: escola }, { key: 'Turma', constraint_type: 'equals', value: turmaId }]))
     .filter(e => (e['Estado'] || 'activo') === 'activo').sort((a, b) => String(a['Nome'] || '').localeCompare(String(b['Nome'] || ''), 'pt'));
   const reg = await pautaDe(escola, turmaId, discId, tri);
-  const desc = ehESC(turma);
-  let grelha = (reg && lerGrelha(reg['Grelha'])) || (desc ? { modo: 'descritiva', notas: {} } : PAUTA_NOVA());
+  const desc = ehESC(turma), sem = ehSEM(turma);
+  if (Number(tri) > PERIODOS(turma)) { const e = new Error('No ensino superior e técnico há só 2 semestres.'); e.publico = 400; throw e; }
+  let grelha = (reg && lerGrelha(reg['Grelha'])) || (desc ? { modo: 'descritiva', notas: {} } : sem ? PAUTA_SEM() : PAUTA_NOVA());
   if (desc && grelha.modo !== 'descritiva') grelha = { modo: 'descritiva', notas: {} };
-  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC' }, trimestre: Number(tri), modo: desc ? 'descritiva' : 'numerica',
+  if (sem && grelha.modo !== 'semestral') grelha = PAUTA_SEM();
+  return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC', creditos: Number(disc['Creditos'] || 0) }, trimestre: Number(tri), modo: desc ? 'descritiva' : sem ? 'semestral' : 'numerica',
     estudantes: ests.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })), grelha, publicado: !!(reg && reg['Publicado']),
     actualizado: reg ? (reg['Modified Date'] || null) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '',
-    regras: { aprovacao: Number((regrasEsc && regrasEsc.regras.aprovacao) || 10), dispensa: Number((regrasEsc && regrasEsc.regras.dispensa) || 14) } };
+    regras: regrasPauta(regrasEsc) };
 }
 async function guardarPauta(req, res, quem) {
   const b = req.body || {};
   if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre (1, 2 ou 3).');
   const d = await dadosPauta(req.escola, String(b.turma || ''), String(b.disciplina || ''), b.trimestre);
-  const g = d.modo === 'descritiva' ? validarDescritiva(b.grelha, new Set(d.estudantes.map(e => e.id))) : validarPauta(b.grelha, new Set(d.estudantes.map(e => e.id)));
+  const ids = new Set(d.estudantes.map(e => e.id));
+  const g = d.modo === 'descritiva' ? validarDescritiva(b.grelha, ids) : d.modo === 'semestral' ? validarSemestral(b.grelha, ids) : validarPauta(b.grelha, ids);
   if (typeof g === 'string') return erro(res, 400, g);
   const campos = { 'Escola': req.escola, 'Turma': d.turma.id, 'Disciplina': d.disciplina.id, 'Trimestre': d.trimestre, 'Grelha': JSON.stringify(g), 'Publicado': !!b.publicado, 'Actualizado Por': quem };
   const reg = await pautaDe(req.escola, d.turma.id, d.disciplina.id, d.trimestre);
@@ -1384,7 +1451,7 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
   res.json({ ok: true, hoje,
     eu: { nome: eu['Nome'] || '', telefone: eu['Telefone'] || '' },
     escola: { nome: escRaw['Nome'] || '', logotipo: escRaw['Logotipo'] || '', ano: escRaw['Ano Lectivo'] || '' },
-    turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', esc: ehESC(TM[p.turma]), disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
+    turmas: meus.map(p => ({ turma: p.turma, turma_nome: TM[p.turma]['Nome'] || '', esc: ehESC(TM[p.turma]), sem: ehSEM(TM[p.turma]), disciplina: p.disciplina, disciplina_nome: DM[p.disciplina]['Nome'] || '', cor: DM[p.disciplina]['Cor'] || '#0A64DC',
       estudantes: ests.filter(e => e['Turma'] === p.turma && (e['Estado'] || 'activo') === 'activo').length }))
       .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt')),
     aulas,
@@ -1433,13 +1500,16 @@ app.post('/pautas-turma', exigeDireccao, rota(async (req, res) => {
       existe: !!reg, publicado: !!(reg && reg['Publicado']), grelha: reg ? lerGrelha(reg['Grelha']) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '' };
   }).sort((x, y) => x.nome.localeCompare(y.nome, 'pt'));
   const activos = ests.filter(e => (e['Estado'] || 'activo') === 'activo').sort((x, y) => String(x['Nome'] || '').localeCompare(String(y['Nome'] || ''), 'pt'));
+  const R = regrasPauta(esc), semT = ehSEM(turma);
+  if (tri > PERIODOS(turma)) return erro(res, 400, 'No ensino superior e técnico há só 2 semestres.');
   res.json({ ok: true, turma: { id: turma._id, nome: turma['Nome'] || '' }, trimestre: tri,
-    regras: { aprovacao: Number((esc && esc.regras.aprovacao) || 10), dispensa: Number((esc && esc.regras.dispensa) || 14) },
-    disciplinas: lista.map(d => ({ id: d.id, nome: d.nome, cor: d.cor, professores: d.professores, existe: d.existe, publicado: d.publicado, actualizado_por: d.actualizado_por,
+    regras: regrasPauta(esc),
+    disciplinas: lista.map(d => ({ id: d.id, nome: d.nome, cor: d.cor, creditos: Number(DM[d.id]['Creditos'] || 0), professores: d.professores, existe: d.existe, publicado: d.publicado, actualizado_por: d.actualizado_por,
       lancadas: d.grelha ? Object.keys(d.grelha.notas || {}).length : 0 })),
     estudantes: activos.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '',
-      medias: Object.fromEntries(lista.map(d => [d.id, d.grelha ? (d.grelha.modo === 'descritiva' ? (mediasPauta(d.grelha, e._id).nivel) : mediasPauta(d.grelha, e._id).mt) : null])) })),
-    modo: ehESC(turma) ? 'descritiva' : 'numerica' });
+      medias: Object.fromEntries(lista.map(d => [d.id, d.grelha ? (d.grelha.modo === 'descritiva' ? (mediasPauta(d.grelha, e._id).nivel) : mediasPauta(d.grelha, e._id, R).mt) : null])),
+      estados: semT ? Object.fromEntries(lista.map(d => [d.id, d.grelha && d.grelha.modo === 'semestral' ? mediasSem(d.grelha, e._id, R).estado : null])) : undefined })),
+    modo: ehESC(turma) ? 'descritiva' : semT ? 'semestral' : 'numerica', periodos: PERIODOS(turma) });
 }));
 app.post('/pautas-publicar', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {}, tri = Number(b.trimestre);
@@ -1463,6 +1533,14 @@ async function notasDoEstudante(escola, est, cache) {
     const linha = (g.notas || {})[est._id] || {};
     const m = mediasPauta(g, est._id);
     const o = out[d._id] = out[d._id] || { disciplina: d['Nome'] || '', cor: d['Cor'] || '#0A64DC', trimestres: {} };
+    if (g.modo === 'semestral') {
+      if (!cache.R) cache.R = regrasPauta(await resumoEscola(escola));
+      const m2 = mediasSem(g, est._id, cache.R);
+      o.semestral = true; o.creditos = Number(d['Creditos'] || 0);
+      o.trimestres[Number(p['Trimestre'])] = { semestral: true, colunas: g.colunas.filter(c => c.tipo === 'F').map(c => ({ nome: c.nome, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })),
+        freq: m2.freq, exame: m2.exame, recorrencia: m2.recorrencia, final: m2.final, estado: m2.estado, aprovado: !!m2.aprovado, mt: m2.final, completa: m2.completa };
+      continue;
+    }
     if (g.modo === 'descritiva') { o.descritiva = true; o.trimestres[Number(p['Trimestre'])] = { descritiva: true, nivel: linha.n || null, nivel_nome: NIVEIS_DESC[linha.n] || '', obs: linha.o || '' }; continue; }
     o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa };
   }
