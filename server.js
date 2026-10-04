@@ -46,7 +46,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.5.0';
+const VERSAO = 'gescolar-proxy 5.5.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -98,6 +98,20 @@ async function pedido(url, method, body) {
   return d;
 }
 const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
+// nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
+const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
+  subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha',
+  turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
+const nomeTabela = t => NOME_TABELA[t] || t;
+// erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
+function erroTabela(tipo, e) {
+  if (e && (e.status === 404 || e.status === 400)) {
+    const x = new Error('No Bubble falta a tabela «' + nomeTabela(tipo) + '» ou um campo dela. Detalhe: ' + String(e.bubble || e.message).slice(0, 160));
+    x.publico = 400; x.tabela = nomeTabela(tipo); return x;
+  }
+  return e;
+}
 const workflow = (nome, body) => pedido(BUBBLE_WF + '/' + nome, 'POST', body);
 const obter = (tipo, id) => bubble('GET', '/' + tipo + '/' + encodeURIComponent(id)).then(d => d && d.response);
 const criar = (tipo, campos) => bubble('POST', '/' + tipo, campos).then(d => d && d.id);
@@ -105,7 +119,7 @@ const mudar = (tipo, id, campos) => bubble('PATCH', '/' + tipo + '/' + encodeURI
 const apagar = (tipo, id) => bubble('DELETE', '/' + tipo + '/' + encodeURIComponent(id));
 async function procurar(tipo, filtros, limite) {
   const q = '?constraints=' + encodeURIComponent(JSON.stringify(filtros || [])) + '&limit=' + (limite || 100);
-  const d = await bubble('GET', '/' + tipo + q);
+  let d; try { d = await bubble('GET', '/' + tipo + q); } catch (e) { throw erroTabela(tipo, e); }
   return (d && d.response && d.response.results) || [];
 }
 
@@ -314,7 +328,7 @@ async function procurarTodos(tipo, filtros, max) {
   const out = []; let cursor = 0; max = max || 2000;
   while (out.length < max) {
     const q = '?constraints=' + encodeURIComponent(JSON.stringify(filtros || [])) + '&limit=100&cursor=' + cursor;
-    const d = await bubble('GET', '/' + tipo + q);
+    let d; try { d = await bubble('GET', '/' + tipo + q); } catch (e) { throw erroTabela(tipo, e); }
     const r = (d && d.response) || {};
     const lista = r.results || [];
     out.push(...lista);
@@ -1734,10 +1748,13 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
   const c = cachePainel.get(req.escola);
   if (c && !(req.body || {}).fresco && Date.now() - c.t < 60e3) return res.json(c.d);
   const f = daEscola(req.escola), hoje = hojeMZ(), mes = hoje.data.slice(0, 7);
+  // uma tabela em falta no Bubble não deita o painel abaixo: conta como vazia e avisa
+  const faltam = new Set();
+  const seg = (p, t, vazio) => p.catch(e => { console.error('[painel] ' + t + ':', e.message); faltam.add(e.tabela || nomeTabela(t)); return vazio || []; });
   const [escola, ests, turmas, props, pags, chsHoje, faltas, pautas, a, discs] = await Promise.all([
-    resumoEscola(req.escola), procurarTodos('estudante', f), procurarTodos('turma', f), procurarTodos('propina', f, 20000), procurarTodos('pagamento', f, 20000),
-    procurarTodos('chamada', f.concat([{ key: 'Data', constraint_type: 'equals', value: hoje.data }])), procurarTodos('falta', f, 20000), procurarTodos('pauta', f, 5000),
-    atribuicoes(req.escola), procurarTodos('disciplina', f)]);
+    resumoEscola(req.escola), seg(procurarTodos('estudante', f), 'estudante'), seg(procurarTodos('turma', f), 'turma'), seg(procurarTodos('propina', f, 20000), 'propina'), seg(procurarTodos('pagamento', f, 20000), 'pagamento'),
+    seg(procurarTodos('chamada', f.concat([{ key: 'Data', constraint_type: 'equals', value: hoje.data }])), 'chamada'), seg(procurarTodos('falta', f, 20000), 'falta'), seg(procurarTodos('pauta', f, 5000), 'pauta'),
+    seg(atribuicoes(req.escola), 'horario', { turmas: [], profs: [], hs: [], pares: [] }), seg(procurarTodos('disciplina', f), 'disciplina')]);
   const regras = (escola && escola.regras) || {}, ap = Number(regras.aprovacao || 10);
   const activos = ests.filter(e => (e['Estado'] || 'activo') === 'activo'), EM = Object.fromEntries(ests.map(e => [e._id, e]));
   const TM = Object.fromEntries(turmas.filter(t => t['Activa'] !== false).map(t => [t._id, t])), DM = Object.fromEntries(discs.map(d => [d._id, d]));
@@ -1806,7 +1823,7 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
     return { turma: t['Nome'] || '', notas: n, positivas: pos, pct: n ? Math.round(pos * 100 / n) : null };
   }).sort((x, y) => x.turma.localeCompare(y.turma, 'pt'));
 
-  const d = { ok: true, gerado: new Date().toISOString(), hoje: hoje.data, dia: hoje.dia, mes,
+  const d = { ok: true, faltam: [...faltam], gerado: new Date().toISOString(), hoje: hoje.data, dia: hoje.dia, mes,
     dinheiro: { recebido_mes: doMes.reduce((x, p) => x + Number(p['Valor'] || 0), 0), recebido_hoje: pagos.filter(p => dataMZ(p['Pago Em']) === hoje.data).reduce((x, p) => x + Number(p['Valor'] || 0), 0),
       pagamentos_mes: doMes.length, em_atraso: atraso, multas, a_vencer: aVencer, estudantes_atraso: Object.keys(divida).length, por_metodo: porMetodo, serie, devedores, ultimos },
     hoje_aulas: { total: aulasHoje.length, feitas: aulasHoje.filter(x => x.feita).length, por_fazer: atrasadas.slice(0, 8), faltas: fx.filter(x => x['Data'] === hoje.data && x['Tipo'] === 'F').length },
@@ -1815,7 +1832,7 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
       publicadas: pt.filter(x => x['Publicado']).length, aproveitamento, sem_notas: Object.values(semNotas).sort((x, y) => y.pendentes.length - x.pendentes.length).slice(0, 8) },
     estudantes: activos.length };
   if ((escola && escola.niveis || []).includes('CON')) {
-    const [vs, aps, ins] = await Promise.all([procurarTodos('viatura', f), procurarTodos('aulapratica', f, 20000), procurarTodos('inscricaoconducao', f)]);
+    const [vs, aps, ins] = await Promise.all([seg(procurarTodos('viatura', f), 'viatura'), seg(procurarTodos('aulapratica', f, 20000), 'aulapratica'), seg(procurarTodos('inscricaoconducao', f), 'inscricaoconducao')]);
     const hojeA = aps.filter(x => x['Data'] === hoje.data && x['Estado'] !== 'cancelada');
     const alertas = [];
     vs.filter(v => v['Activa'] !== false).forEach(v => { for (const [k, n] of [['Inspecao Ate', 'Inspecção'], ['Seguro Ate', 'Seguro']]) { const dd = diasAte(v[k]); if (dd !== null && dd <= 30) alertas.push({ matricula: v['Matricula'] || '', tipo: n, dias: dd, ate: v[k] }); } });
