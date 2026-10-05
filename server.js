@@ -21,6 +21,7 @@
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//    Matrícula (v5.6): SMS de boas-vindas sempre (encarregado e/ou estudante) · no superior o estudante é o titular (sem encarregado)
 //    Superior e Técnico (v5.5): pautas semestrais (frequência, exame, recorrência), créditos das cadeiras
 //    Primário (v5.4): professor titular da turma (monodocência) · chamada do dia (Tempo 99) · Turma.Professor Titular (text)
 //                      (/autorizados /autorizado-guardar /autorizado-apagar · /p/autorizado-guardar /p/autorizado-apagar)
@@ -46,7 +47,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.5.2';
+const VERSAO = 'gescolar-proxy 5.6.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -513,15 +514,19 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
   const turmaId = String(b.turma || '');
   const turma = await daMinhaEscola('turma', turmaId, req.escola);
   const escola = await resumoEscola(req.escola);
+  // no ensino superior o estudante é adulto: não há encarregado, o telemóvel dele é obrigatório
+  const superior = turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP';
+  if (superior && tel9(b.telefone).length !== 9) return erro(res, 400, 'No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
   // encarregado: reutiliza pelo telefone, senão cria
-  const telEnc = soDigitos(b.enc_telefone);
-  let encId = null;
-  if (b.enc_nome || telEnc) {
+  const telEnc = superior ? '' : soDigitos(b.enc_telefone).replace(/^258/, '');
+  let encId = null, encTel = '';
+  if (!superior && (b.enc_nome || telEnc)) {
     if (telEnc.length !== 9) return erro(res, 400, 'O telemóvel do encarregado tem 9 dígitos.');
     const encs = await procurarTodos('encarregado', daEscola(req.escola));
     const ja = encs.find(e => soDigitos(e['Telefone']) === telEnc);
-    if (ja) encId = ja._id;
+    if (ja) { encId = ja._id; encTel = ja['Recebe SMS'] === false ? '' : telEnc; }
     else {
+      encTel = telEnc;
       if (txt(b.enc_nome, 100).split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do encarregado.');
       encId = await criar('encarregado', { 'Escola': req.escola, 'Nome': txt(b.enc_nome, 100), 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
     }
@@ -541,7 +546,24 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
     campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
   }
   const id = await criar('estudante', campos);
-  res.json({ ok: true, id, numero });
+  // SMS de boas-vindas com o número e o link de acesso (sem palavra-passe: entra com o telemóvel e recebe um código)
+  let sms = 0;
+  const esc = await obter('escola', req.escola).catch(() => null);
+  if (esc) {
+    const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, ''), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
+    if (telEst) {
+      const r = await enviarSMS([telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
+        '. Veja notas, horario e propinas em ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
+      if (r.ok) sms++;
+    }
+    if (encTel && encTel !== telEst) {
+      const r = await enviarSMS([encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
+        '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
+      if (r.ok) sms++;
+    }
+  }
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, id, numero, sms });
 }));
 
 
@@ -2254,7 +2276,7 @@ app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
   await criarEmLote('propina', linhas);
   const esc = await obter('escola', req.escola).catch(() => null);
   let sms = false;
-  if (b.sms !== false && esc) {
+  if (esc) {
     const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
     const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Estudante).');
     sms = r.ok;
