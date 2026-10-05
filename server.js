@@ -47,7 +47,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.6.0';
+const VERSAO = 'gescolar-proxy 5.6.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -518,12 +518,13 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
   const superior = turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP';
   if (superior && tel9(b.telefone).length !== 9) return erro(res, 400, 'No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
   // encarregado: reutiliza pelo telefone, senão cria
-  const telEnc = superior ? '' : soDigitos(b.enc_telefone).replace(/^258/, '');
+  const telEnc = superior ? '' : tel9(b.enc_telefone);
   let encId = null, encTel = '';
-  if (!superior && (b.enc_nome || telEnc)) {
-    if (telEnc.length !== 9) return erro(res, 400, 'O telemóvel do encarregado tem 9 dígitos.');
+  if (!superior && (txt(b.enc_nome, 100) || telEnc)) {
+    if (!telEnc) return erro(res, 400, 'Escreveu o nome do encarregado mas falta o telemóvel dele (ex.: 84 123 4567). Ou apague o nome para matricular sem encarregado.');
+    if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) return erro(res, 400, 'O telemóvel do encarregado deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEnc.length + ' dígito(s).');
     const encs = await procurarTodos('encarregado', daEscola(req.escola));
-    const ja = encs.find(e => soDigitos(e['Telefone']) === telEnc);
+    const ja = encs.find(e => tel9(e['Telefone']) === telEnc);
     if (ja) { encId = ja._id; encTel = ja['Recebe SMS'] === false ? '' : telEnc; }
     else {
       encTel = telEnc;
@@ -540,9 +541,9 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
     'Data Matricula': new Date().toISOString(), 'Estado': 'activo', 'Saude Notas': txt(b.saude, 300) };
   if (b.nascimento && !isNaN(Date.parse(b.nascimento))) campos['Data Nascimento'] = new Date(b.nascimento).toISOString();
   if (encId) campos['Encarregado'] = encId;
-  const telEst = soDigitos(b.telefone).replace(/^258/, '');
+  const telEst = tel9(b.telefone);
   if (telEst) {
-    if (telEst.length !== 9) return erro(res, 400, 'O telemóvel do estudante tem 9 dígitos.');
+    if (telEst.length !== 9 || !/^8[2-7]/.test(telEst)) return erro(res, 400, 'O telemóvel do estudante deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEst.length + ' dígito(s).');
     campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
   }
   const id = await criar('estudante', campos);
