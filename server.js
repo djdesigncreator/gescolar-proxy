@@ -46,7 +46,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.5.1';
+const VERSAO = 'gescolar-proxy 5.5.2';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -114,8 +114,16 @@ function erroTabela(tipo, e) {
 }
 const workflow = (nome, body) => pedido(BUBBLE_WF + '/' + nome, 'POST', body);
 const obter = (tipo, id) => bubble('GET', '/' + tipo + '/' + encodeURIComponent(id)).then(d => d && d.response);
-const criar = (tipo, campos) => bubble('POST', '/' + tipo, campos).then(d => d && d.id);
-const mudar = (tipo, id, campos) => bubble('PATCH', '/' + tipo + '/' + encodeURIComponent(id), campos);
+// ao gravar, o Bubble recusa com 400 quando falta um campo ou o tipo não bate certo: dizer qual
+function erroGravar(tipo, e) {
+  if (e && (e.status === 400 || e.status === 404)) {
+    const x = new Error('O Bubble não aceitou gravar na tabela «' + nomeTabela(tipo) + '». Falta criar um campo ou o tipo dele está diferente. Detalhe: ' + String(e.bubble || e.message).slice(0, 200));
+    x.publico = 400; x.tabela = nomeTabela(tipo); return x;
+  }
+  return e;
+}
+const criar = (tipo, campos) => bubble('POST', '/' + tipo, campos).then(d => d && d.id, e => { throw erroGravar(tipo, e); });
+const mudar = (tipo, id, campos) => bubble('PATCH', '/' + tipo + '/' + encodeURIComponent(id), campos).catch(e => { throw erroGravar(tipo, e); });
 const apagar = (tipo, id) => bubble('DELETE', '/' + tipo + '/' + encodeURIComponent(id));
 async function procurar(tipo, filtros, limite) {
   const q = '?constraints=' + encodeURIComponent(JSON.stringify(filtros || [])) + '&limit=' + (limite || 100);
@@ -410,7 +418,7 @@ app.post('/turma-guardar', exigeDireccao, rota(async (req, res) => {
   if (b.titular !== undefined) {
     const tit = String(b.titular || '');
     if (tit) { const p = await daMinhaEscola('professor', tit, req.escola).catch(() => null); if (!p) return erro(res, 400, 'O professor titular escolhido não é desta escola.'); }
-    campos['Professor Titular'] = tit;
+    if (tit || b.id) campos['Professor Titular'] = tit;
   }
   let id = b.id ? String(b.id) : null;
   if (id) { await daMinhaEscola('turma', id, req.escola); await mudar('turma', id, campos); }
