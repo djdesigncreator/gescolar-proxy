@@ -47,7 +47,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.6.1';
+const VERSAO = 'gescolar-proxy 5.6.2';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -666,8 +666,16 @@ async function criarEmLote(tipo, lista) {
     const fatia = lista.slice(i, i + 500);
     const r = await fetch(BUBBLE_BASE + '/' + tipo + '/bulk', { method: 'POST', headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN, 'Content-Type': 'text/plain' }, body: fatia.map(x => JSON.stringify(x)).join('\n') });
     const t = await r.text();
-    if (!r.ok) throw new Error('bulk ' + tipo + ': ' + t.slice(0, 200));
-    criados += t.split('\n').filter(l => /"status"\s*:\s*"success"/.test(l)).length;
+    if (!r.ok) {
+      let msg = t; try { const d = JSON.parse(t); msg = (d.body && d.body.message) || d.message || t; } catch (e) {}
+      throw erroGravar(tipo, Object.assign(new Error(msg), { status: r.status === 404 ? 404 : 400, bubble: String(msg).slice(0, 200) }));
+    }
+    const linhas = t.split('\n').filter(Boolean), ok = linhas.filter(l => /"status"\s*:\s*"success"/.test(l)).length;
+    criados += ok;
+    if (!ok && linhas.length) {   // o Bubble respondeu 200 mas recusou todas as linhas: mostrar o primeiro motivo
+      let msg = linhas[0]; try { const d = JSON.parse(linhas[0]); msg = d.message || (d.body && d.body.message) || linhas[0]; } catch (e) {}
+      throw erroGravar(tipo, Object.assign(new Error(msg), { status: 400, bubble: String(msg).slice(0, 200) }));
+    }
   }
   return criados;
 }
