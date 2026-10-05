@@ -47,7 +47,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.6.2';
+const VERSAO = 'gescolar-proxy 5.6.3';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -624,7 +624,10 @@ let MOZ_TOKEN = null, MOZ_TOKEN_ATE = 0;
 async function mozLogin(forcar) {
   if (!forcar && MOZ_TOKEN && Date.now() < MOZ_TOKEN_ATE) return MOZ_TOKEN;
   if (!MOZ_EMAIL || !MOZ_SENHA) throw new Error('MOZ_EMAIL ou MOZ_SENHA em falta no container');
-  const r = await fetch(MOZ_BASE + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: MOZ_EMAIL, senha: MOZ_SENHA }) });
+  console.log('[moz] login…');
+  let r;
+  try { r = await fetch(MOZ_BASE + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: MOZ_EMAIL, senha: MOZ_SENHA }), signal: AbortSignal.timeout(25000) }); }
+  catch (e) { throw new Error(e.name === 'TimeoutError' ? 'o login na MozPayment não respondeu em 25 segundos' : 'sem ligação à MozPayment (' + e.message + ')'); }
   const t = await r.text(); let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
   const token = achar(d, ['token', 'access_token', 'accessToken', 'jwt']);
   if (!r.ok || !token) throw new Error('login MozPayment falhou (' + r.status + '): ' + t.slice(0, 200));
@@ -635,7 +638,11 @@ async function mozLogin(forcar) {
 async function mozPedido(caminho, corpo) {
   for (let tentativa = 0; tentativa < 2; tentativa++) {
     const token = await mozLogin(tentativa > 0);
-    const r = await fetch(MOZ_BASE + '/' + caminho, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(corpo) });
+    console.log('[moz] ' + caminho + ' a pedir… ' + JSON.stringify(Object.assign({}, corpo, { wallet: corpo.wallet ? '…' : undefined, carteira: corpo.carteira ? '…' : undefined })));
+    let r;
+    // o M-Pesa/e-Mola só responde depois de a pessoa pôr o PIN (ou desistir): esperar até 100 s
+    try { r = await fetch(MOZ_BASE + '/' + caminho, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(corpo), signal: AbortSignal.timeout(100000) }); }
+    catch (e) { const x = new Error(e.name === 'TimeoutError' ? 'a MozPayment não respondeu em 100 segundos' : 'sem ligação à MozPayment (' + e.message + ')'); x.semResposta = true; throw x; }
     const t = await r.text(); let d = null; try { d = JSON.parse(t); } catch (e) { d = { raw: t }; }
     if ((r.status === 401 || r.status === 403) && tentativa === 0) continue;   // token caducado: novo login e repete
     console.log('[moz] ' + caminho + ' → ' + r.status + ' ' + t.slice(0, 1500));
@@ -874,6 +881,10 @@ async function cobrarOnline(req, res) {
     res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
   } catch (e) {
     console.error('[pagar]', e.message);
+    if (e.semResposta) {   // pode ter chegado ao telemóvel: o pagamento fica pendente e o webhook ainda o pode confirmar
+      await mudar('pagamento', pagId, { 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
+      return res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'A MozPayment está a demorar a responder. Se o pedido chegou ao telemóvel e for pago, o recibo aparece sozinho.' });
+    }
     await mudar('pagamento', pagId, { 'Estado': 'falhado', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
     erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(e.message).slice(0, 300));
   }
