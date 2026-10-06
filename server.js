@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.8.6';
+const VERSAO = 'gescolar-proxy 5.9.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -209,7 +209,7 @@ async function abrirSessao(userId, pl) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -1414,7 +1414,7 @@ function validarSemestral(g, estIds) {
     }
     if (Object.keys(l).length) notas[est] = l;
   }
-  return { modo: 'semestral', colunas, notas };
+  return Object.assign({ modo: 'semestral', colunas, notas }, lerObs(g.obs, estIds));
 }
 function mediasPauta(g, estId, R) {
   if (g && g.modo === 'semestral') return mediasSem(g, estId, R);
@@ -1455,7 +1455,13 @@ function validarPauta(g, estIds) {
     }
     if (Object.keys(l).length) notas[est] = l;
   }
-  return { colunas, notas };
+  return Object.assign({ colunas, notas }, lerObs(g.obs, estIds));
+}
+// v5.9: apreciação de cada estudante (escrita pelo professor ou sugerida pela IA), guardada na grelha como obs { estudanteId: texto }
+function lerObs(obs, estIds) {
+  const o = {};
+  if (obs && typeof obs === 'object') for (const [est, t] of Object.entries(obs)) { if (!estIds.has(est)) continue; const v = txt(t, 400); if (v) o[est] = v; }
+  return Object.keys(o).length ? { obs: o } : {};
 }
 const PAUTA_NOVA = () => ({ colunas: [{ id: 'acs1', tipo: 'ACS', nome: 'ACS 1' }, { id: 'acs2', tipo: 'ACS', nome: 'ACS 2' }, { id: 'acs3', tipo: 'ACS', nome: 'ACS 3' }, { id: 'acp', tipo: 'ACP', nome: 'ACP' }], notas: {} });
 const trimestreOk = t => [1, 2, 3].includes(Number(t));
@@ -1503,7 +1509,7 @@ async function dadosPauta(escola, turmaId, discId, tri) {
   return { turma: { id: turma._id, nome: turma['Nome'] || '' }, disciplina: { id: disc._id, nome: disc['Nome'] || '', cor: disc['Cor'] || '#0A64DC', creditos: Number(disc['Creditos'] || 0) }, trimestre: Number(tri), modo: desc ? 'descritiva' : sem ? 'semestral' : 'numerica',
     estudantes: ests.map(e => ({ id: e._id, nome: e['Nome'] || '', numero: e['Numero'] || '' })), grelha, publicado: !!(reg && reg['Publicado']),
     actualizado: reg ? (reg['Modified Date'] || null) : null, actualizado_por: reg ? (reg['Actualizado Por'] || '') : '',
-    regras: regrasPauta(regrasEsc) };
+    regras: regrasPauta(regrasEsc), ia: !!OPENAI_KEY };
 }
 async function guardarPauta(req, res, quem) {
   const b = req.body || {};
@@ -1518,6 +1524,127 @@ async function guardarPauta(req, res, quem) {
   const lancadas = Object.keys(g.notas).length;
   res.json({ ok: true, grelha: g, publicado: !!b.publicado, lancadas, total: d.estudantes.length });
 }
+
+// ============================================================
+//  IA (v5.9) — apreciações de pauta sugeridas pela OpenAI
+//  Render: OPENAI_API_KEY (obrigatório) · OPENAI_MODEL (opcional, por defeito gpt-4o-mini) · IA_LIMITE_MES (opcional, por defeito 100)
+//  Bubble, campos novos em Escola: IA Mes (text) · IA Usos (number)  — contam os pedidos de cada escola no mês
+//  Privacidade: à OpenAI só vão códigos (E1, E2…), notas, faltas e o nome da disciplina e da turma. Nunca nomes nem telefones.
+//  A IA só escreve texto: as notas e as médias continuam a ser calculadas pelo servidor, sem IA.
+// ============================================================
+const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const IA_LIMITE = Math.max(0, Number(process.env.IA_LIMITE_MES === undefined || process.env.IA_LIMITE_MES === '' ? 100 : process.env.IA_LIMITE_MES));
+const iaMem = new Map();      // reserva, se os campos IA Mes / IA Usos ainda não existirem no Bubble
+const iaAgora = new Set();    // um pedido de IA de cada vez por escola
+async function iaReservar(escola) {
+  const mes = hojeMZ().data.slice(0, 7);
+  const e = await obter('escola', escola).catch(() => null);
+  let n = e && e['IA Mes'] === mes ? Number(e['IA Usos'] || 0) : 0;
+  const m = iaMem.get(escola); if (m && m.mes === mes) n = Math.max(n, m.n);
+  if (n >= IA_LIMITE) throw pub('A escola já usou os ' + IA_LIMITE + ' pedidos de IA deste mês. O limite renova no dia 1.');
+  return { mes, n };
+}
+async function iaContar(escola, u) {
+  const n = u.n + 1; iaMem.set(escola, { mes: u.mes, n });
+  await mudar('escola', escola, { 'IA Mes': u.mes, 'IA Usos': n }).catch(e => console.log('[ia] contador no Bubble:', String(e.message || e).slice(0, 160)));
+  return n;
+}
+async function openaiJSON(sistema, utilizador, maxTokens) {
+  if (!OPENAI_KEY) throw pub('A IA ainda não está ligada. Falta a chave OPENAI_API_KEY no Render.');
+  let r, d;
+  try {
+    r = await fetch(process.env.OPENAI_URL || 'https://api.openai.com/v1/chat/completions', { method: 'POST', signal: AbortSignal.timeout(90000),
+      headers: { 'Authorization': 'Bearer ' + OPENAI_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: OPENAI_MODEL, response_format: { type: 'json_object' }, max_completion_tokens: maxTokens || 4000,
+        messages: [{ role: 'system', content: sistema }, { role: 'user', content: utilizador }] }) });
+    d = await r.json().catch(() => null);
+  } catch (e) { console.log('[ia] sem resposta:', e.message); throw pub('A IA demorou demasiado a responder. Tente de novo.'); }
+  if (!r.ok) {
+    console.log('[ia]', r.status, JSON.stringify(d).slice(0, 500));
+    const m = String((d && d.error && d.error.message) || '');
+    throw pub(r.status === 401 ? 'A chave da OpenAI (OPENAI_API_KEY) não é válida.' :
+      r.status === 429 ? (/quota|billing|credit/i.test(m) ? 'A conta da OpenAI está sem saldo. Carregue créditos em platform.openai.com.' : 'A OpenAI está com muitos pedidos. Tente daqui a um minuto.') :
+      (r.status === 404 || /model/i.test(m)) ? 'O modelo de IA «' + OPENAI_MODEL + '» não está disponível nesta conta (OPENAI_MODEL).' :
+      'A IA não respondeu (' + r.status + '). Tente de novo.');
+  }
+  const t = (d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '';
+  try { return JSON.parse(t); } catch (e) { console.log('[ia] resposta não é JSON:', t.slice(0, 300)); throw pub('A IA respondeu num formato inesperado. Tente de novo.'); }
+}
+const IA_SISTEMA = 'És um professor experiente de uma escola em Moçambique e escreves as apreciações que acompanham a pauta.\n' +
+  'Escreve em português de Moçambique (norma europeia: «trimestre», «actividade», «facto»).\n' +
+  'Para cada estudante escreve 1 ou 2 frases, no máximo 220 caracteres, com base APENAS nos dados recebidos.\n' +
+  'Regras:\n' +
+  '- Tom profissional, construtivo e encorajador. Se há negativas ou muitas faltas, diz com clareza e indica uma coisa concreta a melhorar.\n' +
+  '- Não inventes nada que não esteja nos dados (comportamento, família, participação, atitudes).\n' +
+  '- Não escrevas nomes nem «o aluno», «a aluna» ou «a criança». Começa com um verbo ou expressão neutra (ex.: «Revela…», «Demonstra…», «Precisa de…», «Bom trimestre:…») e evita adjectivos com género (aplicado/a, esforçado/a).\n' +
+  '- Não repitas números de notas; descreve o desempenho.\n' +
+  '- Varia a forma das frases de estudante para estudante.\n' +
+  'Responde só com JSON no formato {"apreciacoes":{"E1":"texto","E2":"texto"}}, com uma entrada para cada código recebido.';
+const IA_ESCOLINHA = '\nNesta turma (escolinha/pré-escolar) as áreas são avaliadas como Adquirido, Em aquisição ou Não adquirido. Escreve para os pais, com linguagem simples e carinhosa, e sugere uma actividade simples para casa quando a área está em aquisição ou não adquirida.';
+async function iaApreciacoes(req, res) {
+  const b = req.body || {};
+  if (!trimestreOk(b.trimestre)) return erro(res, 400, 'Escolha o trimestre.');
+  if (iaAgora.has(req.escola)) return erro(res, 429, 'Já há um pedido de IA a ser preparado. Espere uns segundos.');
+  iaAgora.add(req.escola);
+  try {
+    const d = await dadosPauta(req.escola, String(b.turma || ''), String(b.disciplina || ''), b.trimestre);
+    const ids = new Set(d.estudantes.map(e => e.id));
+    const g = d.modo === 'descritiva' ? validarDescritiva(b.grelha, ids) : d.modo === 'semestral' ? validarSemestral(b.grelha, ids) : validarPauta(b.grelha, ids);
+    if (typeof g === 'string') return erro(res, 400, g);
+    const R = d.regras, todas = b.todas === true;
+    // faltas de cada estudante nesta disciplina (ou na chamada do dia), em todo o ano
+    let faltas = {};
+    try {
+      const fx = await procurarTodos('falta', daEscola(req.escola).concat([{ key: 'Turma', constraint_type: 'equals', value: d.turma.id }]), 20000);
+      fx.filter(x => (x['Tipo'] || 'F') === 'F' && (x['Disciplina'] === d.disciplina.id || Number(x['Tempo']) === TEMPO_DIA)).forEach(x => { faltas[x['Estudante']] = (faltas[x['Estudante']] || 0) + 1; });
+    } catch (e) { faltas = {}; }
+    const ESTADOS = { dispensado: 'dispensado do exame', excluido: 'excluído (frequência insuficiente)', admitido: 'admitido a exame', aprovado: 'aprovado', recorrencia: 'vai à recorrência', reprovado: 'reprovado' };
+    const alvo = [];
+    d.estudantes.forEach(e => {
+      const ja = d.modo === 'descritiva' ? ((g.notas[e.id] || {}).o || '') : ((g.obs || {})[e.id] || '');
+      if (ja && !todas) return;
+      const l = g.notas[e.id] || {}, x = { faltas: faltas[e.id] || 0 };
+      if (d.modo === 'descritiva') { if (!l.n) return; x.nivel = NIVEIS_DESC[l.n]; }
+      else if (d.modo === 'semestral') {
+        const m = mediasSem(g, e.id, R); if (m.freq === null) return;
+        x.avaliacoes = g.colunas.filter(c => c.tipo === 'F' && typeof l[c.id] === 'number').map(c => c.nome + ': ' + l[c.id]);
+        x.frequencia = m.freq; if (m.exame !== null) x.exame = m.exame; if (m.recorrencia !== null) x.recorrencia = m.recorrencia; if (m.final !== null) x.final = m.final; x.situacao = ESTADOS[m.estado] || m.estado;
+      } else {
+        const m = mediasPauta(g, e.id); if (m.mt === null) return;
+        x.avaliacoes = g.colunas.filter(c => typeof l[c.id] === 'number').map(c => c.nome + ': ' + l[c.id]);
+        x.media_trimestre = m.mt; x.situacao = !m.completa ? 'notas ainda parciais' : Math.round(m.mt) >= R.aprovacao ? 'positiva' : 'negativa';
+      }
+      alvo.push({ id: e.id, x });
+    });
+    if (!alvo.length) {
+      const algum = d.estudantes.some(e => d.modo === 'descritiva' ? (g.notas[e.id] || {}).n : Object.keys(g.notas[e.id] || {}).length);
+      return erro(res, 400, !algum ? 'Lance primeiro as notas: a IA escreve as apreciações a partir delas.' : 'Todos os estudantes com notas já têm apreciação. Use «Reescrever todas» para pedir novas.');
+    }
+    const uso = await iaReservar(req.escola);
+    const periodo = d.modo === 'semestral' ? d.trimestre + 'º semestre' : d.trimestre + 'º trimestre';
+    const sistema = IA_SISTEMA + (d.modo === 'descritiva' ? IA_ESCOLINHA : '');
+    const out = {};
+    for (let i = 0; i < alvo.length; i += 35) {     // turmas grandes vão em partes
+      const parte = alvo.slice(i, i + 35);
+      const dados = { disciplina: d.disciplina.nome, turma: d.turma.nome, periodo,
+        escala: d.modo === 'descritiva' ? 'Adquirido / Em aquisição / Não adquirido' : 'notas de 0 a 20; positiva a partir de ' + R.aprovacao,
+        estudantes: Object.fromEntries(parte.map((a, k) => ['E' + (i + k + 1), a.x])) };
+      const j = await openaiJSON(sistema, JSON.stringify(dados), 150 * parte.length + 400);
+      const ap = (j && j.apreciacoes) || {};
+      parte.forEach((a, k) => { const t = txt(ap['E' + (i + k + 1)], 400); if (t) out[a.id] = t; });
+    }
+    if (!Object.keys(out).length) return erro(res, 502, 'A IA não devolveu apreciações. Tente de novo.');
+    const usados = await iaContar(req.escola, uso);
+    res.json({ ok: true, apreciacoes: out, pedidos: alvo.length, feitas: Object.keys(out).length, usados, limite: IA_LIMITE });
+  } finally { iaAgora.delete(req.escola); }
+}
+app.post('/prof/ia-apreciacoes', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!await podeLancar(req, String(b.turma || ''), String(b.disciplina || ''))) return erro(res, 403, 'Não dá esta disciplina nesta turma. Fale com a Direcção.');
+  await iaApreciacoes(req, res);
+}));
+app.post('/ia-apreciacoes', exigeDireccao, rota(iaApreciacoes));
 
 // ---------- professor ----------
 async function podeLancar(req, turma, disc) {
@@ -1634,11 +1761,11 @@ async function notasDoEstudante(escola, est, cache) {
       const m2 = mediasSem(g, est._id, cache.R);
       o.semestral = true; o.creditos = Number(d['Creditos'] || 0);
       o.trimestres[Number(p['Trimestre'])] = { semestral: true, colunas: g.colunas.filter(c => c.tipo === 'F').map(c => ({ nome: c.nome, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })),
-        freq: m2.freq, exame: m2.exame, recorrencia: m2.recorrencia, final: m2.final, estado: m2.estado, aprovado: !!m2.aprovado, mt: m2.final, completa: m2.completa };
+        freq: m2.freq, exame: m2.exame, recorrencia: m2.recorrencia, final: m2.final, estado: m2.estado, aprovado: !!m2.aprovado, mt: m2.final, completa: m2.completa, obs: (g.obs || {})[est._id] || '' };
       continue;
     }
     if (g.modo === 'descritiva') { o.descritiva = true; o.trimestres[Number(p['Trimestre'])] = { descritiva: true, nivel: linha.n || null, nivel_nome: NIVEIS_DESC[linha.n] || '', obs: linha.o || '' }; continue; }
-    o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa };
+    o.trimestres[Number(p['Trimestre'])] = { colunas: g.colunas.map(c => ({ nome: c.nome, tipo: c.tipo, nota: typeof linha[c.id] === 'number' ? linha[c.id] : null })), macs: m.macs, acp: m.acp, mt: m.mt, completa: m.completa, obs: (g.obs || {})[est._id] || '' };
   }
   return Object.values(out).sort((a, b) => a.disciplina.localeCompare(b.disciplina, 'pt'));
 }
