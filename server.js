@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.11.0';
+const VERSAO = 'gescolar-proxy 5.11.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -64,6 +64,7 @@ const CODIGO_NIVEL = Object.fromEntries(Object.entries(NIVEIS).map(([k, v]) => [
 const PAPEIS = { Direccao: 'direccao', Secretaria: 'direccao', Professor: 'professor', Estudante: 'estudante', Encarregado: 'encarregado', Plataforma: 'plataforma' };
 const PROVINCIAS = ['Maputo Cidade', 'Maputo Província', 'Gaza', 'Inhambane', 'Sofala', 'Manica', 'Tete', 'Zambézia', 'Nampula', 'Cabo Delgado', 'Niassa'];
 const PLANOS = ['Essencial', 'Pro', 'Rede'];
+const TESTE_DIAS = Math.max(1, Math.min(90, Number(process.env.TESTE_DIAS || 7)));   // período de teste das escolas novas (por defeito 7 dias)
 
 const app = express();
 app.set('trust proxy', true);
@@ -262,7 +263,7 @@ app.post('/registo', async (req, res) => {
 
     // 3. criar a Escola
     const hoje = new Date();
-    const testeAte = new Date(hoje.getTime() + 30 * 864e5);
+    const testeAte = new Date(hoje.getTime() + TESTE_DIAS * 864e5);
     const escolaId = await criar('escola', {
       'Nome': nome, 'NUIT': nuit, 'Provincia': provincia, 'Cidade': txt(b.cidade, 80),
       'Telefone': txt(b.telefone, 30), 'Email': txt(b.email_escola || email, 120), 'Subdominio': sub,
