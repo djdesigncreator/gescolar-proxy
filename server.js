@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.9.0';
+const VERSAO = 'gescolar-proxy 5.10.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -104,7 +104,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -2387,7 +2387,7 @@ const CATEGORIAS = {
   BE: { nome: 'Ligeiros com reboque', idade: 18 }, C: { nome: 'Pesados de mercadorias', idade: 18 }, CE: { nome: 'Pesados com reboque', idade: 18 }, D: { nome: 'Pesados de passageiros', idade: 25 }
 };
 const cursoOut = (c, ins) => ({ id: c._id, categoria: c['Categoria'] || '', nome: c['Nome'] || '', preco: Number(c['Preco'] || 0), prestacoes: Number(c['Prestacoes'] || 1),
-  teoricas: Number(c['Aulas Teoricas'] || 0), praticas: Number(c['Aulas Praticas'] || 0), idade: Number(c['Idade Minima'] || (CATEGORIAS[c['Categoria']] || {}).idade || 18), activo: c['Activo'] !== false,
+  teoricas: Number(c['Aulas Teoricas'] || 0), praticas: Number(c['Aulas Praticas'] || 0), idade: Number(c['Idade Minima'] || (CATEGORIAS[c['Categoria']] || {}).idade || 18), activo: c['Activo'] !== false, extra: Number(c['Preco Aula Extra'] || 0),
   inscritos: ins ? ins.filter(i => i['Curso'] === c._id && (i['Estado'] || 'activa') === 'activa').length : undefined });
 app.post('/cursos', exigeDireccao, rota(async (req, res) => {
   const f = daEscola(req.escola);
@@ -2403,6 +2403,7 @@ app.post('/curso-guardar', exigeDireccao, rota(async (req, res) => {
   const campos = { 'Escola': req.escola, 'Categoria': cat, 'Nome': txt(b.nome, 80) || ('Carta ' + cat + ' · ' + CATEGORIAS[cat].nome), 'Preco': preco, 'Prestacoes': prest,
     'Aulas Teoricas': Math.max(0, Math.round(Number(b.teoricas) || 0)), 'Aulas Praticas': Math.max(0, Math.round(Number(b.praticas) || 0)),
     'Idade Minima': Math.max(CATEGORIAS[cat].idade, Math.round(Number(b.idade) || 0)), 'Activo': true };
+  if (b.extra !== undefined && String(b.extra).trim() !== '') { const x = Math.round(Number(String(b.extra).replace(/\s/g, ''))); if (!(x >= 0)) return erro(res, 400, 'Preço da aula extra inválido.'); campos['Preco Aula Extra'] = x; }
   let id = b.id ? String(b.id) : null;
   if (id) { await daMinhaEscola('cursoconducao', id, req.escola); await mudar('cursoconducao', id, campos); } else id = await criar('cursoconducao', campos);
   res.json({ ok: true, id });
@@ -2415,7 +2416,9 @@ app.post('/curso-apagar', exigeDireccao, rota(async (req, res) => {
 function idadeEm(nasc) { const n = new Date(nasc), h = new Date(); let a = h.getUTCFullYear() - n.getUTCFullYear(); if (h.getUTCMonth() < n.getUTCMonth() || (h.getUTCMonth() === n.getUTCMonth() && h.getUTCDate() < n.getUTCDate())) a--; return a; }
 app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
   const f = daEscola(req.escola);
-  const [ins, cs, ests, props, esc, aulas] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola), procurarTodos('aulapratica', f, 20000)]);
+  const [ins, cs, ests, props, esc, aulas, docs, ts, teo] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola), procurarTodos('aulapratica', f, 20000),
+    docsDaEscola(req.escola), procurarTodos('testecodigo', f, 20000).catch(() => []), procurarTodos('aulateorica', f, 5000).catch(() => [])]);
+  const teoConta = {}; teo.forEach(t => (lerJSON(t['Presentes'], []) || []).forEach(id => { teoConta[id] = (teoConta[id] || 0) + 1; }));
   const CM = Object.fromEntries(cs.map(c => [c._id, c])), EM = Object.fromEntries(ests.map(e => [e._id, e]));
   const regras = (esc && esc.regras) || {};
   res.json({ ok: true, instruendos: ins.map(i => {
@@ -2427,8 +2430,11 @@ app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
       curso: c['Nome'] || '', categoria: i['Categoria'] || c['Categoria'] || '', data: i['Data Inscricao'] || i['Created Date'] || null, estado: i['Estado'] || 'activa',
       preco: Number(i['Preco'] || 0), pago, total, em_atraso: ps.filter(p => p.estado === 'atrasada').reduce((x, p) => x + p.total, 0),
       proxima: prox ? { valor: prox.total, vencimento: prox.vencimento } : null,
-      praticas: { feitas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'feita').length, marcadas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) } };
-  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+      praticas: { feitas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'feita').length, marcadas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) },
+      teoricas: { feitas: teoConta[i._id] || 0, total: Number(c['Aulas Teoricas'] || 0) },
+      codigo: resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)),
+      processo: processoOut(i, docs) };
+  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))), documentos: docs, processos: PROCESSO });
 }));
 async function inscreverCore(escolaId, b) {
   const nome = txt(b.nome, 100);
@@ -2583,15 +2589,25 @@ async function marcarAula(req, res, b) {
   if (c3) return erro(res, 409, 'O instruendo já tem aula das ' + c3['Inicio'] + ' às ' + c3['Fim'] + ' nesse dia.');
   const id = await criar('aulapratica', { 'Escola': req.escola, 'Estudante': i['Estudante'], 'Inscricao': i._id, 'Instrutor': p._id, 'Viatura': v._id, 'Data': b.data,
     'Inicio': b.inicio, 'Fim': hhmmDe(fim), 'Minutos': dur, 'Estado': 'marcada', 'Notas': txt(b.notas, 300) });
+  // v5.10: depois de esgotadas as aulas do curso, cada aula nova é uma aula extra paga (se o curso tiver preço de aula extra)
+  let extra = 0;
+  const cur = D.CM[i['Curso']] || {}, incluidas = Number(cur['Aulas Praticas'] || 0), precoExtra = Number(cur['Preco Aula Extra'] || 0);
+  const usadas = D.aulas.filter(a => a['Inscricao'] === i._id && ['feita', 'marcada', 'faltou'].includes(a['Estado'])).length;
+  if (incluidas > 0 && precoExtra > 0 && usadas >= incluidas) {
+    const vz = new Date(b.data + 'T21:59:00Z');
+    await criar('propina', { 'Escola': req.escola, 'Estudante': i['Estudante'], 'Ano Lectivo': b.data.slice(0, 4), 'Tipo': 'prestacao', 'Mes': Number(b.data.slice(5, 7)),
+      'Descricao': 'Aula prática extra · ' + dmCurto(b.data) + ' ' + b.inicio, 'Valor': precoExtra, 'Vencimento': vz.toISOString(), 'Multa': 0, 'Total': precoExtra, 'Estado': 'aberta' });
+    extra = precoExtra;
+  }
   let sms = false;
   const e = D.EM[i['Estudante']] || {};
   if (b.sms && tel9(e['Telefone']).length === 9) {
     const esc = await obter('escola', req.escola).catch(() => null);
     const d = new Date(b.data + 'T12:00:00Z'), dia = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'][d.getUTCDay()];
-    const r = await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': aula pratica marcada para ' + dia + ' ' + dmCurto(b.data) + ', ' + b.inicio + '-' + hhmmDe(fim) + '. Instrutor ' + (p['Nome'] || '').split(' ')[0] + ', viatura ' + v['Matricula'] + '.');
+    const r = await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': aula pratica marcada para ' + dia + ' ' + dmCurto(b.data) + ', ' + b.inicio + '-' + hhmmDe(fim) + '. Instrutor ' + (p['Nome'] || '').split(' ')[0] + ', viatura ' + v['Matricula'] + '.' + (extra ? ' Aula extra: ' + extra + ' MT, pague no portal.' : ''));
     sms = r.ok;
   }
-  return res.json({ ok: true, id, fim: hhmmDe(fim), sms });
+  return res.json({ ok: true, id, fim: hhmmDe(fim), sms, extra });
 }
 app.post('/aula-marcar', exigeDireccao, rota(async (req, res) => marcarAula(req, res, req.body || {})));
 app.post('/aula-estado', exigeDireccao, rota(async (req, res) => {
@@ -2601,7 +2617,18 @@ app.post('/aula-estado', exigeDireccao, rota(async (req, res) => {
   if (estado === 'feita' && a['Data'] > hojeMZ().data) return erro(res, 400, 'Esta aula ainda não aconteceu.');
   const mud = { 'Estado': estado }; if (b.notas !== undefined) mud['Notas'] = txt(b.notas, 300);
   await mudar('aulapratica', a._id, mud);
-  res.json({ ok: true, estado });
+  let sms = false;
+  if (estado === 'cancelada' && (a['Estado'] || 'marcada') === 'marcada') {
+    // a aula extra que ainda não foi paga deixa de ser devida
+    const ps = await procurarTodos('propina', daEscola(req.escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: a['Estudante'] }])).catch(() => []);
+    const ref = 'Aula prática extra · ' + dmCurto(a['Data']) + ' ' + a['Inicio'];
+    for (const p of ps.filter(x => x['Descricao'] === ref && x['Estado'] !== 'paga')) await mudar('propina', p._id, { 'Estado': 'anulada' }).catch(() => {});
+    if (b.sms !== false && a['Data'] >= hojeMZ().data) {
+      const [e, esc] = await Promise.all([obter('estudante', a['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null)]);
+      if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': a sua aula pratica de ' + dmCurto(a['Data']) + ' as ' + a['Inicio'] + ' foi cancelada. A escola vai marcar outra data.')).ok;
+    }
+  }
+  res.json({ ok: true, estado, sms });
 }));
 
 // ============================================================
@@ -2621,6 +2648,7 @@ app.post('/exames', exigeDireccao, rota(async (req, res) => {
   const hoje = hojeMZ().data;
   res.json({ ok: true, hoje,
     exames: xs.map(x => exameOut(x, D)).sort((a, b) => (b.data.localeCompare(a.data)) || (b.tentativa - a.tentativa) || b.hora.localeCompare(a.hora)),
+    instrutores: taxaPorInstrutor(xs, D),
     inscricoes: D.ins.filter(i => (i['Estado'] || 'activa') === 'activa').map(i => {
       const meus = xs.filter(x => x['Inscricao'] === i._id);
       return Object.assign({ id: i._id, nome: (D.EM[i['Estudante']] || {})['Nome'] || '', numero: (D.EM[i['Estudante']] || {})['Numero'] || '', categoria: i['Categoria'] || '',
@@ -2636,6 +2664,10 @@ app.post('/exame-marcar', exigeDireccao, rota(async (req, res) => {
   if (xs.some(x => x['Tipo'] === tipo && (x['Resultado'] || 'marcado') === 'marcado')) return erro(res, 409, 'Já há um ' + TIPO_EXAME[tipo].toLowerCase() + ' marcado para este instruendo. Registe primeiro o resultado.');
   if (tipo === 'conducao' && !xs.some(x => x['Tipo'] === 'codigo' && x['Resultado'] === 'aprovado')) return erro(res, 400, 'O instruendo ainda não foi aprovado no exame de código.');
   if (tipo === 'codigo' && xs.some(x => x['Tipo'] === 'codigo' && x['Resultado'] === 'aprovado')) return erro(res, 400, 'O instruendo já foi aprovado no exame de código.');
+  if (!b.forcar) {
+    const divida = await dividaDe(req.escola, i['Estudante']);
+    if (divida > 0) return res.status(409).json({ ok: false, divida, erro: 'O instruendo tem ' + mt(divida) + ' de prestações em atraso.' });
+  }
   const tentativa = xs.filter(x => x['Tipo'] === tipo && ['aprovado', 'reprovado', 'faltou'].includes(x['Resultado'])).length + 1;
   const id = await criar('exameconducao', { 'Escola': req.escola, 'Estudante': i['Estudante'], 'Inscricao': i._id, 'Tipo': tipo, 'Data': b.data, 'Hora': b.hora || '', 'Local': txt(b.local, 80), 'Resultado': 'marcado', 'Tentativa': tentativa, 'Notas': txt(b.notas, 300) });
   let sms = false;
@@ -2685,17 +2717,302 @@ app.post('/prof/aula-estado', exigeProfessor, rota(async (req, res) => {
   res.json({ ok: true, estado });
 }));
 
+// ============================================================
+//  ESCOLA DE CONDUÇÃO · PARTE 4 (v5.10)
+//  Treino do código · lembretes por SMS · processo e documentos · aulas teóricas · regras
+//  Bubble, tabelas novas:
+//   Pergunta Codigo: Escola (Escola) · Base (text) · Tema (text) · Pergunta (text) · Opcoes (text) · Correcta (number)
+//                    · Explicacao (text) · Imagem (text) · Activa (yes/no)
+//   Teste Codigo:    Escola (Escola) · Estudante (text) · Inscricao (text) · Data (date) · Acertos (number) · Total (number) · Erradas (text)
+//   Aula Teorica:    Escola (Escola) · Data (text) · Inicio (text) · Tema (text) · Instrutor (text) · Presentes (text)
+//  Bubble, campos novos:
+//   Aula Pratica: Lembrete (yes/no) · Exame Conducao: Lembrete (yes/no)
+//   Inscricao Conducao: Documentos (text) · Processo (text) · Licenca Numero (text) · Licenca Validade (date)
+//   Curso Conducao: Preco Aula Extra (number) · Escola: Docs Conducao (text)
+//  Render (opcionais): LEMBRETES_HORA (por defeito 18) · CODIGO_PRONTO (% para "pronto para o exame", por defeito 80)
+// ============================================================
+
+// ---------- treino do código ----------
+//  Banco de base do Gescolar: perguntas gerais de segurança e sinalização, sem números de lei (velocidades, taxas de álcool),
+//  para a escola completar com as suas. A escola pode esconder qualquer pergunta de base e criar as próprias.
+const BANCO_CODIGO = [
+  { id: 'g01', t: 'Sinais', i: 'stop', p: 'O que deve fazer perante este sinal?', o: ['Abrandar e passar se não vier ninguém', 'Parar sempre e só avançar quando for seguro', 'Buzinar e seguir'], c: 1, e: 'O sinal STOP obriga a parar sempre, mesmo que não venha ninguém. Só depois de parar avança, quando for seguro.' },
+  { id: 'g02', t: 'Sinais', i: 'ceder', p: 'O que indica este sinal?', o: ['Cedência de passagem', 'Proibido parar', 'Fim de prioridade da estrada'], c: 0, e: 'O triângulo invertido de bordo vermelho manda ceder a passagem aos veículos da outra via. Não obriga a parar se a via estiver livre.' },
+  { id: 'g03', t: 'Sinais', i: 'sentido_proibido', p: 'O que indica este sinal?', o: ['Estacionamento proibido', 'Sentido proibido: não pode entrar nesta via', 'Estrada com prioridade'], c: 1, e: 'O disco vermelho com uma barra branca horizontal é o sentido proibido. Não pode entrar na via por esse lado.' },
+  { id: 'g04', t: 'Sinais', i: 'perigo', p: 'Os sinais triangulares com bordo vermelho, com o vértice para cima, indicam:', o: ['Um perigo à frente', 'Uma obrigação', 'Um serviço (bomba, hospital)'], c: 0, e: 'Os triângulos com bordo vermelho são sinais de perigo: avisam de uma situação que exige atenção redobrada e, normalmente, abrandar.' },
+  { id: 'g05', t: 'Sinais', i: 'proibicao', p: 'Os sinais circulares com bordo vermelho indicam, em regra:', o: ['Perigo', 'Proibição', 'Informação turística'], c: 1, e: 'Os sinais redondos com bordo vermelho proíbem alguma coisa: entrar, virar, ultrapassar, estacionar, entre outras.' },
+  { id: 'g06', t: 'Regras', p: 'Em Moçambique, os veículos circulam:', o: ['Pela esquerda', 'Pela direita', 'Pelo centro da faixa'], c: 0, e: 'Moçambique tem circulação pela esquerda. Mantenha-se o mais à esquerda possível da sua faixa.' },
+  { id: 'g07', t: 'Regras', p: 'Numa estrada com circulação pela esquerda, a ultrapassagem faz-se normalmente:', o: ['Pela direita do veículo que vai ultrapassar', 'Pela esquerda do veículo que vai ultrapassar', 'Por qualquer lado, desde que seja rápido'], c: 0, e: 'Com circulação pela esquerda, ultrapassa-se pela direita, depois de verificar espelhos, sinalizar e confirmar que há espaço e visibilidade.' },
+  { id: 'g08', t: 'Regras', p: 'Numa rotunda, em Moçambique, circula-se:', o: ['No sentido dos ponteiros do relógio', 'No sentido contrário aos ponteiros do relógio', 'No sentido que tiver menos trânsito'], c: 0, e: 'Com circulação pela esquerda, contorna-se a rotunda no sentido dos ponteiros do relógio.' },
+  { id: 'g09', t: 'Semáforos', i: 'semaforo_vermelho', p: 'Com a luz vermelha acesa, deve:', o: ['Parar antes da linha de paragem', 'Passar devagar se não vier ninguém', 'Buzinar e avançar'], c: 0, e: 'A luz vermelha obriga a parar antes da linha de paragem e esperar pela luz verde.' },
+  { id: 'g10', t: 'Semáforos', i: 'semaforo_amarelo', p: 'A luz amarela fixa acende-se quando está a chegar ao semáforo. Deve:', o: ['Acelerar para passar antes do vermelho', 'Parar, a não ser que já esteja tão perto que não consiga parar em segurança', 'Avançar sempre, porque ainda não está vermelho'], c: 1, e: 'O amarelo fixo manda parar. Só pode continuar se já estiver tão perto que uma travagem brusca seria perigosa.' },
+  { id: 'g11', t: 'Regras', p: 'Antes de mudar de faixa ou de direcção, deve:', o: ['Sinalizar com o pisca com antecedência e confirmar nos espelhos', 'Sinalizar só depois de mudar', 'Não precisa de sinalizar se não vir ninguém'], c: 0, e: 'Sinalize sempre com antecedência e confirme espelhos e ângulo morto antes de mudar de faixa ou de direcção.' },
+  { id: 'g12', t: 'Regras', p: 'Uma linha contínua no meio da estrada significa que:', o: ['Não a pode pisar nem transpor', 'Pode ultrapassar se tiver pressa', 'Indica um lugar de estacionamento'], c: 0, e: 'A linha contínua não pode ser pisada nem transposta. Normalmente marca zonas onde ultrapassar é perigoso.' },
+  { id: 'g13', t: 'Regras', p: 'É proibido parar ou estacionar:', o: ['Em curvas e lombas com pouca visibilidade', 'Num parque de estacionamento', 'Numa garagem própria'], c: 0, e: 'Parar em curvas e lombas sem visibilidade obriga os outros a desviar sem ver o que vem, e causa acidentes graves.' },
+  { id: 'g14', t: 'Peões', p: 'Um peão está a atravessar na passadeira. Deve:', o: ['Buzinar para ele se apressar', 'Parar e deixá-lo atravessar em segurança', 'Contorná-lo devagar'], c: 1, e: 'Na passadeira, o peão que já está a atravessar tem sempre de ser respeitado: pare e espere que termine.' },
+  { id: 'g15', t: 'Regras', p: 'Ouve a sirene de uma ambulância em marcha de urgência atrás de si. Deve:', o: ['Facilitar a passagem, encostando-se quando for seguro', 'Manter a velocidade e a faixa', 'Acelerar para ficar à frente dela'], c: 0, e: 'Os veículos de emergência com sinais luminosos e sonoros ligados têm prioridade. Facilite a passagem sem manobras bruscas.' },
+  { id: 'g16', t: 'Segurança', p: 'Quem deve usar o cinto de segurança?', o: ['Só o condutor', 'O condutor e todos os passageiros, nos lugares com cinto', 'Só os passageiros da frente'], c: 1, e: 'O cinto protege todos os ocupantes. Num choque, um passageiro de trás sem cinto pode ferir gravemente quem vai à frente.' },
+  { id: 'g17', t: 'Segurança', p: 'Pode segurar o telemóvel na mão enquanto conduz?', o: ['Não', 'Sim, em rectas', 'Sim, se for uma chamada curta'], c: 0, e: 'Segurar o telemóvel tira as mãos e a atenção da condução. É proibido e é uma das grandes causas de acidentes.' },
+  { id: 'g18', t: 'Segurança', p: 'O álcool, mesmo em pouca quantidade:', o: ['Melhora os reflexos', 'Aumenta o tempo de reacção e prejudica a condução', 'Não tem efeito se a pessoa tiver comido'], c: 1, e: 'O álcool atrasa as reacções, reduz a visão e dá falsa confiança. A única forma segura é não beber antes de conduzir.' },
+  { id: 'g19', t: 'Segurança', p: 'Para que serve a distância de segurança ao veículo da frente?', o: ['Para conseguir parar sem bater se ele travar de repente', 'Para ultrapassar mais depressa', 'Não tem utilidade dentro das cidades'], c: 0, e: 'A distância de segurança dá-lhe tempo para reagir e travar. Deve ser maior com chuva, à noite e a velocidades mais altas.' },
+  { id: 'g20', t: 'Segurança', p: 'Com chuva forte, deve:', o: ['Reduzir a velocidade e aumentar a distância de segurança', 'Manter a velocidade, com os máximos ligados', 'Travar a fundo nas curvas'], c: 0, e: 'Com chuva, o piso escorrega e a visibilidade diminui: a distância de travagem aumenta. Abrande e afaste-se do veículo da frente.' },
+  { id: 'g21', t: 'Segurança', p: 'Numa viagem longa, começa a sentir sono. O que deve fazer?', o: ['Abrir a janela e continuar', 'Parar num local seguro e descansar', 'Acelerar para chegar mais cedo'], c: 1, e: 'O sono ao volante é muito perigoso. Abrir a janela ou pôr música não resolve: pare num local seguro e descanse.' },
+  { id: 'g22', t: 'Segurança', p: 'Pneus muito gastos:', o: ['Aumentam a distância de travagem e o risco de derrapar', 'Não afectam a condução', 'Melhoram a aderência'], c: 0, e: 'Pneus gastos agarram menos ao piso, sobretudo com chuva. Verifique o estado e a pressão com regularidade.' },
+  { id: 'g23', t: 'Segurança', p: 'Antes de arrancar com o veículo, deve:', o: ['Verificar os espelhos e o ângulo morto', 'Buzinar para avisar', 'Acelerar a fundo'], c: 0, e: 'Antes de arrancar, confirme espelhos e ângulo morto: peões, motas e bicicletas podem estar escondidos.' },
+  { id: 'g24', t: 'Segurança', p: 'Crianças pequenas devem viajar:', o: ['Ao colo de um passageiro da frente', 'Numa cadeira ou sistema de retenção adequado à idade, no banco de trás', 'Soltas no banco de trás'], c: 1, e: 'Ao colo, num choque, a criança é projectada. Use sempre um sistema de retenção adequado, de preferência no banco de trás.' },
+  { id: 'g25', t: 'Segurança', p: 'À noite, ao cruzar-se com outro veículo, deve:', o: ['Passar dos máximos para os médios', 'Manter os máximos ligados', 'Desligar as luzes'], c: 0, e: 'Os máximos encandeiam quem vem de frente. Mude para os médios ao cruzar-se ou ao seguir outro veículo de perto.' },
+  { id: 'g26', t: 'Segurança', p: 'Vê gado a atravessar a estrada. Deve:', o: ['Abrandar e, se for preciso, parar até a estrada estar livre', 'Buzinar e passar entre os animais', 'Acelerar para passar antes deles'], c: 0, e: 'Os animais têm reacções imprevisíveis. Abrande, pare se for preciso e só avance com a estrada livre.' },
+  { id: 'g27', t: 'Avarias', p: 'O carro avariou na estrada. Para avisar os outros condutores, deve:', o: ['Colocar o triângulo de pré-sinalização bem visível, antes do carro', 'Deixar o carro sem qualquer aviso', 'Pôr só o rádio alto'], c: 0, e: 'O triângulo de pré-sinalização avisa os outros com antecedência. Ligue também os quatro piscas e saia do carro pelo lado seguro.' },
+  { id: 'g28', t: 'Primeiros socorros', p: 'Chega a um acidente com feridos. A primeira coisa a fazer é:', o: ['Tirar logo os feridos dos carros', 'Sinalizar o local, proteger-se e pedir ajuda', 'Dar água aos feridos'], c: 1, e: 'Primeiro evite um segundo acidente: sinalize e proteja-se. Depois peça ajuda. Não mexa nos feridos sem necessidade.' },
+  { id: 'g29', t: 'Primeiros socorros', p: 'Um ferido pode ter uma lesão na coluna. Deve:', o: ['Sentá-lo para respirar melhor', 'Não o mexer, a não ser que haja perigo imediato, como fogo', 'Levantá-lo e levá-lo a andar'], c: 1, e: 'Mexer num ferido com lesão na coluna pode causar paralisia. Só o retire se houver perigo imediato.' },
+  { id: 'g30', t: 'Motociclos', p: 'Num motociclo, o capacete deve ser usado por:', o: ['Só o condutor', 'O condutor e o passageiro', 'Ninguém, dentro das cidades'], c: 1, e: 'O capacete protege a cabeça de quem conduz e de quem vai atrás. Use-o sempre, bem apertado.' }
+];
+const SINAIS_CODIGO = ['stop', 'ceder', 'sentido_proibido', 'perigo', 'proibicao', 'semaforo_vermelho', 'semaforo_amarelo'];
+const CODIGO_PRONTO = Math.max(50, Math.min(100, Number(process.env.CODIGO_PRONTO || 80)));
+const CODIGO_PERGUNTAS = 20;
+const lerJSON = (t, padrao) => { try { const v = JSON.parse(t || ''); return v == null ? padrao : v; } catch (e) { return padrao; } };
+async function bancoCodigo(escola) {
+  const linhas = await procurarTodos('perguntacodigo', daEscola(escola), 3000).catch(() => []);
+  const ocultas = new Set(linhas.filter(x => x['Base'] && x['Activa'] === false).map(x => x['Base']));
+  const base = BANCO_CODIGO.map(q => ({ id: q.id, base: true, tema: q.t, pergunta: q.p, opcoes: q.o, correcta: q.c, explicacao: q.e, imagem: q.i || '', activa: !ocultas.has(q.id) }));
+  const proprias = linhas.filter(x => !x['Base']).map(x => {
+    const o = lerJSON(x['Opcoes'], []);
+    return { id: x._id, base: false, tema: x['Tema'] || 'Geral', pergunta: x['Pergunta'] || '', opcoes: Array.isArray(o) ? o.map(String) : [], correcta: Number(x['Correcta'] || 0), explicacao: x['Explicacao'] || '', imagem: x['Imagem'] || '', activa: x['Activa'] !== false };
+  }).filter(q => q.opcoes.length >= 2 && q.pergunta);
+  return base.concat(proprias);
+}
+const pctDe = t => Number(t['Total'] || 0) ? Math.round(Number(t['Acertos'] || 0) * 100 / Number(t['Total'])) : 0;
+function resumoCodigo(testes) {
+  const L = testes.slice().sort((a, b) => String(b['Data'] || b['Created Date'] || '').localeCompare(String(a['Data'] || a['Created Date'] || '')));
+  const ult3 = L.slice(0, 3).map(pctDe), media = ult3.length ? Math.round(ult3.reduce((a, b) => a + b, 0) / ult3.length) : null;
+  return { testes: L.length, ultimo: L[0] ? { pct: pctDe(L[0]), data: L[0]['Data'] || L[0]['Created Date'] || null } : null, media, pronto: L.length >= 3 && media >= CODIGO_PRONTO, alvo: CODIGO_PRONTO };
+}
+app.post('/codigo-perguntas', exigeDireccao, rota(async (req, res) => {
+  const L = await bancoCodigo(req.escola);
+  res.json({ ok: true, perguntas: L, sinais: SINAIS_CODIGO, activas: L.filter(q => q.activa).length, por_teste: CODIGO_PERGUNTAS });
+}));
+app.post('/codigo-pergunta-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const pergunta = txt(b.pergunta, 400), opcoes = (Array.isArray(b.opcoes) ? b.opcoes : []).map(o => txt(o, 200)).filter(Boolean);
+  if (pergunta.length < 8) return erro(res, 400, 'Escreva a pergunta.');
+  if (opcoes.length < 2 || opcoes.length > 4) return erro(res, 400, 'Escreva entre 2 e 4 respostas.');
+  const correcta = Math.round(Number(b.correcta));
+  if (!(correcta >= 0 && correcta < opcoes.length)) return erro(res, 400, 'Escolha qual é a resposta certa.');
+  const imagem = txt(b.imagem, 500);
+  if (imagem && !SINAIS_CODIGO.includes(imagem) && !/^https:\/\/\S+$/i.test(imagem)) return erro(res, 400, 'A imagem tem de ser um dos sinais da lista ou um endereço que comece por https://');
+  const campos = { 'Escola': req.escola, 'Base': '', 'Tema': txt(b.tema, 40) || 'Geral', 'Pergunta': pergunta, 'Opcoes': JSON.stringify(opcoes), 'Correcta': correcta, 'Explicacao': txt(b.explicacao, 600), 'Imagem': imagem, 'Activa': true };
+  let id = b.id ? String(b.id) : null;
+  if (id) { const x = await daMinhaEscola('perguntacodigo', id, req.escola); if (x['Base']) return erro(res, 400, 'As perguntas de base não se editam: esconda-a e crie uma sua.'); await mudar('perguntacodigo', id, campos); }
+  else id = await criar('perguntacodigo', campos);
+  res.json({ ok: true, id });
+}));
+app.post('/codigo-pergunta-estado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, id = String(b.id || ''), activa = b.activa !== false;
+  if (BANCO_CODIGO.some(q => q.id === id)) {
+    const ja = (await procurarTodos('perguntacodigo', daEscola(req.escola).concat([{ key: 'Base', constraint_type: 'equals', value: id }]))).filter(x => x['Escola'] === req.escola)[0];
+    if (ja) await mudar('perguntacodigo', ja._id, { 'Activa': activa });
+    else if (!activa) await criar('perguntacodigo', { 'Escola': req.escola, 'Base': id, 'Activa': false, 'Pergunta': '(pergunta de base escondida)' });
+  } else {
+    const x = await daMinhaEscola('perguntacodigo', id, req.escola);
+    await mudar('perguntacodigo', x._id, { 'Activa': activa });
+  }
+  res.json({ ok: true, activa });
+}));
+app.post('/codigo-resultados', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [ins, ests, ts] = await Promise.all([procurarTodos('inscricaoconducao', f), procurarTodos('estudante', f), procurarTodos('testecodigo', f, 20000).catch(() => [])]);
+  const EM = Object.fromEntries(ests.map(e => [e._id, e]));
+  const mes = hojeMZ().data.slice(0, 7);
+  res.json({ ok: true, alvo: CODIGO_PRONTO, testes_mes: ts.filter(t => String(t['Data'] || t['Created Date'] || '').slice(0, 7) === mes).length,
+    instruendos: ins.filter(i => (i['Estado'] || 'activa') === 'activa').map(i => Object.assign({ id: i._id, nome: (EM[i['Estudante']] || {})['Nome'] || '', numero: (EM[i['Estudante']] || {})['Numero'] || '', categoria: i['Categoria'] || '' },
+      resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)))).sort((a, b) => (b.media == null ? -1 : b.media) - (a.media == null ? -1 : a.media) || a.nome.localeCompare(b.nome, 'pt')) });
+}));
+async function inscricaoActivaDe(escola, estId) {
+  const l = await procurarTodos('inscricaoconducao', daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: estId }]));
+  return l.filter(i => (i['Estado'] || 'activa') === 'activa')[0] || null;
+}
+function embaralhar(a) { const x = a.slice(); for (let i = x.length - 1; i > 0; i--) { const j = crypto.randomInt(0, i + 1); [x[i], x[j]] = [x[j], x[i]]; } return x; }
+app.post('/p/codigo-teste', exigePortal, rota(async (req, res) => {
+  const est = String((req.body || {}).estudante || '');
+  if (!req.educandos.includes(est)) return erro(res, 403, 'Este instruendo não pertence a esta conta.');
+  if (travao('codigo|' + est, 30, 60)) return erro(res, 429, 'Já fez muitos testes na última hora. Descanse um pouco e volte mais tarde.');
+  const i = await inscricaoActivaDe(req.escola, est);
+  if (!i) return erro(res, 400, 'O treino do código está disponível durante o curso de condução.');
+  const L = (await bancoCodigo(req.escola)).filter(q => q.activa);
+  if (L.length < 5) return erro(res, 400, 'A escola ainda está a preparar as perguntas do código.');
+  const escolhidas = embaralhar(L).slice(0, CODIGO_PERGUNTAS);
+  const token = assinar({ u: est, t: 'codigo', i: i._id, q: escolhidas.map(q => q.id) }, 1);
+  res.json({ ok: true, token, perguntas: escolhidas.map(q => ({ id: q.id, tema: q.tema, pergunta: q.pergunta, opcoes: q.opcoes, imagem: q.imagem })) });
+}));
+app.post('/p/codigo-corrigir', exigePortal, rota(async (req, res) => {
+  const b = req.body || {}, est = String(b.estudante || '');
+  if (!req.educandos.includes(est)) return erro(res, 403, 'Este instruendo não pertence a esta conta.');
+  const t = verificar(String(b.token || ''));
+  if (!t || t.t !== 'codigo' || t.u !== est || !Array.isArray(t.q)) return erro(res, 400, 'Este teste expirou. Comece um novo.');
+  const M = Object.fromEntries((await bancoCodigo(req.escola)).map(q => [q.id, q]));
+  const resp = (b.respostas && typeof b.respostas === 'object') ? b.respostas : {};
+  const correccao = t.q.map(id => M[id]).filter(Boolean).map(q => {
+    const r = resp[q.id], esc = (r === null || r === undefined || r === '') ? null : Number(r);
+    return { id: q.id, tema: q.tema, pergunta: q.pergunta, opcoes: q.opcoes, imagem: q.imagem, explicacao: q.explicacao, certa: q.correcta, escolhida: esc, acertou: esc === q.correcta };
+  });
+  const acertos = correccao.filter(x => x.acertou).length, total = correccao.length;
+  let guardado = true;
+  try {
+    await criar('testecodigo', { 'Escola': req.escola, 'Estudante': est, 'Inscricao': t.i, 'Data': new Date().toISOString(), 'Acertos': acertos, 'Total': total, 'Erradas': JSON.stringify(correccao.filter(x => !x.acertou).map(x => x.id)) });
+  } catch (e) { guardado = false; console.error('[codigo] não guardou o teste:', e.message); }
+  const ts = await procurarTodos('testecodigo', daEscola(req.escola).concat([{ key: 'Inscricao', constraint_type: 'equals', value: t.i }])).catch(() => []);
+  res.json({ ok: true, acertos, total, pct: total ? Math.round(acertos * 100 / total) : 0, correccao, guardado, resumo: resumoCodigo(ts) });
+}));
+
+// ---------- processo, documentos e licença de aprendizagem ----------
+const DOCS_PADRAO = ['Bilhete de Identidade (BI)', 'Atestado médico', 'Fotografias tipo passe'];
+const PROCESSO = { documentos: 'A reunir documentos', submetido: 'Processo entregue no INATRO', licenca: 'Licença de aprendizagem emitida', carta: 'Carta emitida' };
+async function docsDaEscola(escola, escRaw) {
+  const e = escRaw || await obter('escola', escola).catch(() => null);
+  const l = lerJSON(e && e['Docs Conducao'], null);
+  return Array.isArray(l) && l.length ? l.map(String) : DOCS_PADRAO.slice();
+}
+function processoOut(i, docs) {
+  const d = lerJSON(i['Documentos'], {}), entregues = docs.filter(n => d && d[n]);
+  const val = i['Licenca Validade'] || null;
+  return { documentos: Object.fromEntries(docs.map(n => [n, !!(d && d[n])])), docs_entregues: entregues.length, docs_total: docs.length, faltam: docs.filter(n => !(d && d[n])),
+    processo: PROCESSO[i['Processo']] ? i['Processo'] : 'documentos', processo_nome: PROCESSO[i['Processo']] || PROCESSO.documentos,
+    licenca: { numero: i['Licenca Numero'] || '', validade: val, dias: diasAte(val) } };
+}
+app.post('/conducao-docs', exigeDireccao, rota(async (req, res) => {
+  res.json({ ok: true, documentos: await docsDaEscola(req.escola), padrao: DOCS_PADRAO, processos: PROCESSO });
+}));
+app.post('/conducao-docs-guardar', exigeDireccao, rota(async (req, res) => {
+  const l = [...new Set((Array.isArray((req.body || {}).documentos) ? req.body.documentos : []).map(x => txt(x, 60)).filter(Boolean))];
+  if (!l.length) return erro(res, 400, 'Escreva pelo menos um documento.');
+  if (l.length > 15) return erro(res, 400, 'No máximo 15 documentos.');
+  await mudar('escola', req.escola, { 'Docs Conducao': JSON.stringify(l) });
+  res.json({ ok: true, documentos: l });
+}));
+app.post('/inscricao-processo', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const i = await daMinhaEscola('inscricaoconducao', String(b.id || ''), req.escola);
+  const docs = await docsDaEscola(req.escola), entregue = {};
+  docs.forEach(n => { if (b.documentos && b.documentos[n]) entregue[n] = true; });
+  const mud = { 'Documentos': JSON.stringify(entregue), 'Processo': PROCESSO[b.processo] ? b.processo : 'documentos', 'Licenca Numero': txt(b.licenca_numero, 40) };
+  if (b.licenca_validade && !isNaN(Date.parse(b.licenca_validade))) mud['Licenca Validade'] = new Date(b.licenca_validade + 'T23:59:00Z').toISOString();
+  await mudar('inscricaoconducao', i._id, mud);
+  res.json({ ok: true, processo: processoOut(Object.assign({}, i, mud), docs) });
+}));
+
+// ---------- aulas teóricas: presenças ----------
+const teoricaOut = (t, D) => { const p = lerJSON(t['Presentes'], []); const ids = Array.isArray(p) ? p : [];
+  return { id: t._id, data: t['Data'] || '', inicio: t['Inicio'] || '', tema: t['Tema'] || '', instrutor_id: t['Instrutor'] || '', instrutor: ((D.PM[t['Instrutor']] || {})['Nome']) || '',
+    presentes: ids, nomes: ids.map(id => (D.EM[(D.IM[id] || {})['Estudante']] || {})['Nome']).filter(Boolean) }; };
+app.post('/teoricas', exigeDireccao, rota(async (req, res) => {
+  const [D, ts] = await Promise.all([dadosAulas(req.escola), procurarTodos('aulateorica', daEscola(req.escola), 5000)]);
+  const conta = {}; ts.forEach(t => (lerJSON(t['Presentes'], []) || []).forEach(id => { conta[id] = (conta[id] || 0) + 1; }));
+  res.json({ ok: true, hoje: hojeMZ().data,
+    aulas: ts.map(t => teoricaOut(t, D)).sort((a, b) => (b.data + b.inicio).localeCompare(a.data + a.inicio)).slice(0, 200),
+    instrutores: D.profs.filter(p => p['Activo'] !== false).map(p => ({ id: p._id, nome: p['Nome'] || '' })).sort((x, y) => x.nome.localeCompare(y.nome, 'pt')),
+    inscricoes: D.ins.filter(i => (i['Estado'] || 'activa') === 'activa').map(i => ({ id: i._id, nome: (D.EM[i['Estudante']] || {})['Nome'] || '', numero: (D.EM[i['Estudante']] || {})['Numero'] || '', categoria: i['Categoria'] || '',
+      feitas: conta[i._id] || 0, total: Number((D.CM[i['Curso']] || {})['Aulas Teoricas'] || 0) })).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/teorica-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  if (!dataOk(b.data)) return erro(res, 400, 'Escolha a data da aula.');
+  if (b.data > hojeMZ().data) return erro(res, 400, 'Registe a aula teórica no dia em que acontece, com quem esteve presente.');
+  if (b.inicio && !HHMM.test(b.inicio)) return erro(res, 400, 'Hora inválida.');
+  const D = await dadosAulas(req.escola);
+  const presentes = [...new Set((Array.isArray(b.presentes) ? b.presentes : []).map(String))].filter(id => D.IM[id] && D.IM[id]['Escola'] === req.escola);
+  if (!presentes.length) return erro(res, 400, 'Marque quem esteve presente.');
+  if (b.instrutor && !D.PM[String(b.instrutor)]) return erro(res, 400, 'Instrutor inválido.');
+  const campos = { 'Escola': req.escola, 'Data': b.data, 'Inicio': b.inicio || '', 'Tema': txt(b.tema, 120), 'Instrutor': b.instrutor ? String(b.instrutor) : '', 'Presentes': JSON.stringify(presentes) };
+  let id = b.id ? String(b.id) : null;
+  if (id) { await daMinhaEscola('aulateorica', id, req.escola); await mudar('aulateorica', id, campos); } else id = await criar('aulateorica', campos);
+  res.json({ ok: true, id, presentes: presentes.length });
+}));
+app.post('/teorica-apagar', exigeDireccao, rota(async (req, res) => {
+  const t = await daMinhaEscola('aulateorica', String((req.body || {}).id || ''), req.escola);
+  await apagar('aulateorica', t._id);
+  res.json({ ok: true });
+}));
+
+// ---------- lembretes automáticos por SMS (véspera da aula prática e do exame) ----------
+const LEMBRETES_HORA = Math.max(8, Math.min(21, Number(process.env.LEMBRETES_HORA || 18)));
+const lembretesFeitos = new Set();   // protege contra envios repetidos se o campo Lembrete ainda não existir no Bubble
+let lembretesAgora = false;
+async function lembretesConducao() {
+  if (lembretesAgora || !BUBBLE_BASE || !BUBBLE_TOKEN) return;
+  const h = new Date(Date.now() + 2 * 3600e3).getUTCHours();
+  if (h < LEMBRETES_HORA || h >= 22) return;
+  lembretesAgora = true;
+  try {
+    const amanha = hojeMZ(1).data, dia = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'][new Date(amanha + 'T12:00:00Z').getUTCDay()];
+    const [aulas, exames] = await Promise.all([
+      procurarTodos('aulapratica', [{ key: 'Data', constraint_type: 'equals', value: amanha }, { key: 'Estado', constraint_type: 'equals', value: 'marcada' }], 5000).catch(() => []),
+      procurarTodos('exameconducao', [{ key: 'Data', constraint_type: 'equals', value: amanha }, { key: 'Resultado', constraint_type: 'equals', value: 'marcado' }], 2000).catch(() => [])]);
+    if (!aulas.length && !exames.length) return;
+    const cache = {}, pega = async (tipo, id) => { const k = tipo + id; if (!(k in cache)) cache[k] = id ? await obter(tipo, id).catch(() => null) : null; return cache[k]; };
+    let n = 0;
+    for (const a of aulas.filter(x => x['Lembrete'] !== true && !lembretesFeitos.has(x._id))) {
+      lembretesFeitos.add(a._id);
+      const [esc, e, p, v] = await Promise.all([pega('escola', a['Escola']), pega('estudante', a['Estudante']), pega('professor', a['Instrutor']), pega('viatura', a['Viatura'])]);
+      if (!esc || esc['Estado'] === 'suspensa' || !e || tel9(e['Telefone']).length !== 9) continue;
+      const r = await enviarSMS([e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dia + ' ' + dmCurto(amanha) + ') tem aula pratica das ' + a['Inicio'] + ' as ' + a['Fim'] + (p ? ' com ' + String(p['Nome'] || '').split(' ')[0] : '') + (v ? ', viatura ' + v['Matricula'] : '') + '. Se nao puder vir, avise a escola.');
+      if (r.ok) { n++; await mudar('aulapratica', a._id, { 'Lembrete': true }).catch(() => {}); }
+    }
+    // agenda do dia seguinte para cada instrutor
+    const porInst = {};
+    aulas.forEach(a => { if (a['Instrutor']) (porInst[a['Instrutor']] = porInst[a['Instrutor']] || []).push(a); });
+    for (const [pid, L] of Object.entries(porInst)) {
+      const k = 'inst|' + pid + '|' + amanha; if (lembretesFeitos.has(k)) continue; lembretesFeitos.add(k);
+      const p = await pega('professor', pid), esc = await pega('escola', L[0]['Escola']);
+      if (!p || !esc || esc['Estado'] === 'suspensa' || tel9(p['Telefone']).length !== 9) continue;
+      L.sort((x, y) => String(x['Inicio']).localeCompare(String(y['Inicio'])));
+      const r = await enviarSMS([p['Telefone']], (esc['Nome'] || 'Escola') + ': amanha (' + dia + ' ' + dmCurto(amanha) + ') tem ' + L.length + ' aula(s) pratica(s). A primeira e as ' + L[0]['Inicio'] + '. Veja a agenda no Gescolar.');
+      if (r.ok) n++;
+    }
+    for (const x of exames.filter(z => z['Lembrete'] !== true && !lembretesFeitos.has(z._id))) {
+      lembretesFeitos.add(x._id);
+      const [esc, e] = await Promise.all([pega('escola', x['Escola']), pega('estudante', x['Estudante'])]);
+      if (!esc || esc['Estado'] === 'suspensa' || !e || tel9(e['Telefone']).length !== 9) continue;
+      const r = await enviarSMS([e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dmCurto(amanha) + ') tem ' + (TIPO_EXAME[x['Tipo']] || 'exame').toLowerCase() + (x['Hora'] ? ' as ' + x['Hora'] : '') + (x['Local'] ? ', ' + String(x['Local']).slice(0, 50) : '') + '. Leve o BI e chegue cedo. Boa sorte!');
+      if (r.ok) { n++; await mudar('exameconducao', x._id, { 'Lembrete': true }).catch(() => {}); }
+    }
+    if (n) console.log('[lembretes] ' + n + ' SMS enviados para ' + amanha);
+    if (lembretesFeitos.size > 20000) lembretesFeitos.clear();
+  } finally { lembretesAgora = false; }
+}
+setInterval(() => { lembretesConducao().catch(e => console.error('[lembretes]', e.message)); }, 15 * 60e3);
+setTimeout(() => { lembretesConducao().catch(e => console.error('[lembretes]', e.message)); }, 60e3);
+
+// ---------- regras: dívida antes do exame, aula extra e taxa de aprovação por instrutor ----------
+async function dividaDe(escola, estId) {
+  const [ps, esc] = await Promise.all([procurarTodos('propina', daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: estId }])), resumoEscola(escola)]);
+  const regras = (esc && esc.regras) || {};
+  return ps.filter(p => p['Estado'] !== 'anulada').map(p => calcPropina(p, regras)).filter(c => c.estado === 'atrasada').reduce((x, c) => x + c.total, 0);
+}
+function taxaPorInstrutor(xs, D) {
+  const out = {};
+  xs.filter(x => x['Tipo'] === 'conducao' && ['aprovado', 'reprovado'].includes(x['Resultado'])).forEach(x => {
+    const conta = {}; D.aulas.filter(a => a['Inscricao'] === x['Inscricao'] && a['Estado'] === 'feita' && a['Instrutor']).forEach(a => { conta[a['Instrutor']] = (conta[a['Instrutor']] || 0) + 1; });
+    const pid = Object.keys(conta).sort((a, b) => conta[b] - conta[a])[0]; if (!pid) return;
+    const o = out[pid] = out[pid] || { id: pid, nome: (D.PM[pid] || {})['Nome'] || '', exames: 0, aprovados: 0 };
+    o.exames++; if (x['Resultado'] === 'aprovado') o.aprovados++;
+  });
+  return Object.values(out).map(o => Object.assign(o, { taxa: Math.round(o.aprovados * 100 / o.exames) })).sort((a, b) => b.taxa - a.taxa || b.exames - a.exames);
+}
+
 // ---------- portal: o percurso do instruendo ----------
 async function conducaoDoEstudante(escola, estId, cache) {
   const f = daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: estId }]);
   const ins = await procurarTodos('inscricaoconducao', f);
   if (!ins.length) return null;
   const i = ins.filter(x => (x['Estado'] || 'activa') === 'activa')[0] || ins.sort((a, b) => String(b['Created Date'] || '').localeCompare(String(a['Created Date'] || '')))[0];
-  const [c, aps, xs] = await Promise.all([obter('cursoconducao', i['Curso']).catch(() => null), procurarTodos('aulapratica', f, 2000), procurarTodos('exameconducao', f, 200)]);
+  const [c, aps, xs, ts, teo, docs] = await Promise.all([obter('cursoconducao', i['Curso']).catch(() => null), procurarTodos('aulapratica', f, 2000), procurarTodos('exameconducao', f, 200),
+    procurarTodos('testecodigo', f, 500).catch(() => []), procurarTodos('aulateorica', daEscola(escola), 5000).catch(() => []), docsDaEscola(escola)]);
+  const teoFeitas = teo.filter(t => (lerJSON(t['Presentes'], []) || []).includes(i._id)).length;
   if (!cache.profs) cache.profs = Object.fromEntries((await procurarTodos('professor', daEscola(escola))).map(p => [p._id, p['Nome'] || '']));
   if (!cache.vias) cache.vias = Object.fromEntries((await procurarTodos('viatura', daEscola(escola))).map(v => [v._id, v]));
   const minhas = aps.filter(a => a['Inscricao'] === i._id), hoje = hojeMZ().data;
-  return { categoria: i['Categoria'] || '', curso: (c && c['Nome']) || '', estado: i['Estado'] || 'activa', teoricas: Number((c && c['Aulas Teoricas']) || 0),
+  return { categoria: i['Categoria'] || '', curso: (c && c['Nome']) || '', estado: i['Estado'] || 'activa', teoricas: Number((c && c['Aulas Teoricas']) || 0), teoricas_feitas: teoFeitas,
+    codigo: resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)), processo: processoOut(i, docs),
     praticas: { feitas: minhas.filter(a => a['Estado'] === 'feita').length, faltou: minhas.filter(a => a['Estado'] === 'faltou').length, total: Number((c && c['Aulas Praticas']) || 0), minutos: minhas.filter(a => a['Estado'] === 'feita').reduce((x, a) => x + Number(a['Minutos'] || 0), 0) },
     proximas: minhas.filter(a => a['Estado'] === 'marcada' && a['Data'] >= hoje).sort((a, b) => (a['Data'] + a['Inicio']).localeCompare(b['Data'] + b['Inicio'])).slice(0, 10)
       .map(a => ({ data: a['Data'], inicio: a['Inicio'], fim: a['Fim'], instrutor: cache.profs[a['Instrutor']] || '', viatura: (cache.vias[a['Viatura']] || {})['Matricula'] || '', modelo: (cache.vias[a['Viatura']] || {})['Marca Modelo'] || '' })),
