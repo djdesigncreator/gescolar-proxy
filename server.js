@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.8.4';
+const VERSAO = 'gescolar-proxy 5.8.5';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -603,6 +603,7 @@ const MOZ_SENHA = process.env.MOZ_SENHA || '';
 const MOZ_WALLET = process.env.MOZ_WALLET || '';
 const MOZ_CARD_PATH = (process.env.MOZ_CARD_PATH || 'payment').replace(/^\/+/, '');
 const MOZ_WEBHOOK_KEY = process.env.MOZ_WEBHOOK_KEY || '';
+const MOZ_MIN = 10;   // a MozPayment não aceita pagamentos abaixo de 10 MT
 const MOZ_NUM_258 = /^(1|sim|true|258)$/i.test(String(process.env.MOZ_NUMERO_258 || '').trim());   // 1 = enviar 25884xxxxxxx; vazio = 84xxxxxxx
 const numMoz = n9 => (MOZ_NUM_258 ? '258' : '') + n9;
 // corpo do pedido C2B (M-Pesa/e-Mola): exactamente estes 5 campos
@@ -672,6 +673,10 @@ async function mozPedido(caminho, corpo) {
     const st = String(achar(d, ['status', 'estado']) || '').toLowerCase(), cod = Number(achar(d, ['cod', 'code', 'codigo', 'status_code']));
     const falhou = /error|erro|fail|falh|invalid|inv[aá]lid|recus|negad|insuf/.test(st) || (isFinite(cod) && cod >= 400);
     if (falhou) { const e = new Error(achar(d, ['message', 'mensagem', 'msg', 'error', 'erro', 'detalhe']) || ('MozPayment: ' + (st || 'cod ' + cod))); e.moz = d; throw e; }
+    // erros "escondidos" num campo da resposta, ex.: { status:"success", response:{ valor_invalido:"Valor abaixo de 10MT…" } }
+    const procura = o => { if (!o || typeof o !== 'object') return null; for (const [k, v] of Object.entries(o)) { if (typeof v === 'string' && /invalid|erro|error|falh|insufic|recus|negad/i.test(k)) return v; if (v && typeof v === 'object') { const x = procura(v); if (x) return x; } } return null; };
+    const escondido = procura(d);
+    if (escondido) { const e = new Error(escondido); e.moz = d; throw e; }
     return d;
   }
   throw new Error('A MozPayment recusou o acesso (verifique MOZ_EMAIL e MOZ_SENHA).');
@@ -879,6 +884,7 @@ async function cobrarOnline(req, res) {
   if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
   if (!MOZ_WALLET) return erro(res, 500, 'O servidor ainda não tem a carteira configurada (MOZ_WALLET).');
   const { ps, total, multa } = await prepararCobranca(req, b.propinas);
+  if (total < MOZ_MIN) return erro(res, 400, 'O valor mínimo para pagar online é ' + MOZ_MIN + ' MT. Este pagamento é de ' + total + ' MT.');
   const est = ps[0].p['Estudante'] ? await obter('estudante', ps[0].p['Estudante']).catch(() => null) : null;
   const nome = txt(b.nome, 80) || (est && est['Nome']) || 'Encarregado';
   const numero = soDigitos(b.numero);
@@ -902,7 +908,8 @@ async function cobrarOnline(req, res) {
     }
     const d = await mozPedido('payment', corpoC2B(metodo, total, numero, nome));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    await mudar('pagamento', pagId, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
+    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
+    await mudar('pagamento', pagId, { 'Referencia': String(idp), 'Raw': JSON.stringify(d).slice(0, 4000) });
     res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
   } catch (e) {
     console.error('[pagar]', e.message);
@@ -1989,7 +1996,8 @@ app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
     }
     const d = await mozPedido('payment', corpoC2B(metodo, valor, numero, (e['Nome'] || 'Escola').slice(0, 80)));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    await mudar('subscricao', id, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
+    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
+    await mudar('subscricao', id, { 'Referencia': String(idp), 'Raw': JSON.stringify(d).slice(0, 4000) });
     res.json({ ok: true, id, total: valor, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.' });
   } catch (err) {
     console.error('[assinatura]', err.message);
@@ -2743,6 +2751,7 @@ app.post('/link-guardar', exigeDireccao, rota(async (req, res) => {
   if (nivel && !NIVEIS[nivel]) return erro(res, 400, 'Nível inválido.');
   const preco = Math.max(0, Math.round(num(b.preco, 0)));
   if (preco > 500000) return erro(res, 400, 'O preço parece demasiado alto. Verifique o valor.');
+  if (preco && preco < MOZ_MIN) return erro(res, 400, 'A taxa tem de ser 0 (gratuita) ou pelo menos ' + MOZ_MIN + ' MT: é o mínimo para pagar online.');
   const capa = String(b.capa || '');
   if (capa && (!/^data:image\/(png|jpe?g|webp);base64,/.test(capa) || capa.length > 420000)) return erro(res, 400, 'A imagem de capa tem de ser JPG, PNG ou WebP e ter no máximo 300 KB.');
   if (b.prazo && !dataOk(b.prazo)) return erro(res, 400, 'Data limite inválida.');
@@ -2851,6 +2860,7 @@ app.post('/pub/inscrever', rota(async (req, res) => {
   }
   const preco = Number(l['Preco'] || 0);
   const metodo = String(b.metodo || '').toLowerCase(), numero = tel9(b.numero);
+  if (preco && preco < MOZ_MIN) return erro(res, 400, 'Esta inscrição ainda não pode ser paga online: o valor mínimo é ' + MOZ_MIN + ' MT. Contacte a escola.');
   if (preco) {
     if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha como vai pagar: M-Pesa, e-Mola ou cartão.');
     if (!MOZ_WALLET) return erro(res, 500, 'A escola ainda não pode receber pagamentos online.');
@@ -2881,7 +2891,8 @@ app.post('/pub/inscrever', rota(async (req, res) => {
     }
     const d = await mozPedido('payment', corpoC2B(metodo, preco, numero, nome));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    await mudar('inscricaoonline', id, { 'Referencia': idp ? String(idp) : '' });
+    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
+    await mudar('inscricaoonline', id, { 'Referencia': String(idp) });
     res.json({ ok: true, id, chave, estado: 'pendente' });
   } catch (e) {
     console.error('[inscricao] pagamento', e.message);
