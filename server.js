@@ -21,6 +21,7 @@
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//    Saldo e levantamentos (v5.8): /saldo /levantar (B2C M-Pesa/e-Mola) /sacar-cartao · /pl/saques /pl/saque-estado
 //    Inscrições online (v5.7): links públicos personalizados com pagamento · /links /link-guardar /inscricoes-online · /pub/link /pub/inscrever
 //    Matrícula (v5.6): SMS de boas-vindas sempre (encarregado e/ou estudante) · no superior o estudante é o titular (sem encarregado)
 //    Superior e Técnico (v5.5): pautas semestrais (frequência, exame, recorrência), créditos das cadeiras
@@ -48,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.7.0';
+const VERSAO = 'gescolar-proxy 5.8.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -1910,12 +1911,12 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
 //               · Referencia (text) · Transacao (text) · Raw (text) · Pago Em (date) · Valida Ate (date)
 //   Transferencia: Escola (Escola) · Valor (number) · Data (date) · Referencia (text) · Metodo (text) · Notas (text) · Feita Por (text)
 //  Render: PLATAFORMA_EMAILS (emails com acesso à área da plataforma, separados por vírgulas)
-//          TAXA_PROPINAS_PCT (opcional, % que o Gescolar retém das propinas pagas online; por defeito 0)
+//          TAXA_PROPINAS_PCT (opcional, % que o Gescolar retém de cada pagamento online; por defeito 7)
 //          PRECO_ESSENCIAL, PRECO_PRO (opcionais, MT por mês; por defeito 4900 e 12500)
 // ============================================================
 const PRECOS = { Essencial: Number(process.env.PRECO_ESSENCIAL || 4900), Pro: Number(process.env.PRECO_PRO || 12500), Rede: 0 };
 const LIMITES = { Essencial: 300, Pro: 1000, Rede: 0 };
-const TAXA_PROPINAS = Math.max(0, Math.min(50, Number(process.env.TAXA_PROPINAS_PCT || 0)));
+const TAXA_PROPINAS = Math.max(0, Math.min(50, Number(process.env.TAXA_PROPINAS_PCT === undefined || process.env.TAXA_PROPINAS_PCT === '' ? 7 : process.env.TAXA_PROPINAS_PCT)));   // 7% por defeito em cada pagamento online
 const TOLERANCIA_DIAS = 7;
 function situacaoEscola(e) {
   if (!e) return { estado: 'desconhecida' };
@@ -2007,16 +2008,21 @@ function exigePlataforma(req, res, next) {
 }
 const ONLINE = m => ['mpesa', 'emola', 'cartao'].includes(String(m || '').toLowerCase());
 app.post('/pl/resumo', exigePlataforma, rota(async (req, res) => {
-  const [escolas, pags, subs, trs, ests] = await Promise.all([procurarTodos('escola', [], 5000), procurarTodos('pagamento', [], 50000), procurarTodos('subscricao', [], 20000), procurarTodos('transferencia', [], 20000), procurarTodos('estudante', [], 100000)]);
+  const [escolas, pags, subs, trs0, ests, insc] = await Promise.all([procurarTodos('escola', [], 5000), procurarTodos('pagamento', [], 50000), procurarTodos('subscricao', [], 20000), procurarTodos('transferencia', [], 20000), procurarTodos('estudante', [], 100000),
+    procurarTodos('inscricaoonline', [], 50000).catch(() => [])]);
+  const trs = trs0.filter(t => contaTransf(t) && t['Estado'] !== 'pedido');
+  const pedidos = trs0.filter(t => t['Estado'] === 'pedido');
   const lista = escolas.map(e => {
     const online = pags.filter(p => p['Escola'] === e._id && p['Estado'] === 'pago' && ONLINE(p['Metodo']));
-    const bruto = online.reduce((x, p) => x + Number(p['Valor'] || 0), 0), taxa = Math.round(bruto * TAXA_PROPINAS / 100);
+    const insE = insc.filter(i => i['Escola'] === e._id && ['paga', 'matriculada'].includes(i['Estado']) && ONLINE(i['Metodo']));
+    const bruto = online.reduce((x, p) => x + Number(p['Valor'] || 0), 0) + insE.reduce((x, i) => x + Number(i['Valor'] || 0), 0), taxa = Math.round(bruto * TAXA_PROPINAS / 100);
     const transferido = trs.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0);
     const assin = subs.filter(x => x['Escola'] === e._id && x['Estado'] === 'pago');
     return { id: e._id, nome: e['Nome'] || '', subdominio: e['Subdominio'] || '', cidade: e['Cidade'] || '', provincia: e['Provincia'] || '', telefone: e['Telefone'] || '', email: e['Email'] || '', nuit: e['NUIT'] || '',
       plano: e['Plano'] || '', situacao: situacaoEscola(e), criada: e['Created Date'] || null,
       estudantes: ests.filter(x => x['Escola'] === e._id && (x['Estado'] || 'activo') === 'activo').length,
-      propinas_online: bruto, taxa, transferido, saldo: bruto - taxa - transferido, pagamentos: online.length,
+      propinas_online: bruto, taxa, transferido, saldo: bruto - taxa - transferido, pagamentos: online.length + insE.length,
+      saques_pedidos: pedidos.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0),
       assinaturas: assin.reduce((x, s2) => x + Number(s2['Valor'] || 0), 0), ultimo_pagamento: online.map(p => p['Pago Em']).sort().pop() || null };
   }).sort((a, b) => b.saldo - a.saldo || a.nome.localeCompare(b.nome, 'pt'));
   const mes = new Date().toISOString().slice(0, 7);
@@ -2884,6 +2890,137 @@ async function aplicarInscricao(i, b, estado) {
   await confirmarInscricaoSMS(i, l, esc);
   return { ok: true, estado: 'paga' };
 }
+
+
+// ============================================================
+//  SALDO E LEVANTAMENTOS DA ESCOLA (v5.8)
+//  O dinheiro pago online (propinas e inscrições) fica na carteira do Gescolar na MozPayment.
+//  Cada escola vê o saldo por canal e levanta:
+//   · M-Pesa → B2C  POST /wf/b2c-mpesa-imale  { carteira, valor, numero, secret_id, payment_metodo:"mpesa" }
+//   · e-Mola → B2C  POST /wf/b2c-emola-imale  { carteira, valor, numero, secret_id, payment_metodo:"emola" }
+//   · Cartão → não há B2C: a escola pede o saque e a Plataforma paga e marca como feito.
+//  Mínimo 100 MT por levantamento. Pede a palavra-passe de quem levanta.
+//  Render: MOZ_SECRET_ID (o secret_id da MozPayment) · LEVANTAMENTO_MIN (opcional, por defeito 100)
+//  Bubble, campos novos em Transferencia: Canal (text) · Estado (text: pedido | pendente | concluida | falhada) · Numero (text)
+//                                         · Pedido Por (text) · Raw (text)
+// ============================================================
+const MOZ_SECRET_ID = process.env.MOZ_SECRET_ID || '';
+const LEV_MIN = Math.max(1, Number(process.env.LEVANTAMENTO_MIN || 100));
+const CANAIS = { mpesa: 'M-Pesa', emola: 'e-Mola', cartao: 'Visa / Mastercard' };
+const B2C = { mpesa: 'b2c-mpesa-imale', emola: 'b2c-emola-imale' };
+const levando = new Set();   // uma operação de cada vez por escola
+const contaTransf = t => !['falhada', 'cancelada'].includes(t['Estado'] || 'concluida');
+async function saldoDaEscola(escola) {
+  const f = daEscola(escola);
+  const [pags, ins, trs] = await Promise.all([procurarTodos('pagamento', f, 50000), procurarTodos('inscricaoonline', f, 20000).catch(() => []), procurarTodos('transferencia', f, 5000)]);
+  const C = {};
+  for (const k of Object.keys(CANAIS)) C[k] = { canal: k, nome: CANAIS[k], entrou: 0, taxa: 0, saiu: 0, disponivel: 0, pagamentos: 0 };
+  const soma = (canal, v) => { const c = C[canal]; if (!c || !(v > 0)) return; c.entrou += v; c.taxa += Math.round(v * TAXA_PROPINAS / 100); c.pagamentos++; };
+  pags.filter(p => p['Estado'] === 'pago').forEach(p => soma(String(p['Metodo'] || '').toLowerCase(), Number(p['Valor'] || 0)));
+  ins.filter(i => ['paga', 'matriculada'].includes(i['Estado'])).forEach(i => soma(String(i['Metodo'] || '').toLowerCase(), Number(i['Valor'] || 0)));
+  let antigas = 0;
+  trs.filter(contaTransf).forEach(t => { const c = C[t['Canal']]; if (c) c.saiu += Number(t['Valor'] || 0); else antigas += Number(t['Valor'] || 0); });
+  for (const k of ['cartao', 'mpesa', 'emola']) {   // transferências antigas (sem canal) abatem primeiro ao cartão
+    const c = C[k], livre = c.entrou - c.taxa - c.saiu, tira = Math.min(Math.max(0, livre), antigas);
+    c.saiu += tira; antigas -= tira; c.disponivel = Math.max(0, c.entrou - c.taxa - c.saiu);
+  }
+  const historico = trs.map(t => ({ id: t._id, canal: t['Canal'] || 'manual', canal_nome: CANAIS[t['Canal']] || 'Transferência', valor: Number(t['Valor'] || 0), numero: t['Numero'] || '',
+    estado: t['Estado'] || 'concluida', referencia: t['Referencia'] || '', data: t['Data'] || t['Created Date'] || null, por: t['Pedido Por'] || t['Feita Por'] || '', notas: t['Notas'] || '' }))
+    .sort((a, b) => String(b.data || '').localeCompare(String(a.data || '')));
+  return { canais: Object.values(C), historico, taxa_pct: TAXA_PROPINAS };
+}
+async function confirmarSenha(req, senha) {
+  const u = await obter('user', req.sessao.u).catch(() => null);
+  const email = emailDoUser(u);
+  if (!u || !email) throw pub('Não foi possível confirmar a sua conta.');
+  if (!senha) throw pub('Escreva a sua palavra-passe para confirmar.');
+  const chave = 'lev-senha|' + req.sessao.u, agora = Date.now();
+  if ((tentativas.get(chave) || []).filter(t => agora - t < 15 * 60e3).length >= 5) { const e = new Error('Muitas tentativas erradas. Espere 15 minutos.'); e.publico = 429; throw e; }
+  try { const r = await workflow('login', { email, password: String(senha) }); if (!r || !r.response || r.response.user_id !== req.sessao.u) throw new Error('outro'); }
+  catch (e) { travao(chave, 5, 15); throw pub('A palavra-passe não está certa.'); }   // só as erradas contam
+  return u;
+}
+app.post('/saldo', exigeSoDireccao, rota(async (req, res) => {
+  const [s, esc] = await Promise.all([saldoDaEscola(req.escola), obter('escola', req.escola)]);
+  res.json(Object.assign({ ok: true, minimo: LEV_MIN, b2c: !!MOZ_SECRET_ID, telefone: tel9(esc['Telefone']) }, s));
+}));
+app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {}, canal = String(b.canal || '');
+  if (!B2C[canal]) return erro(res, 400, 'Escolha M-Pesa ou e-Mola.');
+  if (!MOZ_SECRET_ID || !MOZ_WALLET) return erro(res, 500, 'Os levantamentos ainda não estão configurados no servidor (MOZ_SECRET_ID).');
+  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  if (!(valor >= LEV_MIN)) return erro(res, 400, 'O valor mínimo de cada levantamento é ' + LEV_MIN + ' MT.');
+  const numero = tel9(b.numero);
+  if (numero.length !== 9) return erro(res, 400, 'Escreva o número que vai receber, com 9 dígitos.');
+  if (canal === 'mpesa' && !['84', '85'].includes(numero.slice(0, 2))) return erro(res, 400, 'M-Pesa só envia para números Vodacom (84 ou 85).');
+  if (canal === 'emola' && !['86', '87'].includes(numero.slice(0, 2))) return erro(res, 400, 'e-Mola só envia para números Movitel (86 ou 87).');
+  if (levando.has(req.escola)) return erro(res, 409, 'Já está um levantamento em curso. Espere que termine.');
+  const u = await confirmarSenha(req, b.senha);
+  levando.add(req.escola);
+  try {
+    const s = await saldoDaEscola(req.escola), c = s.canais.find(x => x.canal === canal);
+    if (valor > c.disponivel) return erro(res, 400, 'O saldo disponível em ' + CANAIS[canal] + ' é ' + mt(c.disponivel) + '.');
+    const quem = u['Nome Completo'] || 'Direcção';
+    const id = await criar('transferencia', { 'Escola': req.escola, 'Valor': valor, 'Data': new Date().toISOString(), 'Canal': canal, 'Estado': 'pendente', 'Numero': numero,
+      'Metodo': CANAIS[canal] + ' (levantamento)', 'Pedido Por': quem, 'Feita Por': quem });
+    let d;
+    try { d = await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero, secret_id: MOZ_SECRET_ID, payment_metodo: canal }); }
+    catch (e) {
+      console.error('[levantar]', e.message);
+      if (e.semResposta) {   // pode ter saído: fica pendente (continua a contar) até a Plataforma confirmar
+        await mudar('transferencia', id, { 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
+        return res.json({ ok: true, id, estado: 'pendente', mensagem: 'A MozPayment está a demorar a responder. O levantamento fica pendente; confirme no telemóvel se o dinheiro chegou.' });
+      }
+      await mudar('transferencia', id, { 'Estado': 'falhada', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
+      return erro(res, 502, 'O levantamento não foi feito: ' + String(e.message).slice(0, 200));
+    }
+    const st = String(achar(d, ['status', 'estado']) || '').toLowerCase();
+    const falhou = ['failed', 'falhou', 'error', 'erro', 'rejected', 'cancelled'].some(x => st.includes(x));
+    const ref = String(achar(d, ['transaction_id', 'transactionId', 'idpayment', 'id_payment', 'reference', 'referencia', 'id']) || '');
+    await mudar('transferencia', id, { 'Estado': falhou ? 'falhada' : 'concluida', 'Referencia': ref, 'Raw': JSON.stringify(d).slice(0, 4000) });
+    if (falhou) return erro(res, 502, 'A MozPayment recusou o levantamento: ' + (achar(d, ['message', 'mensagem', 'erro']) || st));
+    const esc = await obter('escola', req.escola).catch(() => null);
+    if (esc && tel9(esc['Telefone']).length === 9) enviarSMS([esc['Telefone']], 'Gescolar: levantamento de ' + mt(valor) + ' por ' + CANAIS[canal] + ' para o ' + numero + ' feito por ' + quem + '.').catch(() => {});
+    res.json({ ok: true, id, estado: 'concluida', referencia: ref });
+  } finally { levando.delete(req.escola); }
+}));
+app.post('/sacar-cartao', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  if (!(valor >= LEV_MIN)) return erro(res, 400, 'O valor mínimo de cada saque é ' + LEV_MIN + ' MT.');
+  const destino = txt(b.destino, 200);
+  if (destino.length < 6) return erro(res, 400, 'Escreva para onde enviar: banco e NIB, ou número M-Pesa / e-Mola.');
+  if (levando.has(req.escola)) return erro(res, 409, 'Já está uma operação em curso. Espere que termine.');
+  const u = await confirmarSenha(req, b.senha);
+  levando.add(req.escola);
+  try {
+    const s = await saldoDaEscola(req.escola), c = s.canais.find(x => x.canal === 'cartao');
+    if (valor > c.disponivel) return erro(res, 400, 'O saldo disponível de pagamentos com cartão é ' + mt(c.disponivel) + '.');
+    const quem = u['Nome Completo'] || 'Direcção';
+    const id = await criar('transferencia', { 'Escola': req.escola, 'Valor': valor, 'Data': new Date().toISOString(), 'Canal': 'cartao', 'Estado': 'pedido', 'Metodo': 'Saque de cartão',
+      'Notas': 'Enviar para: ' + destino, 'Pedido Por': quem, 'Feita Por': quem });
+    res.json({ ok: true, id, estado: 'pedido' });
+  } finally { levando.delete(req.escola); }
+}));
+// Plataforma: pedidos de saque por pagar e levantamentos pendentes
+app.post('/pl/saques', exigePlataforma, rota(async (req, res) => {
+  const [trs, escolas] = await Promise.all([procurarTodos('transferencia', [], 20000), procurarTodos('escola', [], 5000)]);
+  const EN = Object.fromEntries(escolas.map(e => [e._id, e['Nome'] || '']));
+  res.json({ ok: true, saques: trs.filter(t => ['pedido', 'pendente'].includes(t['Estado'])).map(t => ({ id: t._id, escola: t['Escola'], escola_nome: EN[t['Escola']] || '', canal: t['Canal'] || '',
+    canal_nome: CANAIS[t['Canal']] || '', valor: Number(t['Valor'] || 0), estado: t['Estado'], numero: t['Numero'] || '', notas: t['Notas'] || '', por: t['Pedido Por'] || '', data: t['Data'] || t['Created Date'] || null }))
+    .sort((a, b) => String(a.data || '').localeCompare(String(b.data || ''))) });
+}));
+app.post('/pl/saque-estado', exigePlataforma, rota(async (req, res) => {
+  const b = req.body || {};
+  const t = await obter('transferencia', String(b.id || '')).catch(() => null);
+  if (!t) return erro(res, 404, 'Pedido não encontrado.');
+  if (!['concluida', 'falhada'].includes(b.estado)) return erro(res, 400, 'Estado inválido.');
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  await mudar('transferencia', t._id, { 'Estado': b.estado, 'Referencia': txt(b.referencia, 80) || t['Referencia'] || '', 'Feita Por': (eu && eu['Nome Completo']) || 'Plataforma' });
+  const e = await obter('escola', t['Escola']).catch(() => null);
+  if (b.estado === 'concluida' && e && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: o saque de ' + mt(Number(t['Valor'] || 0)) + ' foi pago' + (b.referencia ? '. Ref. ' + txt(b.referencia, 40) : '') + '.').catch(() => {});
+  res.json({ ok: true });
+}));
 
 // ============================================================
 //  WEBHOOK DA MOZPAYMENT
