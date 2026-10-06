@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.8.3';
+const VERSAO = 'gescolar-proxy 5.8.4';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -605,9 +605,8 @@ const MOZ_CARD_PATH = (process.env.MOZ_CARD_PATH || 'payment').replace(/^\/+/, '
 const MOZ_WEBHOOK_KEY = process.env.MOZ_WEBHOOK_KEY || '';
 const MOZ_NUM_258 = /^(1|sim|true|258)$/i.test(String(process.env.MOZ_NUMERO_258 || '').trim());   // 1 = enviar 25884xxxxxxx; vazio = 84xxxxxxx
 const numMoz = n9 => (MOZ_NUM_258 ? '258' : '') + n9;
-// corpo do pedido C2B (M-Pesa/e-Mola): vai com os nomes em inglês e em português; o workflow da MozPayment usa os que conhece
-const corpoC2B = (metodo, valor, n9, nome) => ({ wallet: MOZ_WALLET, carteira: MOZ_WALLET, payment_method: metodo, payment_metodo: metodo, amount: String(valor), valor: String(valor),
-  number: numMoz(n9), numero: numMoz(n9), name: nome, nome_cliente: nome });
+// corpo do pedido C2B (M-Pesa/e-Mola): exactamente estes 5 campos
+const corpoC2B = (metodo, valor, n9, nome) => ({ wallet: MOZ_WALLET, payment_method: metodo, amount: String(valor), number: numMoz(n9), name: String(nome || '').slice(0, 80) });
 
 // procura um campo em qualquer nível da resposta (a MozPayment nem sempre devolve no mesmo sítio)
 function achar(obj, nomes, prof) {
