@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.8.1';
+const VERSAO = 'gescolar-proxy 5.8.3';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -275,7 +275,16 @@ app.post('/registo', async (req, res) => {
     await mudar('user', userId, { 'Escola': escolaId, 'Papel': 'Direccao', 'Nome Completo': adminNome, 'Telefone': txt(b.admin_tel, 30), 'Activo': true });
 
     const s = await abrirSessao(userId);
-    s.subdominio = sub; s.teste_ate = testeAte.toISOString().slice(0, 10);
+    s.subdominio = sub; s.teste_ate = testeAte.toISOString().slice(0, 10); s.acesso = linkFamilias(sub);
+    // SMS de boas-vindas ao director com o código da escola e os links
+    const telAdm = tel9(b.admin_tel), telEsc = tel9(b.telefone);
+    const nums = [...new Set([telAdm, telEsc].filter(t => t.length === 9))];
+    if (nums.length) {
+      const base = PORTAL_URL.replace(/acesso\.html.*$/, '').replace(/^https?:\/\//, '');
+      const r = await enviarSMS(nums, 'Gescolar: a escola ' + nome + ' foi criada. Codigo da escola: ' + sub + '. Direccao entra em ' + base + 'entrar.html com ' + email +
+        '. Familias, alunos e professores entram em ' + base + 'acesso.html?e=' + sub + ' com o telemovel.').catch(() => ({ ok: false }));
+      s.sms = !!r.ok;
+    }
     res.json(s);
   } catch (e) {
     console.error('[registo]', e.message);
@@ -594,6 +603,11 @@ const MOZ_SENHA = process.env.MOZ_SENHA || '';
 const MOZ_WALLET = process.env.MOZ_WALLET || '';
 const MOZ_CARD_PATH = (process.env.MOZ_CARD_PATH || 'payment').replace(/^\/+/, '');
 const MOZ_WEBHOOK_KEY = process.env.MOZ_WEBHOOK_KEY || '';
+const MOZ_NUM_258 = /^(1|sim|true|258)$/i.test(String(process.env.MOZ_NUMERO_258 || '').trim());   // 1 = enviar 25884xxxxxxx; vazio = 84xxxxxxx
+const numMoz = n9 => (MOZ_NUM_258 ? '258' : '') + n9;
+// corpo do pedido C2B (M-Pesa/e-Mola): vai com os nomes em inglês e em português; o workflow da MozPayment usa os que conhece
+const corpoC2B = (metodo, valor, n9, nome) => ({ wallet: MOZ_WALLET, carteira: MOZ_WALLET, payment_method: metodo, payment_metodo: metodo, amount: String(valor), valor: String(valor),
+  number: numMoz(n9), numero: numMoz(n9), name: nome, nome_cliente: nome });
 
 // procura um campo em qualquer nível da resposta (a MozPayment nem sempre devolve no mesmo sítio)
 function achar(obj, nomes, prof) {
@@ -655,6 +669,10 @@ async function mozPedido(caminho, corpo) {
     if ((r.status === 401 || r.status === 403) && tentativa === 0) continue;   // token caducado: novo login e repete
     console.log('[moz] ' + caminho + ' → ' + r.status + ' ' + t.slice(0, 1500));
     if (!r.ok) { const e = new Error(achar(d, ['message', 'mensagem', 'error', 'erro']) || ('MozPayment respondeu ' + r.status)); e.moz = d; throw e; }
+    // a MozPayment responde 200 mesmo quando falha: ver o cod/status dentro da resposta
+    const st = String(achar(d, ['status', 'estado']) || '').toLowerCase(), cod = Number(achar(d, ['cod', 'code', 'codigo', 'status_code']));
+    const falhou = /error|erro|fail|falh|invalid|inv[aá]lid|recus|negad|insuf/.test(st) || (isFinite(cod) && cod >= 400);
+    if (falhou) { const e = new Error(achar(d, ['message', 'mensagem', 'msg', 'error', 'erro', 'detalhe']) || ('MozPayment: ' + (st || 'cod ' + cod))); e.moz = d; throw e; }
     return d;
   }
   throw new Error('A MozPayment recusou o acesso (verifique MOZ_EMAIL e MOZ_SENHA).');
@@ -883,7 +901,7 @@ async function cobrarOnline(req, res) {
       await mudar('pagamento', pagId, { 'Referencia': sessao, 'Raw': JSON.stringify(d).slice(0, 4000) });
       return res.json({ ok: true, pagamento: pagId, estado: 'pendente', link, total });
     }
-    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(total), number: numero, name: nome });
+    const d = await mozPedido('payment', corpoC2B(metodo, total, numero, nome));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
     await mudar('pagamento', pagId, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
     res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
@@ -1970,7 +1988,7 @@ app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
       await mudar('subscricao', id, { 'Referencia': String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || ''), 'Raw': JSON.stringify(d).slice(0, 4000) });
       return res.json({ ok: true, id, link, total: valor });
     }
-    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(valor), number: numero, name: (e['Nome'] || 'Escola').slice(0, 80) });
+    const d = await mozPedido('payment', corpoC2B(metodo, valor, numero, (e['Nome'] || 'Escola').slice(0, 80)));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
     await mudar('subscricao', id, { 'Referencia': idp ? String(idp) : '', 'Raw': JSON.stringify(d).slice(0, 4000) });
     res.json({ ok: true, id, total: valor, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.' });
@@ -2862,7 +2880,7 @@ app.post('/pub/inscrever', rota(async (req, res) => {
       await mudar('inscricaoonline', id, { 'Referencia': sessao });
       return res.json({ ok: true, id, chave, estado: 'pendente', checkout: link });
     }
-    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(preco), number: numero, name: nome });
+    const d = await mozPedido('payment', corpoC2B(metodo, preco, numero, nome));
     const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
     await mudar('inscricaoonline', id, { 'Referencia': idp ? String(idp) : '' });
     res.json({ ok: true, id, chave, estado: 'pendente' });
@@ -2964,7 +2982,7 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
     const id = await criar('transferencia', { 'Escola': req.escola, 'Valor': valor, 'Data': new Date().toISOString(), 'Canal': canal, 'Estado': 'pendente', 'Numero': numero,
       'Metodo': CANAIS[canal] + ' (levantamento)', 'Pedido Por': quem, 'Feita Por': quem });
     let d;
-    try { d = await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero, secret_id: MOZ_SECRET_ID, payment_metodo: canal }); }
+    try { d = await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero: numMoz(numero), secret_id: MOZ_SECRET_ID, payment_metodo: canal }); }
     catch (e) {
       console.error('[levantar]', e.message);
       if (e.semResposta) {   // pode ter saído: fica pendente (continua a contar) até a Plataforma confirmar
