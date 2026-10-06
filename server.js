@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.8.5';
+const VERSAO = 'gescolar-proxy 5.8.6';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -829,7 +829,7 @@ async function enviarSMS(numeros, mensagem) {
     return { ok: false, erro: e.message, numeros: lista };
   }
 }
-const mt = v => Number(v || 0).toLocaleString('pt-PT').replace(/\s/g, ' ') + ' MT';
+const mt = v => Number(v || 0).toLocaleString('pt-PT', { maximumFractionDigits: 6 }).replace(/\s/g, ' ') + ' MT';
 // recibo por SMS: ao encarregado (se aceita SMS) e a quem pagou pelo telemóvel
 async function smsRecibo(pag, documento) {
   try {
@@ -1941,6 +1941,12 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
 const PRECOS = { Essencial: Number(process.env.PRECO_ESSENCIAL || 4900), Pro: Number(process.env.PRECO_PRO || 12500), Rede: 0 };
 const LIMITES = { Essencial: 300, Pro: 1000, Rede: 0 };
 const TAXA_PROPINAS = Math.max(0, Math.min(50, Number(process.env.TAXA_PROPINAS_PCT === undefined || process.env.TAXA_PROPINAS_PCT === '' ? 7 : process.env.TAXA_PROPINAS_PCT)));   // 7% por defeito em cada pagamento online
+// 5.8.6: a taxa é exactamente TAXA_PROPINAS% do valor, sem arredondar (ex.: 15 MT → 1,05 MT; 10,55 MT → 0,7385 MT).
+// limpa() só tira o ruído das contas em vírgula flutuante (1.0500000000000003 → 1.05), não arredonda os meticais.
+const limpa = n => Number(Number(n || 0).toFixed(6));
+const taxaDe = v => limpa(Number(v || 0) * TAXA_PROPINAS / 100);
+// Valores em meticais escritos à mão: até 2 casas decimais, com vírgula ou ponto. Nunca arredonda.
+const valorMT = x => { const t = String(x == null ? '' : x).replace(/\s/g, '').replace(',', '.'); return /^\d+(\.\d{1,2})?$/.test(t) ? Number(t) : NaN; };
 const TOLERANCIA_DIAS = 7;
 function situacaoEscola(e) {
   if (!e) return { estado: 'desconhecida' };
@@ -2040,21 +2046,21 @@ app.post('/pl/resumo', exigePlataforma, rota(async (req, res) => {
   const lista = escolas.map(e => {
     const online = pags.filter(p => p['Escola'] === e._id && p['Estado'] === 'pago' && ONLINE(p['Metodo']));
     const insE = insc.filter(i => i['Escola'] === e._id && ['paga', 'matriculada'].includes(i['Estado']) && ONLINE(i['Metodo']));
-    const bruto = online.reduce((x, p) => x + Number(p['Valor'] || 0), 0) + insE.reduce((x, i) => x + Number(i['Valor'] || 0), 0), taxa = Math.round(bruto * TAXA_PROPINAS / 100);
+    const bruto = online.reduce((x, p) => x + Number(p['Valor'] || 0), 0) + insE.reduce((x, i) => x + Number(i['Valor'] || 0), 0), taxa = taxaDe(bruto);
     const transferido = trs.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0);
     const assin = subs.filter(x => x['Escola'] === e._id && x['Estado'] === 'pago');
     return { id: e._id, nome: e['Nome'] || '', subdominio: e['Subdominio'] || '', cidade: e['Cidade'] || '', provincia: e['Provincia'] || '', telefone: e['Telefone'] || '', email: e['Email'] || '', nuit: e['NUIT'] || '',
       plano: e['Plano'] || '', situacao: situacaoEscola(e), criada: e['Created Date'] || null,
       estudantes: ests.filter(x => x['Escola'] === e._id && (x['Estado'] || 'activo') === 'activo').length,
-      propinas_online: bruto, taxa, transferido, saldo: bruto - taxa - transferido, pagamentos: online.length + insE.length,
+      propinas_online: limpa(bruto), taxa, transferido: limpa(transferido), saldo: limpa(bruto - taxa - transferido), pagamentos: online.length + insE.length,
       saques_pedidos: pedidos.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0),
       assinaturas: assin.reduce((x, s2) => x + Number(s2['Valor'] || 0), 0), ultimo_pagamento: online.map(p => p['Pago Em']).sort().pop() || null };
   }).sort((a, b) => b.saldo - a.saldo || a.nome.localeCompare(b.nome, 'pt'));
   const mes = new Date().toISOString().slice(0, 7);
   res.json({ ok: true, taxa_pct: TAXA_PROPINAS, precos: PRECOS, escolas: lista,
     totais: { escolas: lista.length, activas: lista.filter(x => ['activa', 'tolerancia'].includes(x.situacao.estado)).length, teste: lista.filter(x => x.situacao.estado === 'teste').length,
-      estudantes: lista.reduce((x, e) => x + e.estudantes, 0), a_transferir: lista.reduce((x, e) => x + Math.max(0, e.saldo), 0),
-      propinas_online: lista.reduce((x, e) => x + e.propinas_online, 0), assinaturas: lista.reduce((x, e) => x + e.assinaturas, 0),
+      estudantes: lista.reduce((x, e) => x + e.estudantes, 0), a_transferir: limpa(lista.reduce((x, e) => x + Math.max(0, e.saldo), 0)),
+      propinas_online: limpa(lista.reduce((x, e) => x + e.propinas_online, 0)), assinaturas: lista.reduce((x, e) => x + e.assinaturas, 0),
       assinaturas_mes: subs.filter(x => x['Estado'] === 'pago' && String(x['Pago Em'] || '').slice(0, 7) === mes).reduce((x, s2) => x + Number(s2['Valor'] || 0), 0) } });
 }));
 app.post('/pl/escola', exigePlataforma, rota(async (req, res) => {
@@ -2064,7 +2070,7 @@ app.post('/pl/escola', exigePlataforma, rota(async (req, res) => {
   const f = daEscola(id);
   const [pags, subs, trs, ests] = await Promise.all([procurarTodos('pagamento', f, 20000), procurarTodos('subscricao', f, 500), procurarTodos('transferencia', f, 2000), procurarTodos('estudante', f)]);
   const EM = Object.fromEntries(ests.map(x => [x._id, x['Nome']]));
-  const movimentos = pags.filter(p => p['Estado'] === 'pago' && ONLINE(p['Metodo'])).map(p => ({ tipo: 'entrada', data: p['Pago Em'], valor: Number(p['Valor'] || 0), taxa: Math.round(Number(p['Valor'] || 0) * TAXA_PROPINAS / 100),
+  const movimentos = pags.filter(p => p['Estado'] === 'pago' && ONLINE(p['Metodo'])).map(p => ({ tipo: 'entrada', data: p['Pago Em'], valor: Number(p['Valor'] || 0), taxa: taxaDe(p['Valor']),
       texto: (EM[p['Estudante']] || '') + ' · ' + (p['Documento'] || ''), metodo: p['Metodo'] || '' }))
     .concat(trs.map(t => ({ tipo: 'transferencia', id: t._id, data: t['Data'] || t['Created Date'], valor: Number(t['Valor'] || 0), texto: [t['Metodo'], t['Referencia'], t['Notas']].filter(Boolean).join(' · '), feita_por: t['Feita Por'] || '' })))
     .sort((a, b) => String(b.data || '').localeCompare(String(a.data || '')));
@@ -2090,7 +2096,8 @@ app.post('/pl/transferencia', exigePlataforma, rota(async (req, res) => {
   const b = req.body || {};
   const e = await obter('escola', String(b.escola || ''));
   if (!e) return erro(res, 404, 'Escola não encontrada.');
-  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  const valor = valorMT(b.valor);
+  if (isNaN(valor)) return erro(res, 400, 'Escreva o valor em meticais, com até 2 casas decimais (ex.: 150 ou 150,50).');
   if (!(valor > 0)) return erro(res, 400, 'Escreva o valor transferido.');
   const data = b.data && !isNaN(Date.parse(b.data)) ? new Date(b.data + 'T12:00:00Z').toISOString() : new Date().toISOString();
   const eu = await obter('user', req.sessao.u).catch(() => null);
@@ -2943,14 +2950,14 @@ async function saldoDaEscola(escola) {
   const [pags, ins, trs] = await Promise.all([procurarTodos('pagamento', f, 50000), procurarTodos('inscricaoonline', f, 20000).catch(() => []), procurarTodos('transferencia', f, 5000)]);
   const C = {};
   for (const k of Object.keys(CANAIS)) C[k] = { canal: k, nome: CANAIS[k], entrou: 0, taxa: 0, saiu: 0, disponivel: 0, pagamentos: 0 };
-  const soma = (canal, v) => { const c = C[canal]; if (!c || !(v > 0)) return; c.entrou += v; c.taxa += Math.round(v * TAXA_PROPINAS / 100); c.pagamentos++; };
+  const soma = (canal, v) => { const c = C[canal]; if (!c || !(v > 0)) return; c.entrou = limpa(c.entrou + v); c.taxa = limpa(c.taxa + taxaDe(v)); c.pagamentos++; };
   pags.filter(p => p['Estado'] === 'pago').forEach(p => soma(String(p['Metodo'] || '').toLowerCase(), Number(p['Valor'] || 0)));
   ins.filter(i => ['paga', 'matriculada'].includes(i['Estado'])).forEach(i => soma(String(i['Metodo'] || '').toLowerCase(), Number(i['Valor'] || 0)));
   let antigas = 0;
-  trs.filter(contaTransf).forEach(t => { const c = C[t['Canal']]; if (c) c.saiu += Number(t['Valor'] || 0); else antigas += Number(t['Valor'] || 0); });
+  trs.filter(contaTransf).forEach(t => { const c = C[t['Canal']]; if (c) c.saiu = limpa(c.saiu + Number(t['Valor'] || 0)); else antigas = limpa(antigas + Number(t['Valor'] || 0)); });
   for (const k of ['cartao', 'mpesa', 'emola']) {   // transferências antigas (sem canal) abatem primeiro ao cartão
     const c = C[k], livre = c.entrou - c.taxa - c.saiu, tira = Math.min(Math.max(0, livre), antigas);
-    c.saiu += tira; antigas -= tira; c.disponivel = Math.max(0, c.entrou - c.taxa - c.saiu);
+    c.saiu = limpa(c.saiu + tira); antigas = limpa(antigas - tira); c.disponivel = Math.max(0, limpa(c.entrou - c.taxa - c.saiu));
   }
   const historico = trs.map(t => ({ id: t._id, canal: t['Canal'] || 'manual', canal_nome: CANAIS[t['Canal']] || 'Transferência', valor: Number(t['Valor'] || 0), numero: t['Numero'] || '',
     estado: t['Estado'] || 'concluida', referencia: t['Referencia'] || '', data: t['Data'] || t['Created Date'] || null, por: t['Pedido Por'] || t['Feita Por'] || '', notas: t['Notas'] || '' }))
@@ -2976,7 +2983,8 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
   const b = req.body || {}, canal = String(b.canal || '');
   if (!B2C[canal]) return erro(res, 400, 'Escolha M-Pesa ou e-Mola.');
   if (!MOZ_SECRET_ID || !MOZ_WALLET) return erro(res, 500, 'Os levantamentos ainda não estão configurados no servidor (MOZ_SECRET_ID).');
-  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  const valor = valorMT(b.valor);
+  if (isNaN(valor)) return erro(res, 400, 'Escreva o valor em meticais, com até 2 casas decimais (ex.: 150 ou 150,50).');
   if (!(valor >= LEV_MIN)) return erro(res, 400, 'O valor mínimo de cada levantamento é ' + LEV_MIN + ' MT.');
   const numero = tel9(b.numero);
   if (numero.length !== 9) return erro(res, 400, 'Escreva o número que vai receber, com 9 dígitos.');
@@ -3014,7 +3022,8 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
 }));
 app.post('/sacar-cartao', exigeSoDireccao, rota(async (req, res) => {
   const b = req.body || {};
-  const valor = Math.round(Number(String(b.valor || '').replace(/\s/g, '').replace(',', '.')));
+  const valor = valorMT(b.valor);
+  if (isNaN(valor)) return erro(res, 400, 'Escreva o valor em meticais, com até 2 casas decimais (ex.: 150 ou 150,50).');
   if (!(valor >= LEV_MIN)) return erro(res, 400, 'O valor mínimo de cada saque é ' + LEV_MIN + ' MT.');
   const destino = txt(b.destino, 200);
   if (destino.length < 6) return erro(res, 400, 'Escreva para onde enviar: banco e NIB, ou número M-Pesa / e-Mola.');
