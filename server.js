@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.10.0';
+const VERSAO = 'gescolar-proxy 5.11.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -104,7 +104,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -1682,6 +1682,7 @@ app.post('/prof/inicio', exigeProfessor, rota(async (req, res) => {
       estudantes: ests.filter(e => e['Turma'] === t._id && (e['Estado'] || 'activo') === 'activo').length, chamada: hoje.dia !== 0 && feitas.includes(t._id + '|' + TEMPO_DIA) }))
       .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt')),
     conducao: await praticasDoInstrutor(req.escola, req.sessao.u).catch(err => { console.error('[prof] condução', err.message); return null; }),
+    codigo: (escRaw['Niveis'] || []).includes(NIVEIS.CON),
     comunicados: cs.filter(c => !c['Turma']).map(c => comOut(c)).sort((x, y) => String(y.data || '').localeCompare(String(x.data || ''))).slice(0, 10) });
 }));
 app.post('/prof/pauta', exigeProfessor, rota(async (req, res) => {
@@ -2419,6 +2420,7 @@ app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
   const [ins, cs, ests, props, esc, aulas, docs, ts, teo] = await Promise.all([procurarTodos('inscricaoconducao', f, 5000), procurarTodos('cursoconducao', f), procurarTodos('estudante', f), procurarTodos('propina', f.concat([{ key: 'Tipo', constraint_type: 'equals', value: 'prestacao' }]), 20000), resumoEscola(req.escola), procurarTodos('aulapratica', f, 20000),
     docsDaEscola(req.escola), procurarTodos('testecodigo', f, 20000).catch(() => []), procurarTodos('aulateorica', f, 5000).catch(() => [])]);
   const teoConta = {}; teo.forEach(t => (lerJSON(t['Presentes'], []) || []).forEach(id => { teoConta[id] = (teoConta[id] || 0) + 1; }));
+  const escRawI = await obter('escola', req.escola).catch(() => null);
   const CM = Object.fromEntries(cs.map(c => [c._id, c])), EM = Object.fromEntries(ests.map(e => [e._id, e]));
   const regras = (esc && esc.regras) || {};
   res.json({ ok: true, instruendos: ins.map(i => {
@@ -2432,9 +2434,10 @@ app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
       proxima: prox ? { valor: prox.total, vencimento: prox.vencimento } : null,
       praticas: { feitas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'feita').length, marcadas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) },
       teoricas: { feitas: teoConta[i._id] || 0, total: Number(c['Aulas Teoricas'] || 0) },
-      codigo: resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)),
+      codigo: Object.assign(resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)), { acesso: i['Codigo Acesso'] || '', acesso_pago: props.some(p => p['Estudante'] === i['Estudante'] && p['Descricao'] === DESC_ACESSO && p['Estado'] === 'paga') }),
       processo: processoOut(i, docs) };
-  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))), documentos: docs, processos: PROCESSO });
+  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))), documentos: docs, processos: PROCESSO,
+    codigo_acesso: { modo: (escRawI && escRawI['Codigo Acesso']) === 'pago' ? 'pago' : 'gratis', preco: Number((escRawI && escRawI['Codigo Preco']) || 0) } });
 }));
 async function inscreverCore(escolaId, b) {
   const nome = txt(b.nome, 100);
@@ -2836,8 +2839,7 @@ app.post('/p/codigo-teste', exigePortal, rota(async (req, res) => {
   const est = String((req.body || {}).estudante || '');
   if (!req.educandos.includes(est)) return erro(res, 403, 'Este instruendo não pertence a esta conta.');
   if (travao('codigo|' + est, 30, 60)) return erro(res, 429, 'Já fez muitos testes na última hora. Descanse um pouco e volte mais tarde.');
-  const i = await inscricaoActivaDe(req.escola, est);
-  if (!i) return erro(res, 400, 'O treino do código está disponível durante o curso de condução.');
+  const i = await exigeAcessoCodigo(req, est);
   const L = (await bancoCodigo(req.escola)).filter(q => q.activa);
   if (L.length < 5) return erro(res, 400, 'A escola ainda está a preparar as perguntas do código.');
   const escolhidas = embaralhar(L).slice(0, CODIGO_PERGUNTAS);
@@ -2862,6 +2864,189 @@ app.post('/p/codigo-corrigir', exigePortal, rota(async (req, res) => {
   } catch (e) { guardado = false; console.error('[codigo] não guardou o teste:', e.message); }
   const ts = await procurarTodos('testecodigo', daEscola(req.escola).concat([{ key: 'Inscricao', constraint_type: 'equals', value: t.i }])).catch(() => []);
   res.json({ ok: true, acertos, total, pct: total ? Math.round(acertos * 100 / total) : 0, correccao, guardado, resumo: resumoCodigo(ts) });
+}));
+
+
+// ---------- lições do código (v5.11) ----------
+//  Bubble: Licao Codigo: Escola (Escola) · Base (text) · Tema (text) · Titulo (text) · Texto (text) · Ordem (number) · Activa (yes/no)
+//          Escola: Codigo Acesso (text: gratis | pago) · Codigo Preco (number)
+//          Inscricao Conducao: Codigo Acesso (text: vazio = como a escola | gratis | pago)
+//  Cada lição junta o texto e as perguntas com o mesmo Tema. Só instruendos, instrutores e Direcção de escolas de condução.
+//  O Código da Estrada de Moçambique está em revisão: as lições de base não trazem limites nem valores; a escola acrescenta os que estão em vigor.
+const LICOES_BASE = [
+  { id: 'l01', t: 'Sinais', o: 1, ti: 'Sinais de trânsito: formas e cores', x:
+'Os sinais falam pela forma e pela cor. Reconhecer a forma de longe dá-lhe tempo para reagir antes de conseguir ler o símbolo.\n\n' +
+'- Triângulo com bordo vermelho e vértice para cima: perigo. Avisa de uma curva, de um cruzamento, de peões, de animais ou de obras. Abrande e prepare-se.\n' +
+'- Círculo com bordo vermelho: proibição. Proíbe entrar, virar, ultrapassar, parar ou estacionar, entre outras.\n' +
+'- Disco vermelho com barra branca: sentido proibido. Não pode entrar na via por esse lado.\n' +
+'- Octógono vermelho com a palavra STOP: paragem obrigatória. Pare sempre, mesmo sem trânsito, e só depois avance com segurança.\n' +
+'- Triângulo com o vértice para baixo: cedência de passagem. Deixe passar os veículos da outra via; se estiver livre, não precisa de parar.\n\n' +
+'Os sinais de obrigação, de indicação e de informação têm formas e cores próprias. O seu instrutor mostra-lhe os modelos usados em Moçambique.\n\n' +
+'Lembre-se: as ordens de um agente de trânsito estão acima dos sinais e das regras gerais. Se o agente mandar avançar com o semáforo vermelho, obedeça ao agente.' },
+  { id: 'l02', t: 'Semáforos', o: 2, ti: 'Semáforos', x:
+'- Vermelho: pare antes da linha de paragem e espere.\n' +
+'- Amarelo fixo: pare. Só pode continuar se já estiver tão perto que uma travagem brusca seria perigosa.\n' +
+'- Verde: pode avançar, mas com atenção. O verde não lhe dá o direito de atropelar quem ainda está a atravessar o cruzamento ou a passadeira.\n\n' +
+'Quando o semáforo está desligado ou avariado, valem os sinais verticais do cruzamento e as regras de prioridade. Aproxime-se devagar e esteja pronto para parar.\n\n' +
+'Nunca acelere para «apanhar» o amarelo: é uma das causas mais comuns de choques nos cruzamentos.' },
+  { id: 'l03', t: 'Regras', o: 3, ti: 'Regras de circulação', x:
+'Em Moçambique circula-se pela esquerda. Mantenha-se o mais à esquerda possível da sua faixa, deixando espaço para quem ultrapassa.\n\n' +
+'Ultrapassagem\n' +
+'- Faz-se pela direita do veículo ultrapassado.\n' +
+'- Antes: verifique os espelhos e o ângulo morto, confirme que tem visibilidade e espaço, e sinalize com o pisca.\n' +
+'- Não ultrapasse em curvas, lombas, passadeiras, cruzamentos ou onde haja linha contínua.\n\n' +
+'Rotundas: contornam-se no sentido dos ponteiros do relógio. Sinalize a saída.\n\n' +
+'Mudanças de direcção e de faixa: sinalize com antecedência e confirme os espelhos. Sinalizar não lhe dá prioridade: só avança quando for seguro.\n\n' +
+'Marcas no pavimento: a linha contínua não pode ser pisada nem transposta; a linha descontínua pode ser transposta quando for seguro.\n\n' +
+'Parar e estacionar: é proibido em curvas e lombas sem visibilidade, nas passadeiras, nos cruzamentos e onde os sinais o proíbam.\n\n' +
+'Velocidade: ajuste sempre a velocidade às condições da via, do tempo e do trânsito, mesmo abaixo do limite. Os limites de velocidade em vigor são dados pelo seu instrutor, de acordo com o Código da Estrada.' },
+  { id: 'l04', t: 'Peões', o: 4, ti: 'Peões e utilizadores vulneráveis', x:
+'Peões, ciclistas e motociclistas não têm a protecção de uma carroçaria. Um pequeno toque pode ser fatal.\n\n' +
+'- Na passadeira, o peão que está a atravessar tem de ser respeitado: pare e espere que termine.\n' +
+'- Junto a escolas, mercados, paragens de chapa e machimbombo, abrande: há pessoas a atravessar fora da passadeira.\n' +
+'- Crianças podem correr para a estrada sem olhar. Idosos e pessoas com deficiência atravessam mais devagar.\n' +
+'- Ao ultrapassar uma bicicleta, deixe bastante espaço lateral.\n' +
+'- À noite, peões com roupa escura são difíceis de ver: reduza a velocidade nas zonas habitadas.' },
+  { id: 'l05', t: 'Segurança', o: 5, ti: 'Segurança ao volante', x:
+'Cinto e crianças\n' +
+'- Todos os ocupantes usam cinto nos lugares que o têm.\n' +
+'- Crianças viajam num sistema de retenção adequado à idade, de preferência no banco de trás, nunca ao colo.\n\n' +
+'Atenção\n' +
+'- Não segure o telemóvel a conduzir.\n' +
+'- O álcool e as drogas atrasam as reacções e dão falsa confiança. Se vai conduzir, não beba.\n' +
+'- O sono mata: numa viagem longa, pare e descanse.\n\n' +
+'Distância e tempo\n' +
+'- Mantenha distância de segurança ao veículo da frente: é o que lhe permite travar a tempo.\n' +
+'- Com chuva, à noite ou com piso de terra, aumente a distância e reduza a velocidade.\n\n' +
+'Luzes: use os médios ao cruzar-se com outro veículo ou ao seguir alguém de perto; os máximos encandeiam.\n\n' +
+'Veículo: pneus gastos, travões fracos ou luzes fundidas aumentam o risco. Verifique-os com regularidade.\n\n' +
+'Animais na via: abrande e, se for preciso, pare até a estrada estar livre.' },
+  { id: 'l06', t: 'Avarias', o: 6, ti: 'Avarias na estrada', x:
+'Se o veículo avariar:\n' +
+'- Tente tirá-lo da faixa de rodagem.\n' +
+'- Ligue os quatro piscas.\n' +
+'- Coloque o triângulo de pré-sinalização bem visível, antes do veículo, para avisar quem vem atrás.\n' +
+'- Saia pelo lado seguro e afaste os passageiros da estrada.\n' +
+'- À noite, torne-se visível. Confirme com o instrutor o equipamento obrigatório no veículo.' },
+  { id: 'l07', t: 'Primeiros socorros', o: 7, ti: 'Acidentes e primeiros socorros', x:
+'Num acidente, siga a ordem: proteger, alertar, socorrer.\n\n' +
+'- Proteger: sinalize o local e proteja-se, para não haver um segundo acidente.\n' +
+'- Alertar: peça ajuda. Guarde no telemóvel os números de emergência da sua zona.\n' +
+'- Socorrer: não mexa nos feridos sem necessidade. Uma lesão na coluna pode piorar. Só os retire se houver perigo imediato, como fogo.\n\n' +
+'Enquanto a ajuda não chega: fale com o ferido, mantenha-o quente e não lhe dê de beber. Num motociclista ferido, não tire o capacete, a não ser que ele não consiga respirar.' },
+  { id: 'l08', t: 'Motociclos', o: 8, ti: 'Motociclos', x:
+'- O capacete, bem apertado, é para o condutor e para o passageiro.\n' +
+'- As motas são difíceis de ver: circule com as luzes ligadas e fique fora do ângulo morto dos carros e camiões.\n' +
+'- Não circule entre filas de carros nem faça ultrapassagens arriscadas.\n' +
+'- Com chuva ou areia na estrada, trave com suavidade: a mota escorrega com facilidade.\n' +
+'- Leve só os passageiros e a carga que a mota pode transportar com segurança.' }
+];
+async function licoesCodigo(escola) {
+  const linhas = await procurarTodos('licaocodigo', daEscola(escola), 500).catch(() => []);
+  const ocultas = new Set(linhas.filter(x => x['Base'] && x['Activa'] === false).map(x => x['Base']));
+  const base = LICOES_BASE.map(l => ({ id: l.id, base: true, tema: l.t, titulo: l.ti, texto: l.x, ordem: l.o, activa: !ocultas.has(l.id) }));
+  const proprias = linhas.filter(x => !x['Base'] && x['Titulo']).map(x => ({ id: x._id, base: false, tema: x['Tema'] || 'Geral', titulo: x['Titulo'] || '', texto: x['Texto'] || '', ordem: Number(x['Ordem'] || 50), activa: x['Activa'] !== false }));
+  return base.concat(proprias).sort((a, b) => a.ordem - b.ordem || a.titulo.localeCompare(b.titulo, 'pt'));
+}
+// material de estudo: lições activas com as perguntas do mesmo tema (com a resposta certa, porque é para estudar)
+async function materialCodigo(escola) {
+  const [ls, qs] = await Promise.all([licoesCodigo(escola), bancoCodigo(escola)]);
+  const activas = qs.filter(q => q.activa), usadas = new Set();
+  const licoes = ls.filter(l => l.activa).map(l => {
+    const perguntas = activas.filter(q => q.tema.toLowerCase() === l.tema.toLowerCase()); perguntas.forEach(q => usadas.add(q.id));
+    return { id: l.id, tema: l.tema, titulo: l.titulo, texto: l.texto, perguntas: perguntas.map(q => ({ id: q.id, pergunta: q.pergunta, opcoes: q.opcoes, correcta: q.correcta, explicacao: q.explicacao, imagem: q.imagem })) };
+  });
+  const soltas = activas.filter(q => !usadas.has(q.id));
+  if (soltas.length) licoes.push({ id: 'outras', tema: 'Outras', titulo: 'Outras perguntas da escola', texto: '', perguntas: soltas.map(q => ({ id: q.id, pergunta: q.pergunta, opcoes: q.opcoes, correcta: q.correcta, explicacao: q.explicacao, imagem: q.imagem })) });
+  return licoes;
+}
+// acesso pago ou gratuito
+const DESC_ACESSO = 'Acesso ao treino do código';
+function modoAcesso(escRaw, ins) { const m = (ins && ins['Codigo Acesso']) || (escRaw && escRaw['Codigo Acesso']) || 'gratis'; return m === 'pago' ? 'pago' : 'gratis'; }
+async function acessoCodigo(escola, ins, escRaw) {
+  const e = escRaw || await obter('escola', escola).catch(() => null);
+  const preco = Number((e && e['Codigo Preco']) || 0), modo = modoAcesso(e, ins);
+  if (modo !== 'pago' || !(preco > 0)) return { livre: true, modo: 'gratis', preco: 0 };
+  const ps = await procurarTodos('propina', daEscola(escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: ins['Estudante'] }])).catch(() => []);
+  const minhas = ps.filter(p => p['Descricao'] === DESC_ACESSO && p['Estado'] !== 'anulada');
+  const paga = minhas.find(p => p['Estado'] === 'paga'), aberta = minhas.find(p => p['Estado'] !== 'paga');
+  return { livre: !!paga, modo: 'pago', preco, cobranca: aberta ? aberta._id : null };
+}
+async function exigeAcessoCodigo(req, est) {
+  const i = await inscricaoActivaDe(req.escola, est);
+  if (!i) throw pub('O treino do código está disponível durante o curso de condução.');
+  const a = await acessoCodigo(req.escola, i);
+  if (!a.livre) { const e = new Error('O treino do código desta escola é pago (' + mt(a.preco) + '). Pague o acesso nas Prestações.'); e.publico = 402; throw e; }
+  return i;
+}
+app.post('/codigo-licoes', exigeDireccao, rota(async (req, res) => {
+  const [ls, e] = await Promise.all([licoesCodigo(req.escola), obter('escola', req.escola)]);
+  res.json({ ok: true, licoes: ls, acesso: { modo: (e && e['Codigo Acesso']) === 'pago' ? 'pago' : 'gratis', preco: Number((e && e['Codigo Preco']) || 0) } });
+}));
+app.post('/codigo-licao-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const titulo = txt(b.titulo, 120), texto = String(b.texto == null ? '' : b.texto).trim().slice(0, 6000);
+  if (titulo.length < 3) return erro(res, 400, 'Escreva o título da lição.');
+  if (texto.length < 20) return erro(res, 400, 'Escreva o texto da lição.');
+  const campos = { 'Escola': req.escola, 'Base': '', 'Tema': txt(b.tema, 40) || 'Geral', 'Titulo': titulo, 'Texto': texto, 'Ordem': Math.max(1, Math.min(999, Math.round(Number(b.ordem) || 50))), 'Activa': true };
+  let id = b.id ? String(b.id) : null;
+  if (id) { const x = await daMinhaEscola('licaocodigo', id, req.escola); if (x['Base']) return erro(res, 400, 'As lições de base não se editam: esconda-a e crie uma sua.'); await mudar('licaocodigo', id, campos); }
+  else id = await criar('licaocodigo', campos);
+  res.json({ ok: true, id });
+}));
+app.post('/codigo-licao-estado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, id = String(b.id || ''), activa = b.activa !== false;
+  if (LICOES_BASE.some(l => l.id === id)) {
+    const ja = (await procurarTodos('licaocodigo', daEscola(req.escola).concat([{ key: 'Base', constraint_type: 'equals', value: id }]))).filter(x => x['Escola'] === req.escola)[0];
+    if (ja) await mudar('licaocodigo', ja._id, { 'Activa': activa });
+    else if (!activa) await criar('licaocodigo', { 'Escola': req.escola, 'Base': id, 'Activa': false, 'Titulo': '', 'Texto': '' });
+  } else { const x = await daMinhaEscola('licaocodigo', id, req.escola); await mudar('licaocodigo', x._id, { 'Activa': activa }); }
+  res.json({ ok: true, activa });
+}));
+app.post('/codigo-acesso-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, modo = b.modo === 'pago' ? 'pago' : 'gratis';
+  const preco = Math.round(Number(String(b.preco == null ? '' : b.preco).replace(/\s/g, '')) || 0);
+  if (modo === 'pago' && !(preco >= MOZ_MIN)) return erro(res, 400, 'Escreva o preço do acesso (pelo menos ' + MOZ_MIN + ' MT, o mínimo para pagar online).');
+  await mudar('escola', req.escola, { 'Codigo Acesso': modo, 'Codigo Preco': modo === 'pago' ? preco : 0 });
+  res.json({ ok: true, modo, preco: modo === 'pago' ? preco : 0 });
+}));
+app.post('/inscricao-codigo-acesso', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, v = ['gratis', 'pago'].includes(b.acesso) ? b.acesso : '';
+  const i = await daMinhaEscola('inscricaoconducao', String(b.id || ''), req.escola);
+  await mudar('inscricaoconducao', i._id, { 'Codigo Acesso': v });
+  // ao passar para gratuito, a cobrança do acesso que ainda não foi paga deixa de ser devida
+  if (v === 'gratis') {
+    const ps = await procurarTodos('propina', daEscola(req.escola).concat([{ key: 'Estudante', constraint_type: 'equals', value: i['Estudante'] }])).catch(() => []);
+    for (const p of ps.filter(x => x['Descricao'] === DESC_ACESSO && x['Estado'] !== 'paga' && x['Estado'] !== 'anulada')) await mudar('propina', p._id, { 'Estado': 'anulada' }).catch(() => {});
+  }
+  res.json({ ok: true, acesso: await acessoCodigo(req.escola, Object.assign({}, i, { 'Codigo Acesso': v })) });
+}));
+// portal do instruendo
+app.post('/p/codigo-estudo', exigePortal, rota(async (req, res) => {
+  const est = String((req.body || {}).estudante || '');
+  if (!req.educandos.includes(est)) return erro(res, 403, 'Este instruendo não pertence a esta conta.');
+  await exigeAcessoCodigo(req, est);
+  res.json({ ok: true, licoes: await materialCodigo(req.escola) });
+}));
+app.post('/p/codigo-acesso', exigePortal, rota(async (req, res) => {
+  const est = String((req.body || {}).estudante || '');
+  if (!req.educandos.includes(est)) return erro(res, 403, 'Este instruendo não pertence a esta conta.');
+  const i = await inscricaoActivaDe(req.escola, est);
+  if (!i) return erro(res, 400, 'O treino do código está disponível durante o curso de condução.');
+  const a = await acessoCodigo(req.escola, i);
+  if (a.livre) return res.json({ ok: true, livre: true });
+  let id = a.cobranca;
+  if (!id) {
+    const hoje = hojeMZ().data, vz = new Date(hoje + 'T21:59:00Z');
+    id = await criar('propina', { 'Escola': req.escola, 'Estudante': est, 'Ano Lectivo': hoje.slice(0, 4), 'Tipo': 'prestacao', 'Mes': Number(hoje.slice(5, 7)), 'Descricao': DESC_ACESSO, 'Valor': a.preco, 'Vencimento': vz.toISOString(), 'Multa': 0, 'Total': a.preco, 'Estado': 'aberta' });
+  }
+  res.json({ ok: true, livre: false, cobranca: id, preco: a.preco });
+}));
+// instrutores: o mesmo material, para preparar as aulas
+app.post('/prof/codigo-estudo', exigeProfessor, rota(async (req, res) => {
+  const e = await resumoEscola(req.escola);
+  if (!e || !(e.niveis || []).includes('CON')) return erro(res, 403, 'O treino do código é só para escolas de condução.');
+  res.json({ ok: true, licoes: await materialCodigo(req.escola) });
 }));
 
 // ---------- processo, documentos e licença de aprendizagem ----------
@@ -3012,7 +3197,7 @@ async function conducaoDoEstudante(escola, estId, cache) {
   if (!cache.vias) cache.vias = Object.fromEntries((await procurarTodos('viatura', daEscola(escola))).map(v => [v._id, v]));
   const minhas = aps.filter(a => a['Inscricao'] === i._id), hoje = hojeMZ().data;
   return { categoria: i['Categoria'] || '', curso: (c && c['Nome']) || '', estado: i['Estado'] || 'activa', teoricas: Number((c && c['Aulas Teoricas']) || 0), teoricas_feitas: teoFeitas,
-    codigo: resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)), processo: processoOut(i, docs),
+    codigo: Object.assign(resumoCodigo(ts.filter(t => t['Inscricao'] === i._id)), { acesso: (i['Estado'] || 'activa') === 'activa' ? await acessoCodigo(escola, i).catch(() => ({ livre: true })) : { livre: false, fim: true } }), processo: processoOut(i, docs),
     praticas: { feitas: minhas.filter(a => a['Estado'] === 'feita').length, faltou: minhas.filter(a => a['Estado'] === 'faltou').length, total: Number((c && c['Aulas Praticas']) || 0), minutos: minhas.filter(a => a['Estado'] === 'feita').reduce((x, a) => x + Number(a['Minutos'] || 0), 0) },
     proximas: minhas.filter(a => a['Estado'] === 'marcada' && a['Data'] >= hoje).sort((a, b) => (a['Data'] + a['Inicio']).localeCompare(b['Data'] + b['Inicio'])).slice(0, 10)
       .map(a => ({ data: a['Data'], inicio: a['Inicio'], fim: a['Fim'], instrutor: cache.profs[a['Instrutor']] || '', viatura: (cache.vias[a['Viatura']] || {})['Matricula'] || '', modelo: (cache.vias[a['Viatura']] || {})['Marca Modelo'] || '' })),
