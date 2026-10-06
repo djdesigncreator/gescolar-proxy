@@ -21,6 +21,7 @@
 //    Professores e notas (v4.5): entrada do professor por SMS · /prof/inicio /prof/pauta /prof/pauta-guardar
 //                                Direcção: /pautas-turma /pauta /pauta-guardar /pautas-publicar · portal: notas em /p/inicio
 //    Escolinha (v5.3): avaliação descritiva nas pautas · /prof/diario /prof/diario-guardar · autorizados a recolher
+//    Inscrições online (v5.7): links públicos personalizados com pagamento · /links /link-guardar /inscricoes-online · /pub/link /pub/inscrever
 //    Matrícula (v5.6): SMS de boas-vindas sempre (encarregado e/ou estudante) · no superior o estudante é o titular (sem encarregado)
 //    Superior e Técnico (v5.5): pautas semestrais (frequência, exame, recorrência), créditos das cadeiras
 //    Primário (v5.4): professor titular da turma (monodocência) · chamada do dia (Tempo 99) · Turma.Professor Titular (text)
@@ -47,7 +48,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.6.3';
+const VERSAO = 'gescolar-proxy 5.7.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -102,7 +103,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -508,48 +509,50 @@ app.post('/estudantes', exigeDireccao, rota(async (req, res) => {
   const [est, encs] = await Promise.all([procurarTodos('estudante', filtros), procurarTodos('encarregado', f)]);
   res.json({ ok: true, estudantes: est.filter(e => (e['Estado'] || 'activo') !== 'apagado').map(e => estOut(e, encs)).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
 }));
-app.post('/matricular', exigeDireccao, rota(async (req, res) => {
-  const b = req.body || {}, nome = txt(b.nome, 100);
-  if (nome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome e o apelido do estudante.');
+// matrícula partilhada: Direcção (/matricular) e inscrições online aprovadas
+function pub(msg) { const e = new Error(msg); e.publico = 400; return e; }
+async function matricularCore(escolaId, b) {
+  const nome = txt(b.nome, 100);
+  if (nome.split(/\s+/).length < 2) throw pub('Escreva o nome e o apelido do estudante.');
   const turmaId = String(b.turma || '');
-  const turma = await daMinhaEscola('turma', turmaId, req.escola);
-  const escola = await resumoEscola(req.escola);
+  const turma = await daMinhaEscola('turma', turmaId, escolaId);
+  const escola = await resumoEscola(escolaId);
   // no ensino superior o estudante é adulto: não há encarregado, o telemóvel dele é obrigatório
   const superior = turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP';
-  if (superior && tel9(b.telefone).length !== 9) return erro(res, 400, 'No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
+  if (superior && tel9(b.telefone).length !== 9) throw pub('No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
   // encarregado: reutiliza pelo telefone, senão cria
   const telEnc = superior ? '' : tel9(b.enc_telefone);
   let encId = null, encTel = '';
   if (!superior && (txt(b.enc_nome, 100) || telEnc)) {
-    if (!telEnc) return erro(res, 400, 'Escreveu o nome do encarregado mas falta o telemóvel dele (ex.: 84 123 4567). Ou apague o nome para matricular sem encarregado.');
-    if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) return erro(res, 400, 'O telemóvel do encarregado deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEnc.length + ' dígito(s).');
-    const encs = await procurarTodos('encarregado', daEscola(req.escola));
+    if (!telEnc) throw pub('Escreveu o nome do encarregado mas falta o telemóvel dele (ex.: 84 123 4567). Ou apague o nome para matricular sem encarregado.');
+    if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) throw pub('O telemóvel do encarregado deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEnc.length + ' dígito(s).');
+    const encs = await procurarTodos('encarregado', daEscola(escolaId));
     const ja = encs.find(e => tel9(e['Telefone']) === telEnc);
     if (ja) { encId = ja._id; encTel = ja['Recebe SMS'] === false ? '' : telEnc; }
     else {
       encTel = telEnc;
-      if (txt(b.enc_nome, 100).split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do encarregado.');
-      encId = await criar('encarregado', { 'Escola': req.escola, 'Nome': txt(b.enc_nome, 100), 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
+      if (txt(b.enc_nome, 100).split(/\s+/).length < 2) throw pub('Escreva o nome completo do encarregado.');
+      encId = await criar('encarregado', { 'Escola': escolaId, 'Nome': txt(b.enc_nome, 100), 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
     }
   }
   // número de estudante: ano-sequência
-  const todos = await procurarTodos('estudante', daEscola(req.escola));
+  const todos = await procurarTodos('estudante', daEscola(escolaId));
   const ano = (escola && escola.ano) || String(new Date().getFullYear());
   const maior = todos.map(e => String(e['Numero'] || '')).filter(n => n.startsWith(ano + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, c) => Math.max(a, c), 0);
   const numero = ano + '-' + String(maior + 1).padStart(4, '0');
-  const campos = { 'Escola': req.escola, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Turma': turma._id, 'Ano Lectivo': ano,
+  const campos = { 'Escola': escolaId, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Turma': turma._id, 'Ano Lectivo': ano,
     'Data Matricula': new Date().toISOString(), 'Estado': 'activo', 'Saude Notas': txt(b.saude, 300) };
   if (b.nascimento && !isNaN(Date.parse(b.nascimento))) campos['Data Nascimento'] = new Date(b.nascimento).toISOString();
   if (encId) campos['Encarregado'] = encId;
   const telEst = tel9(b.telefone);
   if (telEst) {
-    if (telEst.length !== 9 || !/^8[2-7]/.test(telEst)) return erro(res, 400, 'O telemóvel do estudante deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEst.length + ' dígito(s).');
+    if (telEst.length !== 9 || !/^8[2-7]/.test(telEst)) throw pub('O telemóvel do estudante deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEst.length + ' dígito(s).');
     campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
   }
   const id = await criar('estudante', campos);
   // SMS de boas-vindas com o número e o link de acesso (sem palavra-passe: entra com o telemóvel e recebe um código)
   let sms = 0;
-  const esc = await obter('escola', req.escola).catch(() => null);
+  const esc = await obter('escola', escolaId).catch(() => null);
   if (esc) {
     const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, ''), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
     if (telEst) {
@@ -563,8 +566,12 @@ app.post('/matricular', exigeDireccao, rota(async (req, res) => {
       if (r.ok) sms++;
     }
   }
-  cachePainel.delete(req.escola);
-  res.json({ ok: true, id, numero, sms });
+  cachePainel.delete(escolaId);
+  return { id, numero, sms };
+}
+app.post('/matricular', exigeDireccao, rota(async (req, res) => {
+  const r = await matricularCore(req.escola, req.body || {});
+  res.json(Object.assign({ ok: true }, r));
 }));
 
 
@@ -2258,21 +2265,21 @@ app.post('/instruendos', exigeDireccao, rota(async (req, res) => {
       praticas: { feitas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'feita').length, marcadas: aulas.filter(a => a['Inscricao'] === i._id && a['Estado'] === 'marcada').length, total: Number(c['Aulas Praticas'] || 0) } };
   }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
 }));
-app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
-  const b = req.body || {}, nome = txt(b.nome, 100);
-  if (nome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do instruendo.');
+async function inscreverCore(escolaId, b) {
+  const nome = txt(b.nome, 100);
+  if (nome.split(/\s+/).length < 2) throw pub('Escreva o nome completo do instruendo.');
   const tel = tel9(b.telefone);
-  if (tel.length !== 9) return erro(res, 400, 'O telemóvel tem 9 dígitos. É por ele que o instruendo entra no portal e recebe avisos.');
-  if (!b.nascimento || isNaN(Date.parse(b.nascimento))) return erro(res, 400, 'Escreva a data de nascimento: a idade mínima depende da categoria.');
-  const c = await daMinhaEscola('cursoconducao', String(b.curso || ''), req.escola);
-  if (c['Activo'] === false) return erro(res, 400, 'Este curso já não está activo.');
+  if (tel.length !== 9) throw pub('O telemóvel tem 9 dígitos. É por ele que o instruendo entra no portal e recebe avisos.');
+  if (!b.nascimento || isNaN(Date.parse(b.nascimento))) throw pub('Escreva a data de nascimento: a idade mínima depende da categoria.');
+  const c = await daMinhaEscola('cursoconducao', String(b.curso || ''), escolaId);
+  if (c['Activo'] === false) throw pub('Este curso já não está activo.');
   const idade = idadeEm(b.nascimento), minima = Number(c['Idade Minima'] || (CATEGORIAS[c['Categoria']] || {}).idade || 18);
-  if (idade < minima) return erro(res, 400, 'A carta ' + c['Categoria'] + ' exige pelo menos ' + minima + ' anos. O instruendo tem ' + idade + '.');
+  if (idade < minima) throw pub('A carta ' + c['Categoria'] + ' exige pelo menos ' + minima + ' anos. O instruendo tem ' + idade + '.');
   const prest = Math.max(1, Math.min(Number(c['Prestacoes'] || 1), Math.round(Number(b.prestacoes) || Number(c['Prestacoes'] || 1))));
   const preco = Number(c['Preco'] || 0);
   const inicio = b.inicio && !isNaN(Date.parse(b.inicio)) ? new Date(b.inicio + 'T12:00:00Z') : new Date();
   // número do instruendo: C<ano>-0001 (separado dos estudantes)
-  const ests = await procurarTodos('estudante', daEscola(req.escola));
+  const ests = await procurarTodos('estudante', daEscola(escolaId));
   const ano = String(new Date().getFullYear());
   const repetido = ests.find(e => tel9(e['Telefone']) === tel && (e['Estado'] || 'activo') === 'activo' && String(e['Numero'] || '').startsWith('C'));
   let estId, numero;
@@ -2280,29 +2287,33 @@ app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
   else {
     const maior = ests.map(e => String(e['Numero'] || '')).filter(n => n.startsWith('C' + ano + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, x) => Math.max(a, x), 0);
     numero = 'C' + ano + '-' + String(maior + 1).padStart(4, '0');
-    const campos = { 'Escola': req.escola, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'),
+    const campos = { 'Escola': escolaId, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'),
       'Data Nascimento': new Date(b.nascimento).toISOString(), 'Ano Lectivo': ano, 'Data Matricula': new Date().toISOString(), 'Estado': 'activo' };
     estId = await criar('estudante', campos);
   }
-  const insId = await criar('inscricaoconducao', { 'Escola': req.escola, 'Estudante': estId, 'Curso': c._id, 'Categoria': c['Categoria'], 'Data Inscricao': new Date().toISOString(), 'Estado': 'activa', 'Preco': preco, 'Prestacoes': prest });
+  const insId = await criar('inscricaoconducao', { 'Escola': escolaId, 'Estudante': estId, 'Curso': c._id, 'Categoria': c['Categoria'], 'Data Inscricao': new Date().toISOString(), 'Estado': 'activa', 'Preco': preco, 'Prestacoes': prest });
   // prestações: dividir o preço; a primeira vence no dia da inscrição (ou no início escolhido), as outras de mês a mês
   const base = Math.floor(preco / prest), resto = preco - base * prest, linhas = [];
   for (let k = 0; k < prest; k++) {
     const v = new Date(inicio); v.setUTCMonth(v.getUTCMonth() + k); v.setUTCHours(21, 59, 0, 0);
     const valor = base + (k === 0 ? resto : 0);
-    linhas.push({ 'Escola': req.escola, 'Estudante': estId, 'Ano Lectivo': String(v.getUTCFullYear()), 'Tipo': 'prestacao', 'Mes': v.getUTCMonth() + 1,
+    linhas.push({ 'Escola': escolaId, 'Estudante': estId, 'Ano Lectivo': String(v.getUTCFullYear()), 'Tipo': 'prestacao', 'Mes': v.getUTCMonth() + 1,
       'Descricao': 'Carta ' + c['Categoria'] + ' · ' + (prest === 1 ? 'pagamento único' : 'prestação ' + (k + 1) + '/' + prest), 'Valor': valor, 'Vencimento': v.toISOString(), 'Multa': 0, 'Total': valor, 'Estado': 'aberta' });
   }
   await criarEmLote('propina', linhas);
-  const esc = await obter('escola', req.escola).catch(() => null);
+  const esc = await obter('escola', escolaId).catch(() => null);
   let sms = false;
   if (esc) {
     const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
     const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Estudante).');
     sms = r.ok;
   }
-  cachePainel.delete(req.escola);
-  res.json({ ok: true, id: insId, estudante: estId, numero, prestacoes: prest, sms });
+  cachePainel.delete(escolaId);
+  return { id: insId, estudante: estId, numero, prestacoes: prest, sms };
+}
+app.post('/inscrever', exigeDireccao, rota(async (req, res) => {
+  const r = await inscreverCore(req.escola, req.body || {});
+  res.json(Object.assign({ ok: true }, r));
 }));
 app.post('/inscricao-estado', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {}, estado = String(b.estado || '');
@@ -2631,6 +2642,249 @@ async function diarioDoEstudante(escola, estId) {
     .sort((a, b) => b.data.localeCompare(a.data));
 }
 
+
+// ============================================================
+//  INSCRIÇÕES ONLINE (v5.7)
+//  A escola cria links públicos (inscricao.html?e=<escola>&l=<codigo>) com a sua capa, texto, preço, prazo e vagas.
+//  O candidato preenche os dados, paga a taxa (M-Pesa, e-Mola ou cartão) e fica na lista da Direcção para matricular.
+//  Bubble:
+//   Link Inscricao:  Escola (Escola) · Codigo (text) · Titulo (text) · Descricao (text) · Preco (number) · Cor (text) · Capa (text)
+//                    · Nivel (text) · Prazo (date) · Vagas (number) · Campos (text, JSON) · Mensagem Final (text) · Contacto (text)
+//                    · WhatsApp (text) · Activo (yes/no)
+//   Inscricao Online: Escola (Escola) · Link (text) · Nome (text) · Telefone (text) · Nascimento (text) · Encarregado Nome (text)
+//                    · Encarregado Telefone (text) · Email (text) · Respostas (text, JSON) · Valor (number) · Metodo (text)
+//                    · Estado (text: pendente | paga | falhada | matriculada | recusada) · Referencia (text) · Transacao (text)
+//                    · Pago Em (date) · Chave (text) · Estudante (text) · Numero (text)
+// ============================================================
+const TIPOS_CAMPO = ['texto', 'opcoes', 'simnao'];
+const COR_OK = c => /^#[0-9a-f]{6}$/i.test(String(c || ''));
+function lerCampos(t) { try { const l = JSON.parse(t || '[]'); return Array.isArray(l) ? l : []; } catch (e) { return []; } }
+function validarCampos(lista) {
+  const out = [];
+  for (const c of (Array.isArray(lista) ? lista : []).slice(0, 10)) {
+    const rotulo = txt(c && c.rotulo, 60); if (!rotulo) continue;
+    const tipo = TIPOS_CAMPO.includes(c.tipo) ? c.tipo : 'texto';
+    const opcoes = tipo === 'opcoes' ? [...new Set((Array.isArray(c.opcoes) ? c.opcoes : String(c.opcoes || '').split(',')).map(o => txt(o, 40)).filter(Boolean))].slice(0, 12) : [];
+    if (tipo === 'opcoes' && opcoes.length < 2) throw pub('A pergunta "' + rotulo + '" precisa de pelo menos 2 opções, separadas por vírgulas.');
+    out.push({ id: 'c' + (out.length + 1), rotulo, tipo, opcoes, obrigatorio: !!c.obrigatorio });
+  }
+  return out;
+}
+const pedeEncarregado = l => !['SUP', 'CON', NIVEIS.SUP, NIVEIS.CON].includes(l['Nivel']);
+function fimDoPrazo(l) { return l['Prazo'] ? new Date(String(l['Prazo']).slice(0, 10) + 'T21:59:59Z') : null; }   // fim do dia em Maputo
+async function contarInscritos(escola, link) {
+  const l = await procurarTodos('inscricaoonline', daEscola(escola).concat([{ key: 'Link', constraint_type: 'equals', value: link._id }]), 5000);
+  const validas = l.filter(i => ['paga', 'matriculada'].includes(i['Estado']) || (!Number(link['Preco']) && i['Estado'] !== 'recusada'));
+  return { todas: l, validas: validas.length };
+}
+function situacaoLink(l, inscritos) {
+  if (l['Activo'] === false) return { aberto: false, motivo: 'As inscrições deste link estão fechadas.' };
+  const fim = fimDoPrazo(l);
+  if (fim && Date.now() > fim.getTime()) return { aberto: false, motivo: 'O prazo de inscrição terminou a ' + String(l['Prazo']).slice(8, 10) + '/' + String(l['Prazo']).slice(5, 7) + '/' + String(l['Prazo']).slice(0, 4) + '.' };
+  const vagas = Number(l['Vagas'] || 0);
+  if (vagas && inscritos >= vagas) return { aberto: false, motivo: 'As vagas já estão todas preenchidas.' };
+  return { aberto: true, restantes: vagas ? vagas - inscritos : null };
+}
+function linkOut(l, extra) {
+  return Object.assign({ id: l._id, codigo: l['Codigo'] || '', titulo: l['Titulo'] || '', descricao: l['Descricao'] || '', preco: Number(l['Preco'] || 0), cor: COR_OK(l['Cor']) ? l['Cor'] : '#0A64DC',
+    capa: l['Capa'] || '', nivel: CODIGO_NIVEL[l['Nivel']] || l['Nivel'] || '', prazo: l['Prazo'] ? String(l['Prazo']).slice(0, 10) : '', vagas: Number(l['Vagas'] || 0),
+    campos: lerCampos(l['Campos']), mensagem: l['Mensagem Final'] || '', contacto: l['Contacto'] || '', whatsapp: l['WhatsApp'] || '', activo: l['Activo'] !== false,
+    encarregado: pedeEncarregado(l) }, extra || {});
+}
+const inscOut = i => ({ id: i._id, link: i['Link'] || '', nome: i['Nome'] || '', telefone: i['Telefone'] || '', nascimento: i['Nascimento'] || '', enc_nome: i['Encarregado Nome'] || '',
+  enc_telefone: i['Encarregado Telefone'] || '', email: i['Email'] || '', respostas: (() => { try { return JSON.parse(i['Respostas'] || '{}'); } catch (e) { return {}; } })(),
+  valor: Number(i['Valor'] || 0), metodo: i['Metodo'] || '', estado: i['Estado'] || 'pendente', referencia: i['Referencia'] || '', pago_em: i['Pago Em'] || null,
+  criado: i['Created Date'] || null, numero: i['Numero'] || '', estudante: i['Estudante'] || '' });
+function linkPublico(sub, codigo) { return PORTAL_URL.replace(/acesso\.html.*$/, '') + 'inscricao.html?e=' + encodeURIComponent(sub || '') + '&l=' + encodeURIComponent(codigo || ''); }
+
+// ---------- Direcção ----------
+app.post('/links', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [ls, is, esc] = await Promise.all([procurarTodos('linkinscricao', f), procurarTodos('inscricaoonline', f, 10000), obter('escola', req.escola)]);
+  res.json({ ok: true, base: linkPublico(esc['Subdominio'], ''), links: ls.map(l => {
+    const d = is.filter(i => i['Link'] === l._id), pagas = d.filter(i => i['Estado'] === 'paga').length, mat = d.filter(i => i['Estado'] === 'matriculada').length;
+    const sit = situacaoLink(l, d.filter(i => ['paga', 'matriculada'].includes(i['Estado']) || (!Number(l['Preco']) && i['Estado'] !== 'recusada')).length);
+    return linkOut(l, { capa: undefined, tem_capa: !!l['Capa'], url: linkPublico(esc['Subdominio'], l['Codigo']), total: d.length, pagas, matriculadas: mat,
+      pendentes: d.filter(i => i['Estado'] === 'pendente').length, aberto: sit.aberto, motivo: sit.motivo || '' });
+  }).sort((a, b) => Number(b.activo) - Number(a.activo) || a.titulo.localeCompare(b.titulo, 'pt')) });
+}));
+app.post('/link', exigeDireccao, rota(async (req, res) => {
+  const l = await daMinhaEscola('linkinscricao', String((req.body || {}).id || ''), req.escola);
+  res.json({ ok: true, link: linkOut(l) });
+}));
+app.post('/link-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const titulo = txt(b.titulo, 90);
+  if (titulo.length < 4) return erro(res, 400, 'Escreva o título do link, por exemplo "Inscrições 2027 · 8ª Classe".');
+  const nivel = String(b.nivel || '').toUpperCase();
+  if (nivel && !NIVEIS[nivel]) return erro(res, 400, 'Nível inválido.');
+  const preco = Math.max(0, Math.round(num(b.preco, 0)));
+  if (preco > 500000) return erro(res, 400, 'O preço parece demasiado alto. Verifique o valor.');
+  const capa = String(b.capa || '');
+  if (capa && (!/^data:image\/(png|jpe?g|webp);base64,/.test(capa) || capa.length > 420000)) return erro(res, 400, 'A imagem de capa tem de ser JPG, PNG ou WebP e ter no máximo 300 KB.');
+  if (b.prazo && !dataOk(b.prazo)) return erro(res, 400, 'Data limite inválida.');
+  const campos = validarCampos(b.campos);
+  const campos2 = { 'Escola': req.escola, 'Titulo': titulo, 'Descricao': txt(b.descricao, 2000), 'Preco': preco, 'Cor': COR_OK(b.cor) ? b.cor : '#0A64DC', 'Capa': capa,
+    'Nivel': nivel ? NIVEIS[nivel] : '', 'Vagas': Math.max(0, Math.round(num(b.vagas, 0))), 'Campos': JSON.stringify(campos), 'Mensagem Final': txt(b.mensagem, 600),
+    'Contacto': txt(b.contacto, 40), 'WhatsApp': tel9(b.whatsapp).length === 9 ? tel9(b.whatsapp) : '', 'Activo': b.activo !== false };
+  if (b.prazo) campos2['Prazo'] = new Date(b.prazo + 'T12:00:00Z').toISOString();
+  let id = b.id ? String(b.id) : null;
+  if (id) { await daMinhaEscola('linkinscricao', id, req.escola); await mudar('linkinscricao', id, campos2); }
+  else {
+    const todos = await procurarTodos('linkinscricao', daEscola(req.escola));
+    let cod = slug(txt(b.codigo, 30) || titulo).slice(0, 24) || 'inscricao';
+    while (todos.some(l => l['Codigo'] === cod)) cod = cod.replace(/-\d{3}$/, '') + '-' + (100 + Math.floor(Math.random() * 900));
+    campos2['Codigo'] = cod;
+    id = await criar('linkinscricao', campos2);
+  }
+  const l = await obter('linkinscricao', id), esc = await obter('escola', req.escola);
+  res.json({ ok: true, id, codigo: l['Codigo'], url: linkPublico(esc['Subdominio'], l['Codigo']) });
+}));
+app.post('/link-estado', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const l = await daMinhaEscola('linkinscricao', String(b.id || ''), req.escola);
+  await mudar('linkinscricao', l._id, { 'Activo': !!b.activo });
+  res.json({ ok: true, activo: !!b.activo });
+}));
+app.post('/inscricoes-online', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const f = daEscola(req.escola).concat(b.link ? [{ key: 'Link', constraint_type: 'equals', value: String(b.link) }] : []);
+  const l = await procurarTodos('inscricaoonline', f, 10000);
+  res.json({ ok: true, inscricoes: l.map(inscOut).sort((x, y) => String(y.pago_em || y.criado || '').localeCompare(String(x.pago_em || x.criado || ''))) });
+}));
+app.post('/inscricao-online-matricular', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const i = await daMinhaEscola('inscricaoonline', String(b.id || ''), req.escola);
+  if (i['Estado'] === 'matriculada') return erro(res, 400, 'Esta inscrição já foi matriculada (nº ' + (i['Numero'] || '') + ').');
+  if (i['Estado'] !== 'paga') return erro(res, 400, 'Só pode matricular inscrições pagas.');
+  let r;
+  if (b.curso) {   // escola de condução: inscreve no curso escolhido
+    r = await inscreverCore(req.escola, { curso: String(b.curso), nome: i['Nome'], telefone: i['Telefone'] || i['Encarregado Telefone'], nascimento: i['Nascimento'] });
+    r = { id: r.estudante, numero: r.numero, sms: r.sms ? 1 : 0 };
+  } else {
+    if (!b.turma) return erro(res, 400, 'Escolha a turma.');
+    r = await matricularCore(req.escola, { nome: i['Nome'], turma: String(b.turma), nascimento: i['Nascimento'], telefone: i['Telefone'],
+      enc_nome: i['Encarregado Nome'], enc_telefone: i['Encarregado Telefone'], enc_email: i['Email'] });
+  }
+  await mudar('inscricaoonline', i._id, { 'Estado': 'matriculada', 'Estudante': r.id || '', 'Numero': r.numero || '' });
+  res.json({ ok: true, numero: r.numero, sms: r.sms });
+}));
+app.post('/inscricao-online-recusar', exigeDireccao, rota(async (req, res) => {
+  const i = await daMinhaEscola('inscricaoonline', String((req.body || {}).id || ''), req.escola);
+  if (i['Estado'] === 'matriculada') return erro(res, 400, 'Esta inscrição já foi matriculada.');
+  await mudar('inscricaoonline', i._id, { 'Estado': 'recusada' });
+  res.json({ ok: true });
+}));
+
+// ---------- página pública ----------
+async function linkDaEscola(sub, codigo) {
+  const esc = await escolaPorCodigo(sub);
+  if (!esc) return {};
+  const l = (await procurar('linkinscricao', daEscola(esc._id).concat([{ key: 'Codigo', constraint_type: 'equals', value: slug(codigo) }]), 1))[0];
+  return { esc, l };
+}
+app.post('/pub/link', rota(async (req, res) => {
+  const b = req.body || {};
+  if (travao('pub-link|' + req.ip, 60, 10)) return erro(res, 429, 'Muitos pedidos seguidos. Espere alguns minutos.');
+  const { esc, l } = await linkDaEscola(b.escola, b.link);
+  if (!esc || !l) return erro(res, 404, 'Este link de inscrição não existe. Confirme o endereço com a escola.');
+  const n = await contarInscritos(esc._id, l), sit = situacaoLink(l, n.validas);
+  res.json({ ok: true, escola: { nome: esc['Nome'] || '', logotipo: esc['Logotipo'] || '', telefone: esc['Telefone'] || '', email: esc['Email'] || '', morada: esc['Morada'] || '' },
+    link: linkOut(l), aberto: sit.aberto, motivo: sit.motivo || '', restantes: sit.restantes == null ? null : sit.restantes });
+}));
+async function confirmarInscricaoSMS(i, l, esc) {
+  const tel = tel9(i['Encarregado Telefone']) || tel9(i['Telefone']);
+  if (tel.length !== 9) return false;
+  const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': inscricao de ' + i['Nome'] + ' em "' + (l['Titulo'] || '') + '" recebida' +
+    (Number(i['Valor']) ? ' e paga (' + Number(i['Valor']) + ' MT)' : '') + '. A escola vai contacta-lo para a matricula.').catch(() => ({ ok: false }));
+  return !!r.ok;
+}
+app.post('/pub/inscrever', rota(async (req, res) => {
+  const b = req.body || {};
+  if (travao('pub-insc|' + req.ip, 8, 30)) return erro(res, 429, 'Muitas inscrições seguidas a partir desta ligação. Espere meia hora.');
+  const { esc, l } = await linkDaEscola(b.escola, b.link);
+  if (!esc || !l) return erro(res, 404, 'Este link de inscrição não existe.');
+  const n = await contarInscritos(esc._id, l), sit = situacaoLink(l, n.validas);
+  if (!sit.aberto) return erro(res, 400, sit.motivo);
+  const nome = txt(b.nome, 100);
+  if (nome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do candidato.');
+  const tel = tel9(b.telefone), telEnc = tel9(b.enc_telefone);
+  const comEnc = pedeEncarregado(l);
+  if (tel && (tel.length !== 9 || !/^8[2-7]/.test(tel))) return erro(res, 400, 'O telemóvel do candidato deve ter 9 dígitos (ex.: 84 123 4567).');
+  if (comEnc) {
+    if (txt(b.enc_nome, 100).split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do encarregado de educação.');
+    if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) return erro(res, 400, 'O telemóvel do encarregado deve ter 9 dígitos (ex.: 84 123 4567).');
+  } else if (tel.length !== 9) return erro(res, 400, 'Escreva o seu telemóvel: é por ele que a escola o contacta.');
+  if (b.nascimento && !dataOk(b.nascimento)) return erro(res, 400, 'Data de nascimento inválida.');
+  const email = txt(b.email, 120).toLowerCase();
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return erro(res, 400, 'O email não parece válido.');
+  const respostas = {};
+  for (const c of lerCampos(l['Campos'])) {
+    let v = (b.respostas || {})[c.id];
+    v = c.tipo === 'simnao' ? (v === true || v === 'sim' ? 'Sim' : v === false || v === 'nao' ? 'Não' : '') : txt(v, 300);
+    if (c.tipo === 'opcoes' && v && !c.opcoes.includes(v)) return erro(res, 400, 'Escolha uma opção válida em "' + c.rotulo + '".');
+    if (c.obrigatorio && !v) return erro(res, 400, 'Responda a "' + c.rotulo + '".');
+    if (v) respostas[c.rotulo] = v;
+  }
+  const preco = Number(l['Preco'] || 0);
+  const metodo = String(b.metodo || '').toLowerCase(), numero = tel9(b.numero);
+  if (preco) {
+    if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha como vai pagar: M-Pesa, e-Mola ou cartão.');
+    if (!MOZ_WALLET) return erro(res, 500, 'A escola ainda não pode receber pagamentos online.');
+    if (metodo !== 'cartao') {
+      if (numero.length !== 9) return erro(res, 400, 'Escreva o número que vai pagar, com 9 dígitos.');
+      if (metodo === 'mpesa' && !['84', '85'].includes(numero.slice(0, 2))) return erro(res, 400, 'M-Pesa só funciona com números Vodacom (84 ou 85).');
+      if (metodo === 'emola' && !['86', '87'].includes(numero.slice(0, 2))) return erro(res, 400, 'e-Mola só funciona com números Movitel (86 ou 87).');
+    }
+    if (travao('pub-insc-tel|' + (numero || tel || telEnc), 4, 30)) return erro(res, 429, 'Já houve vários pedidos para este número. Espere meia hora.');
+  }
+  const chave = require('crypto').randomBytes(12).toString('hex');
+  const fmt = t => t ? t.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') : '';
+  const campos = { 'Escola': esc._id, 'Link': l._id, 'Nome': nome, 'Telefone': fmt(tel), 'Nascimento': b.nascimento || '', 'Encarregado Nome': comEnc ? txt(b.enc_nome, 100) : '',
+    'Encarregado Telefone': comEnc ? fmt(telEnc) : '', 'Email': email, 'Respostas': JSON.stringify(respostas), 'Valor': preco, 'Metodo': preco ? metodo : 'gratis',
+    'Estado': preco ? 'pendente' : 'paga', 'Chave': chave };
+  if (!preco) campos['Pago Em'] = new Date().toISOString();
+  const id = await criar('inscricaoonline', campos);
+  if (!preco) { const i = await obter('inscricaoonline', id); await confirmarInscricaoSMS(i, l, esc); return res.json({ ok: true, id, chave, estado: 'paga' }); }
+  const produto = ('Inscricao ' + (l['Titulo'] || '') + ' · ' + nome).slice(0, 120);
+  try {
+    if (metodo === 'cartao') {
+      const d = await mozPedido(MOZ_CARD_PATH, { valor: String(preco), nome_cliente: nome, carteira: MOZ_WALLET, nome_producto: produto });
+      const link = acharLink(d);
+      if (!link) throw new Error('sem link na resposta');
+      const sessao = String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || '');
+      await mudar('inscricaoonline', id, { 'Referencia': sessao });
+      return res.json({ ok: true, id, chave, estado: 'pendente', checkout: link });
+    }
+    const d = await mozPedido('payment', { wallet: MOZ_WALLET, payment_method: metodo, amount: String(preco), number: numero, name: nome });
+    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
+    await mudar('inscricaoonline', id, { 'Referencia': idp ? String(idp) : '' });
+    res.json({ ok: true, id, chave, estado: 'pendente' });
+  } catch (e) {
+    console.error('[inscricao] pagamento', e.message);
+    if (e.semResposta) return res.json({ ok: true, id, chave, estado: 'pendente' });
+    await mudar('inscricaoonline', id, { 'Estado': 'falhada' }).catch(() => {});
+    erro(res, 502, 'O pagamento não foi iniciado: ' + String(e.message).slice(0, 200) + '. Tente de novo.');
+  }
+}));
+app.post('/pub/inscricao-estado', rota(async (req, res) => {
+  const b = req.body || {};
+  const i = await obter('inscricaoonline', String(b.id || '')).catch(() => null);
+  if (!i || !b.chave || i['Chave'] !== String(b.chave)) return erro(res, 404, 'Inscrição não encontrada.');
+  res.json({ ok: true, estado: i['Estado'] === 'matriculada' ? 'paga' : (i['Estado'] || 'pendente'), nome: i['Nome'] || '', valor: Number(i['Valor'] || 0) });
+}));
+// chamado pelo webhook da MozPayment
+async function aplicarInscricao(i, b, estado) {
+  if (['paga', 'matriculada'].includes(i['Estado'])) return { ok: true, ja: 'aplicado' };
+  const valor = Math.round(Number(String(b.amount || '').replace(',', '.')));
+  if (estado === 'pago' && valor !== Math.round(Number(i['Valor'] || 0))) { console.warn('[webhook] inscrição: valor diferente'); await mudar('inscricaoonline', i._id, { 'Transacao': txt(b.transaction_id, 120) }); return { ok: true, revisao: true }; }
+  if (estado !== 'pago') { await mudar('inscricaoonline', i._id, { 'Estado': 'falhada', 'Transacao': txt(b.transaction_id, 120) }); return { ok: true, estado }; }
+  await mudar('inscricaoonline', i._id, { 'Estado': 'paga', 'Pago Em': new Date().toISOString(), 'Transacao': txt(b.transaction_id, 120) });
+  const [l, esc] = await Promise.all([obter('linkinscricao', i['Link']).catch(() => ({})), obter('escola', i['Escola']).catch(() => ({}))]);
+  await confirmarInscricaoSMS(i, l, esc);
+  return { ok: true, estado: 'paga' };
+}
+
 // ============================================================
 //  WEBHOOK DA MOZPAYMENT
 //  POST /wh-moz/<MOZ_WEBHOOK_KEY>
@@ -2665,6 +2919,7 @@ app.post('/wh-moz/:chave', async (req, res) => {
     for (const c of candidatos) { const l = await procurar('pagamento', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) { p = l[0]; break; } }
     if (!p) {
       for (const c of candidatos) { const l = await procurar('subscricao', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) return res.json(await aplicarSubscricao(l[0], b, estado)); }
+      for (const c of candidatos) { const l = await procurar('inscricaoonline', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []); if (l[0]) return res.json(await aplicarInscricao(l[0], b, estado)); }
       console.warn('[webhook] referência desconhecida: ' + candidatos.join(' / ')); return res.json({ ok: true, ignorado: 'referência desconhecida' });
     }
     if (p['Estado'] === 'pago') return res.json({ ok: true, ja: 'aplicado' });
