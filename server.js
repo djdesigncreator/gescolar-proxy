@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.12.0';
+const VERSAO = 'gescolar-proxy 5.13.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -2073,6 +2073,10 @@ app.post('/painel-indicadores', exigeDireccao, rota(async (req, res) => {
 // ============================================================
 const PRECOS = { Essencial: Number(process.env.PRECO_ESSENCIAL || 4900), Pro: Number(process.env.PRECO_PRO || 12500), Rede: 0 };
 const LIMITES = { Essencial: 300, Pro: 1000, Rede: 0 };
+// v5.13: pagar vários meses de uma vez tem desconto (por defeito 30% em 3, 6 e 12 meses). Render: ASSINATURA_DESCONTO (opcional, %)
+const DESCONTO_ASS = Math.max(0, Math.min(90, Number(process.env.ASSINATURA_DESCONTO === undefined || process.env.ASSINATURA_DESCONTO === '' ? 30 : process.env.ASSINATURA_DESCONTO)));
+const PERIODOS_ASS = [{ meses: 1, desconto: 0 }, { meses: 3, desconto: DESCONTO_ASS }, { meses: 6, desconto: DESCONTO_ASS }, { meses: 12, desconto: DESCONTO_ASS }];
+const valorAssinatura = (plano, meses) => { const p = PERIODOS_ASS.find(x => x.meses === meses) || PERIODOS_ASS[0]; return limpa(PRECOS[plano] * meses * (100 - p.desconto) / 100); };
 const TAXA_PROPINAS = Math.max(0, Math.min(50, Number(process.env.TAXA_PROPINAS_PCT === undefined || process.env.TAXA_PROPINAS_PCT === '' ? 7 : process.env.TAXA_PROPINAS_PCT)));   // 7% por defeito em cada pagamento online
 // 5.8.6: a taxa é exactamente TAXA_PROPINAS% do valor, sem arredondar (ex.: 15 MT → 1,05 MT; 10,55 MT → 0,7385 MT).
 // limpa() só tira o ruído das contas em vírgula flutuante (1.0500000000000003 → 1.05), não arredonda os meticais.
@@ -2102,7 +2106,7 @@ app.post('/assinatura', exigeDireccao, rota(async (req, res) => {
   const [e, subs, ests] = await Promise.all([obter('escola', req.escola), procurarTodos('subscricao', daEscola(req.escola), 300), procurarTodos('estudante', daEscola(req.escola))]);
   const plano = e['Plano'] || 'Essencial', activos = ests.filter(x => (x['Estado'] || 'activo') === 'activo').length;
   res.json({ ok: true, plano, preco: PRECOS[plano] || 0, limite: LIMITES[plano] || 0, estudantes: activos, situacao: situacaoEscola(e), tolerancia: TOLERANCIA_DIAS,
-    planos: Object.keys(PRECOS).map(k => ({ nome: k, preco: PRECOS[k], limite: LIMITES[k] })),
+    planos: Object.keys(PRECOS).map(k => ({ nome: k, preco: PRECOS[k], limite: LIMITES[k] })), periodos: PERIODOS_ASS,
     historico: subs.map(subOut).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
 }));
 app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
@@ -2116,7 +2120,7 @@ app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
   const ests = await procurarTodos('estudante', daEscola(req.escola));
   const activos = ests.filter(x => (x['Estado'] || 'activo') === 'activo').length;
   if (LIMITES[plano] && activos > LIMITES[plano]) return erro(res, 400, 'A escola tem ' + activos + ' estudantes e o plano ' + plano + ' vai até ' + LIMITES[plano] + '. Escolha um plano maior.');
-  const valor = PRECOS[plano] * meses, numero = soDigitos(b.numero).replace(/^258(?=\d{9}$)/, '');
+  const valor = valorAssinatura(plano, meses), numero = soDigitos(b.numero).replace(/^258(?=\d{9}$)/, '');
   if (metodo !== 'cartao') {
     if (numero.length !== 9) return erro(res, 400, 'O número tem 9 dígitos, por exemplo 84 123 4567.');
     const pre = numero.slice(0, 2);
