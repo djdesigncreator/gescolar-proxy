@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.11.1';
+const VERSAO = 'gescolar-proxy 5.12.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -522,30 +522,34 @@ app.post('/estudantes', exigeDireccao, rota(async (req, res) => {
 }));
 // matrícula partilhada: Direcção (/matricular) e inscrições online aprovadas
 function pub(msg) { const e = new Error(msg); e.publico = 400; return e; }
+// encarregado de educação: reutiliza pelo telefone, senão cria. obrigatorio=false → só se o nome ou o telefone vierem preenchidos
+async function encarregadoDe(escolaId, b, obrigatorio) {
+  const nomeEnc = txt(b.enc_nome, 100), telEnc = tel9(b.enc_telefone);
+  if (!nomeEnc && !telEnc) {
+    if (obrigatorio) throw pub('Escreva o nome e o telemóvel do encarregado de educação: neste nível de ensino é obrigatório.');
+    return { encId: null, encTel: '' };
+  }
+  if (!telEnc) throw pub('Escreveu o nome do encarregado mas falta o telemóvel dele (ex.: 84 123 4567).' + (obrigatorio ? '' : ' Ou apague o nome para continuar sem encarregado.'));
+  if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) throw pub('O telemóvel do encarregado deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEnc.length + ' dígito(s).');
+  const encs = await procurarTodos('encarregado', daEscola(escolaId));
+  const ja = encs.find(e => tel9(e['Telefone']) === telEnc);
+  if (ja) return { encId: ja._id, encTel: ja['Recebe SMS'] === false ? '' : telEnc };
+  if (nomeEnc.split(/\s+/).length < 2) throw pub('Escreva o nome completo do encarregado.');
+  const encId = await criar('encarregado', { 'Escola': escolaId, 'Nome': nomeEnc, 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
+  return { encId, encTel: telEnc };
+}
 async function matricularCore(escolaId, b) {
   const nome = txt(b.nome, 100);
   if (nome.split(/\s+/).length < 2) throw pub('Escreva o nome e o apelido do estudante.');
   const turmaId = String(b.turma || '');
   const turma = await daMinhaEscola('turma', turmaId, escolaId);
   const escola = await resumoEscola(escolaId);
-  // no ensino superior o estudante é adulto: não há encarregado, o telemóvel dele é obrigatório
+  // no ensino superior o estudante é adulto: o telemóvel dele é obrigatório e o encarregado é opcional
   const superior = turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP';
   if (superior && tel9(b.telefone).length !== 9) throw pub('No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
   // encarregado: reutiliza pelo telefone, senão cria
-  const telEnc = superior ? '' : tel9(b.enc_telefone);
-  let encId = null, encTel = '';
-  if (!superior && (txt(b.enc_nome, 100) || telEnc)) {
-    if (!telEnc) throw pub('Escreveu o nome do encarregado mas falta o telemóvel dele (ex.: 84 123 4567). Ou apague o nome para matricular sem encarregado.');
-    if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) throw pub('O telemóvel do encarregado deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEnc.length + ' dígito(s).');
-    const encs = await procurarTodos('encarregado', daEscola(escolaId));
-    const ja = encs.find(e => tel9(e['Telefone']) === telEnc);
-    if (ja) { encId = ja._id; encTel = ja['Recebe SMS'] === false ? '' : telEnc; }
-    else {
-      encTel = telEnc;
-      if (txt(b.enc_nome, 100).split(/\s+/).length < 2) throw pub('Escreva o nome completo do encarregado.');
-      encId = await criar('encarregado', { 'Escola': escolaId, 'Nome': txt(b.enc_nome, 100), 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
-    }
-  }
+  // v5.12: encarregado obrigatório em todos os níveis, excepto no ensino superior (opcional)
+  const { encId, encTel } = await encarregadoDe(escolaId, b, !superior);
   // número de estudante: ano-sequência
   const todos = await procurarTodos('estudante', daEscola(escolaId));
   const ano = (escola && escola.ano) || String(new Date().getFullYear());
@@ -2457,13 +2461,15 @@ async function inscreverCore(escolaId, b) {
   const ests = await procurarTodos('estudante', daEscola(escolaId));
   const ano = String(new Date().getFullYear());
   const repetido = ests.find(e => tel9(e['Telefone']) === tel && (e['Estado'] || 'activo') === 'activo' && String(e['Numero'] || '').startsWith('C'));
+  const { encId, encTel } = await encarregadoDe(escolaId, b, false);   // v5.12: encarregado opcional na condução
   let estId, numero;
-  if (repetido) { estId = repetido._id; numero = repetido['Numero']; }
+  if (repetido) { estId = repetido._id; numero = repetido['Numero']; if (encId && repetido['Encarregado'] !== encId) await mudar('estudante', estId, { 'Encarregado': encId }).catch(() => {}); }
   else {
     const maior = ests.map(e => String(e['Numero'] || '')).filter(n => n.startsWith('C' + ano + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, x) => Math.max(a, x), 0);
     numero = 'C' + ano + '-' + String(maior + 1).padStart(4, '0');
     const campos = { 'Escola': escolaId, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'),
       'Data Nascimento': new Date(b.nascimento).toISOString(), 'Ano Lectivo': ano, 'Data Matricula': new Date().toISOString(), 'Estado': 'activo' };
+    if (encId) campos['Encarregado'] = encId;
     estId = await criar('estudante', campos);
   }
   const insId = await criar('inscricaoconducao', { 'Escola': escolaId, 'Estudante': estId, 'Curso': c._id, 'Categoria': c['Categoria'], 'Data Inscricao': new Date().toISOString(), 'Estado': 'activa', 'Preco': preco, 'Prestacoes': prest });
@@ -2482,6 +2488,7 @@ async function inscreverCore(escolaId, b) {
     const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
     const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Estudante).');
     sms = r.ok;
+    if (encTel && encTel !== tel) await enviarSMS([encTel], (esc['Nome'] || 'A escola') + ': ' + nome + ' foi inscrito(a) no curso da carta ' + c['Categoria'] + ' com o numero ' + numero + '. Acompanhe aulas e prestacoes e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => {});
   }
   cachePainel.delete(escolaId);
   return { id: insId, estudante: estId, numero, prestacoes: prest, sms };
@@ -3428,7 +3435,8 @@ app.post('/inscricao-online-matricular', exigeDireccao, rota(async (req, res) =>
   if (i['Estado'] !== 'paga') return erro(res, 400, 'Só pode matricular inscrições pagas.');
   let r;
   if (b.curso) {   // escola de condução: inscreve no curso escolhido
-    r = await inscreverCore(req.escola, { curso: String(b.curso), nome: i['Nome'], telefone: i['Telefone'] || i['Encarregado Telefone'], nascimento: i['Nascimento'] });
+    r = await inscreverCore(req.escola, { curso: String(b.curso), nome: i['Nome'], telefone: i['Telefone'] || i['Encarregado Telefone'], nascimento: i['Nascimento'],
+      enc_nome: i['Telefone'] ? i['Encarregado Nome'] : '', enc_telefone: i['Telefone'] ? i['Encarregado Telefone'] : '' });
     r = { id: r.estudante, numero: r.numero, sms: r.sms ? 1 : 0 };
   } else {
     if (!b.turma) return erro(res, 400, 'Escolha a turma.');
@@ -3480,10 +3488,12 @@ app.post('/pub/inscrever', rota(async (req, res) => {
   const tel = tel9(b.telefone), telEnc = tel9(b.enc_telefone);
   const comEnc = pedeEncarregado(l);
   if (tel && (tel.length !== 9 || !/^8[2-7]/.test(tel))) return erro(res, 400, 'O telemóvel do candidato deve ter 9 dígitos (ex.: 84 123 4567).');
-  if (comEnc) {
+  const encDado = !!(txt(b.enc_nome, 100) || telEnc);
+  if (comEnc || encDado) {   // obrigatório nos outros níveis; no superior e na condução só se for preenchido
     if (txt(b.enc_nome, 100).split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do encarregado de educação.');
     if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) return erro(res, 400, 'O telemóvel do encarregado deve ter 9 dígitos (ex.: 84 123 4567).');
-  } else if (tel.length !== 9) return erro(res, 400, 'Escreva o seu telemóvel: é por ele que a escola o contacta.');
+  }
+  if (!comEnc && tel.length !== 9) return erro(res, 400, 'Escreva o seu telemóvel: é por ele que a escola o contacta.');
   if (b.nascimento && !dataOk(b.nascimento)) return erro(res, 400, 'Data de nascimento inválida.');
   const email = txt(b.email, 120).toLowerCase();
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return erro(res, 400, 'O email não parece válido.');
@@ -3510,8 +3520,8 @@ app.post('/pub/inscrever', rota(async (req, res) => {
   }
   const chave = require('crypto').randomBytes(12).toString('hex');
   const fmt = t => t ? t.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') : '';
-  const campos = { 'Escola': esc._id, 'Link': l._id, 'Nome': nome, 'Telefone': fmt(tel), 'Nascimento': b.nascimento || '', 'Encarregado Nome': comEnc ? txt(b.enc_nome, 100) : '',
-    'Encarregado Telefone': comEnc ? fmt(telEnc) : '', 'Email': email, 'Respostas': JSON.stringify(respostas), 'Valor': preco, 'Metodo': preco ? metodo : 'gratis',
+  const campos = { 'Escola': esc._id, 'Link': l._id, 'Nome': nome, 'Telefone': fmt(tel), 'Nascimento': b.nascimento || '', 'Encarregado Nome': (comEnc || encDado) ? txt(b.enc_nome, 100) : '',
+    'Encarregado Telefone': (comEnc || encDado) ? fmt(telEnc) : '', 'Email': email, 'Respostas': JSON.stringify(respostas), 'Valor': preco, 'Metodo': preco ? metodo : 'gratis',
     'Estado': preco ? 'pendente' : 'paga', 'Chave': chave };
   if (!preco) campos['Pago Em'] = new Date().toISOString();
   const id = await criar('inscricaoonline', campos);
