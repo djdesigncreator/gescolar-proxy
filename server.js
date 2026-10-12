@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.13.0';
+const VERSAO = 'gescolar-proxy 5.15.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -68,7 +68,9 @@ const TESTE_DIAS = Math.max(1, Math.min(90, Number(process.env.TESTE_DIAS || 7))
 
 const app = express();
 app.set('trust proxy', true);
-app.use(express.json({ limit: '1mb' }));
+// o envio de ficheiros no chat precisa de pedidos maiores; o resto fica com 1 MB
+const jsonPequeno = express.json({ limit: '1mb' }), jsonGrande = express.json({ limit: '30mb' });
+app.use((req, res, next) => (req.path === '/chat/enviar' ? jsonGrande : jsonPequeno)(req, res, next));
 
 // ---------- CORS ----------
 app.use((req, res, next) => {
@@ -105,7 +107,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo', chatturma: 'Chat Turma', mensagemchat: 'Mensagem Chat',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -210,7 +212,7 @@ async function abrirSessao(userId, pl) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -3759,6 +3761,265 @@ app.post('/wh-moz/:chave', async (req, res) => {
     res.status(500).json({ ok: false });
   }
 });
+
+// ============================================================
+//  CHAT DA TURMA (v5.14)
+//  O professor cria um chat numa turma onde dá aulas. Os estudantes da turma conversam e enviam ficheiros.
+//  Os encarregados só lêem (se o professor deixar). A Direcção vê todos, pode apagar mensagens e fechar chats.
+//  Ficheiros: no Bunny Storage (zona própria do Gescolar, links que expiram) até CHAT_MAX_MB (por defeito 5 MB).
+//  Sem as variáveis do Bunny, ficam no armazenamento do Bubble (/fileupload), como na 5.14.
+//  Tabelas: Chat Turma (Escola, Turma, Professor, Nome, Encarregados, So Professor, Activo, Ultima, Ultimo Texto, Mensagens)
+//           Mensagem Chat (Escola, Chat, Autor, Autor Nome, Papel, Texto, Ficheiro URL, Ficheiro Nome, Ficheiro Tipo, Tamanho, Apagada)
+// ============================================================
+const CHAT_MAX_MB = Math.max(1, Math.min(20, Number(process.env.CHAT_MAX_MB || 5)));
+const CHAT_TIPOS = { pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
+  doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  odt: 'application/vnd.oasis.opendocument.text', ods: 'application/vnd.oasis.opendocument.spreadsheet', odp: 'application/vnd.oasis.opendocument.presentation',
+  txt: 'text/plain', csv: 'text/csv', mp3: 'audio/mpeg', m4a: 'audio/mp4', ogg: 'audio/ogg', opus: 'audio/ogg', mp4: 'video/mp4' };
+const PAPEL_CHAT = { professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', direccao: 'Direcção' };
+const BUBBLE_UPLOAD = BUBBLE_BASE.replace(/\/api\/1\.1\/obj$/, '/fileupload');
+
+async function exigeChat(req, res, next) {
+  const s = sessaoDo(req);
+  if (!s) return erro(res, 401, 'A sessão terminou. Entre outra vez.');
+  if (!s.e) return erro(res, 403, 'Esta conta ainda não tem escola.');
+  req.sessao = s; req.escola = s.e;
+  try {
+    if (s.t === 'portal') {
+      if (s.p === 'Professor') req.papelChat = 'professor';
+      else if (s.p === 'Estudante' || s.p === 'Encarregado') { req.papelChat = s.p === 'Estudante' ? 'estudante' : 'encarregado'; req.educandos = await educandosDe(s); }
+      else return erro(res, 403, 'Sem acesso ao chat.');
+    } else if (s.p === 'Direccao' || s.p === 'Secretaria') req.papelChat = 'direccao';
+    else return erro(res, 403, 'Sem acesso ao chat.');
+    next();
+  } catch (e) { console.error('[chat]', e.message); erro(res, 500, 'Não foi possível concluir. Tente de novo.'); }
+}
+// turmas onde o professor dá aulas (pelo horário, pelas disciplinas ou como titular)
+async function turmasDoProfessor(escola, prof) {
+  const a = await atribuicoes(escola), DM = {};
+  const discs = await procurarTodos('disciplina', daEscola(escola));
+  discs.forEach(d => { DM[d._id] = d['Nome'] || ''; });
+  const T = {};
+  for (const t of a.turmas.filter(x => x['Activa'] !== false)) {
+    const minhas = a.pares.filter(p => p.turma === t._id && p.professores.has(prof)).map(p => DM[p.disciplina]).filter(Boolean);
+    const titular = t['Professor Titular'] === prof;
+    if (minhas.length || titular) T[t._id] = { id: t._id, nome: t['Nome'] || '', disciplinas: minhas.sort((x, y) => x.localeCompare(y, 'pt')), titular };
+  }
+  return T;
+}
+// turmas dos educandos (portal); com estudante, só a turma desse educando
+async function turmasDoPortal(req, estudante) {
+  let ids = req.educandos || [];
+  if (estudante) { if (!ids.includes(estudante)) { const e = new Error('Estudante não encontrado.'); e.publico = 404; throw e; } ids = [estudante]; }
+  const ests = (await Promise.all(ids.map(id => obter('estudante', id).catch(() => null)))).filter(e => e && e['Escola'] === req.escola && e['Turma']);
+  return [...new Set(ests.map(e => e['Turma']))];
+}
+function chatOut(c, extra) {
+  return Object.assign({ id: c._id, nome: c['Nome'] || '', turma: c['Turma'] || '', professor: c['Professor'] || '',
+    encarregados: c['Encarregados'] !== false, so_professor: c['So Professor'] === true, activo: c['Activo'] !== false,
+    ultima: c['Ultima'] || c['Created Date'] || null, ultimo_texto: c['Ultimo Texto'] || '', mensagens: Number(c['Mensagens'] || 0) }, extra || {});
+}
+// carrega o chat e diz o que esta pessoa pode fazer nele
+async function abrirChat(req, id) {
+  const c = await obter('chatturma', String(id || '')).catch(() => null);
+  const nao = () => { const e = new Error('Chat não encontrado.'); e.publico = 404; return e; };
+  if (!c || c['Escola'] !== req.escola) throw nao();
+  const p = req.papelChat, activo = c['Activo'] !== false, u = req.sessao.u;
+  if (p === 'direccao') return { c, ler: true, escrever: activo, gerir: true };
+  if (p === 'professor') {
+    if (c['Professor'] !== u) throw nao();
+    return { c, ler: true, escrever: activo, gerir: true };
+  }
+  if (!activo) throw nao();
+  const turmas = await turmasDoPortal(req);
+  if (!turmas.includes(c['Turma'])) throw nao();
+  if (p === 'encarregado' && c['Encarregados'] === false) throw nao();
+  return { c, ler: true, escrever: p === 'estudante' && c['So Professor'] !== true, gerir: false };
+}
+function msgOut(m, req, gerir) {
+  const meu = m['Autor'] === req.sessao.u && (m['Papel'] || '') === req.papelChat;
+  if (m['Apagada']) return { id: m._id, apagada: true, data: m['Created Date'], mod: m['Modified Date'] };
+  return { id: m._id, autor: m['Autor Nome'] || '', papel: m['Papel'] || '', papel_nome: PAPEL_CHAT[m['Papel']] || '', eu: meu,
+    texto: m['Texto'] || '', data: m['Created Date'], mod: m['Modified Date'],
+    ficheiro: m['Ficheiro URL'] ? { url: linkFicheiro(m['Ficheiro URL']), nome: m['Ficheiro Nome'] || 'ficheiro', tipo: m['Ficheiro Tipo'] || '', tamanho: Number(m['Tamanho'] || 0) } : null,
+    pode_apagar: meu || !!gerir };
+}
+// mensagens: as últimas (ou as mais antigas que «antes»), ou as mudadas depois de «depois» (para actualizar o ecrã)
+async function mensagensDo(escola, chat, op) {
+  const f = daEscola(escola).concat([{ key: 'Chat', constraint_type: 'equals', value: chat }]);
+  if (op.depois) f.push({ key: 'Modified Date', constraint_type: 'greater than', value: op.depois });
+  if (op.antes) f.push({ key: 'Created Date', constraint_type: 'less than', value: op.antes });
+  const q = '?constraints=' + encodeURIComponent(JSON.stringify(f)) + '&limit=' + (op.limite || 60) + '&sort_field=' + encodeURIComponent(op.depois ? 'Modified Date' : 'Created Date') + '&descending=' + (op.depois ? 'false' : 'true');
+  let d; try { d = await bubble('GET', '/mensagemchat' + q); } catch (e) { throw erroTabela('mensagemchat', e); }
+  const r = (d && d.response) || {};
+  const l = r.results || [];
+  return { lista: l.sort((x, y) => String(x['Created Date']).localeCompare(String(y['Created Date']))), mais: !op.depois && !!r.remaining };
+}
+// envia o ficheiro para o armazenamento do Bubble e devolve o endereço
+// ---------- Bunny Storage (v5.15): ficheiros do chat numa storage zone só do Gescolar ----------
+//    STORAGE_ZONE      nome da storage zone (ex.: gescolar)
+//    STORAGE_PASSWORD  password da storage zone (FTP & API Access → Password)
+//    STORAGE_HOST      storage.bunnycdn.com (Falkenstein) ou o da região, ex.: jh.storage.bunnycdn.com
+//    CDN_HOST          hostname da pull zone ligada à storage zone (ex.: gescolar.b-cdn.net)
+//    CDN_TOKEN_KEY     Security → Token Authentication → Url Token Authentication Key (os links passam a expirar)
+const STORAGE_ZONE = (process.env.STORAGE_ZONE || '').trim();
+const STORAGE_PASSWORD = (process.env.STORAGE_PASSWORD || '').trim();
+const STORAGE_HOST = (process.env.STORAGE_HOST || 'storage.bunnycdn.com').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+const CDN_HOST = (process.env.CDN_HOST || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+const CDN_TOKEN_KEY = (process.env.CDN_TOKEN_KEY || '').trim();
+const BUNNY_OK = !!(STORAGE_ZONE && STORAGE_PASSWORD && CDN_HOST);
+const LINK_HORAS = 24;   // cada link de ficheiro vale 24 horas; ao abrir o chat outra vez gera-se um novo
+const caminhoUrl = c => c.split('/').map(encodeURIComponent).join('/');
+async function guardarFicheiroBunny(caminho, base64) {
+  const r = await fetch('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + caminhoUrl(caminho), { method: 'PUT', headers: { 'AccessKey': STORAGE_PASSWORD, 'Content-Type': 'application/octet-stream' }, body: Buffer.from(base64, 'base64'), signal: AbortSignal.timeout(60000) })
+    .catch(e => { console.error('[bunny] envio', e.message); throw pub('Não foi possível guardar o ficheiro. Tente outra vez.'); });
+  if (!r.ok) { console.error('[bunny] envio', r.status, (await r.text().catch(() => '')).slice(0, 200)); throw pub(r.status === 401 ? 'O armazenamento recusou o ficheiro: confira STORAGE_ZONE, STORAGE_PASSWORD e STORAGE_HOST no Render.' : 'Não foi possível guardar o ficheiro (' + r.status + '). Tente outra vez.'); }
+  return caminho;
+}
+async function apagarFicheiroBunny(caminho) {
+  if (!BUNNY_OK || !caminho || !caminho.startsWith('/')) return;
+  const r = await fetch('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + caminhoUrl(caminho), { method: 'DELETE', headers: { 'AccessKey': STORAGE_PASSWORD }, signal: AbortSignal.timeout(20000) }).catch(e => ({ ok: false, status: e.message }));
+  if (!r.ok && r.status !== 404) console.error('[bunny] apagar', r.status);
+}
+// link para abrir o ficheiro: com CDN_TOKEN_KEY é assinado e expira (Token Authentication do Bunny)
+function linkFicheiro(guardado) {
+  if (!guardado) return '';
+  if (!guardado.startsWith('/')) return guardado;          // ficheiros antigos guardados no Bubble (5.14)
+  const path = caminhoUrl(guardado), base = 'https://' + CDN_HOST + path;
+  if (!CDN_TOKEN_KEY) return base;
+  const expira = Math.floor(Date.now() / 1000) + LINK_HORAS * 3600;
+  const token = crypto.createHash('sha256').update(CDN_TOKEN_KEY + path + expira).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  return base + '?token=' + token + '&expires=' + expira;
+}
+async function guardarFicheiroBubble(nome, base64) {
+  if (!BUBBLE_UPLOAD || !BUBBLE_TOKEN) throw pub('O servidor ainda não está configurado (BUBBLE_BASE).');
+  const r = await fetch(BUBBLE_UPLOAD, { method: 'POST', headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: nome, contents: base64, private: false }) });
+  const t = (await r.text()).trim();
+  if (!r.ok) { console.error('[chat] fileupload', r.status, t.slice(0, 200)); throw pub('O Bubble não aceitou o ficheiro (' + r.status + '). Tente outra vez ou envie um ficheiro mais pequeno.'); }
+  let url = t; try { const j = JSON.parse(t); if (typeof j === 'string') url = j; else if (j && (j.url || j.response)) url = j.url || j.response; } catch (e) {}
+  url = String(url || '').replace(/^"+|"+$/g, '').trim();
+  if (url.startsWith('//')) url = 'https:' + url;
+  if (!/^https:\/\//.test(url)) { console.error('[chat] fileupload resposta', t.slice(0, 200)); throw pub('O Bubble não devolveu o endereço do ficheiro.'); }
+  return url;
+}
+function nomeFicheiroLimpo(n) {
+  const s = String(n || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\w.\- ]+/g, '').replace(/\s+/g, '_').replace(/^\.+/, '');
+  return (s || 'ficheiro').slice(-80);
+}
+
+// lista de chats (cada papel vê os seus)
+app.post('/chat/lista', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, p = req.papelChat, f = daEscola(req.escola);
+  if (p === 'professor') {
+    const [T, cs] = await Promise.all([turmasDoProfessor(req.escola, req.sessao.u), procurarTodos('chatturma', f.concat([{ key: 'Professor', constraint_type: 'equals', value: req.sessao.u }]), 300)]);
+    const chats = cs.filter(c => c['Activo'] !== false).map(c => chatOut(c, { turma_nome: (T[c['Turma']] || {}).nome || 'Turma', pode_gerir: true, pode_escrever: true }));
+    return res.json({ ok: true, papel: p, pode_criar: true, max_mb: CHAT_MAX_MB, turmas: Object.values(T).sort((x, y) => x.nome.localeCompare(y.nome, 'pt')), chats: ordenarChats(chats) });
+  }
+  if (p === 'direccao') {
+    const [cs, ts, ps] = await Promise.all([procurarTodos('chatturma', f, 1000), procurarTodos('turma', f), procurarTodos('professor', f)]);
+    const TN = Object.fromEntries(ts.map(t => [t._id, t['Nome'] || ''])), PN = Object.fromEntries(ps.map(x => [x._id, x['Nome'] || '']));
+    const chats = cs.map(c => chatOut(c, { turma_nome: TN[c['Turma']] || 'Turma', professor_nome: PN[c['Professor']] || '', pode_gerir: true, pode_escrever: c['Activo'] !== false }));
+    return res.json({ ok: true, papel: p, pode_criar: false, max_mb: CHAT_MAX_MB, chats: ordenarChats(chats) });
+  }
+  const turmas = await turmasDoPortal(req, b.estudante ? String(b.estudante) : '');
+  if (!turmas.length) return res.json({ ok: true, papel: p, pode_criar: false, max_mb: CHAT_MAX_MB, chats: [] });
+  const listas = await Promise.all(turmas.map(t => procurarTodos('chatturma', f.concat([{ key: 'Turma', constraint_type: 'equals', value: t }]), 100)));
+  const todos = [].concat(...listas).filter(c => c['Activo'] !== false && (p === 'estudante' || c['Encarregados'] !== false));
+  const tIds = [...new Set(todos.map(c => c['Turma']))], pIds = [...new Set(todos.map(c => c['Professor']).filter(Boolean))];
+  const [ts, ps] = await Promise.all([Promise.all(tIds.map(id => obter('turma', id).catch(() => null))), Promise.all(pIds.map(id => obter('professor', id).catch(() => null)))]);
+  const TN = {}, PN = {}; ts.filter(Boolean).forEach(t => { TN[t._id] = t['Nome'] || ''; }); ps.filter(Boolean).forEach(x => { PN[x._id] = x['Nome'] || ''; });
+  const chats = todos.map(c => chatOut(c, { turma_nome: TN[c['Turma']] || 'Turma', professor_nome: PN[c['Professor']] || '', pode_gerir: false, pode_escrever: p === 'estudante' && c['So Professor'] !== true }));
+  res.json({ ok: true, papel: p, pode_criar: false, max_mb: CHAT_MAX_MB, chats: ordenarChats(chats) });
+}));
+function ordenarChats(l) { return l.sort((x, y) => (y.activo - x.activo) || String(y.ultima || '').localeCompare(String(x.ultima || ''))); }
+
+// professor cria ou muda um chat
+app.post('/chat/guardar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, p = req.papelChat;
+  if (p !== 'professor' && p !== 'direccao') return erro(res, 403, 'Só o professor pode criar chats.');
+  const nome = txt(b.nome, 80);
+  if (nome.length < 2) return erro(res, 400, 'Dê um nome ao chat, por exemplo «10ª A · Matemática».');
+  const campos = { 'Nome': nome, 'Encarregados': b.encarregados !== false, 'So Professor': b.so_professor === true };
+  if (b.id) {
+    const x = await abrirChat(req, b.id);
+    if (!x.gerir) return erro(res, 403, 'Só o professor deste chat pode mudá-lo.');
+    if (p === 'direccao' && typeof b.activo === 'boolean') campos['Activo'] = b.activo;
+    await mudar('chatturma', x.c._id, campos);
+    return res.json({ ok: true, id: x.c._id });
+  }
+  if (p !== 'professor') return erro(res, 403, 'Os chats são criados pelos professores.');
+  const T = await turmasDoProfessor(req.escola, req.sessao.u), turma = String(b.turma || '');
+  if (!T[turma]) return erro(res, 403, 'Só pode criar chats nas turmas onde dá aulas.');
+  const meus = await procurarTodos('chatturma', daEscola(req.escola).concat([{ key: 'Professor', constraint_type: 'equals', value: req.sessao.u }]), 300);
+  if (meus.filter(c => c['Activo'] !== false).length >= 40) return erro(res, 400, 'Já tem 40 chats abertos. Feche os que já não usa.');
+  const id = await criar('chatturma', Object.assign(campos, { 'Escola': req.escola, 'Turma': turma, 'Professor': req.sessao.u, 'Activo': true, 'Ultima': new Date().toISOString(), 'Mensagens': 0, 'Ultimo Texto': '' }));
+  res.json({ ok: true, id });
+}));
+// fechar (professor ou Direcção) — o chat sai da lista dos estudantes; a Direcção pode reabrir
+app.post('/chat/fechar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, x = await abrirChat(req, b.id);
+  if (!x.gerir) return erro(res, 403, 'Só o professor deste chat pode fechá-lo.');
+  const abrir = req.papelChat === 'direccao' && b.reabrir === true;
+  await mudar('chatturma', x.c._id, { 'Activo': abrir });
+  res.json({ ok: true, activo: abrir });
+}));
+
+app.post('/chat/mensagens', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, x = await abrirChat(req, b.chat);
+  const iso = v => { const d = new Date(String(v || '')); return isNaN(d) ? '' : d.toISOString(); };
+  const depois = iso(b.depois), antes = iso(b.antes);
+  const r = await mensagensDo(req.escola, x.c._id, { depois, antes, limite: depois ? 100 : 60 });
+  let marca = depois || '';
+  r.lista.forEach(m => { if (String(m['Modified Date'] || '') > marca) marca = m['Modified Date']; });
+  res.json({ ok: true, chat: chatOut(x.c, { pode_escrever: x.escrever, pode_gerir: x.gerir }), mensagens: r.lista.map(m => msgOut(m, req, x.gerir)), mais: r.mais, marca: marca || '2000-01-01T00:00:00.000Z', max_mb: CHAT_MAX_MB });
+}));
+
+app.post('/chat/enviar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, x = await abrirChat(req, b.chat);
+  if (!x.escrever) return erro(res, 403, x.c['Activo'] === false ? 'Este chat está fechado.' : req.papelChat === 'encarregado' ? 'Os encarregados podem ler o chat, mas não escrever.' : 'Neste chat só o professor escreve.');
+  if (travao('chat:' + req.sessao.u, 20, 1)) return erro(res, 429, 'Muitas mensagens seguidas. Espere um minuto.');
+  const texto = txt(b.texto, 2000);
+  const campos = { 'Escola': req.escola, 'Chat': x.c._id, 'Autor': req.sessao.u, 'Papel': req.papelChat, 'Texto': texto, 'Apagada': false };
+  const fx = b.ficheiro;
+  if (!texto && !(fx && fx.dados)) return erro(res, 400, 'Escreva uma mensagem ou escolha um ficheiro.');
+  if (fx && fx.dados) {
+    const nome = nomeFicheiroLimpo(fx.nome), ext = (nome.match(/\.([a-z0-9]{2,5})$/i) || [])[1];
+    const tipo = ext && CHAT_TIPOS[ext.toLowerCase()];
+    if (!tipo) return erro(res, 400, 'Este tipo de ficheiro não é aceite. Envie PDF, imagens, Word, Excel, PowerPoint, texto ou áudio.');
+    const dados = String(fx.dados).replace(/^data:[^,]*,/, '').replace(/\s/g, '');
+    if (!/^[A-Za-z0-9+/]+=*$/.test(dados)) return erro(res, 400, 'O ficheiro chegou estragado. Tente outra vez.');
+    const bytes = Math.floor(dados.length * 3 / 4) - (dados.endsWith('==') ? 2 : dados.endsWith('=') ? 1 : 0);
+    if (bytes > CHAT_MAX_MB * 1048576) return erro(res, 400, 'O ficheiro tem mais de ' + CHAT_MAX_MB + ' MB.');
+    if (bytes < 1) return erro(res, 400, 'O ficheiro está vazio.');
+    if (travao('chatfx:' + req.escola, 300, 60)) return erro(res, 429, 'A escola enviou muitos ficheiros na última hora. Tente mais tarde.');
+    campos['Ficheiro URL'] = BUNNY_OK
+      ? await guardarFicheiroBunny('/' + req.escola + '/chat/' + x.c._id + '/' + Date.now().toString(36) + crypto.randomBytes(4).toString('hex') + '/' + nome, dados)
+      : await guardarFicheiroBubble(nome, dados);
+    Object.assign(campos, { 'Ficheiro Nome': nome, 'Ficheiro Tipo': tipo, 'Tamanho': bytes });
+  }
+  const tabela = { professor: 'professor', estudante: 'estudante', encarregado: 'encarregado' }[req.papelChat];
+  const eu = tabela ? await obter(tabela, req.sessao.u).catch(() => null) : await obter('user', req.sessao.u).catch(() => null);
+  campos['Autor Nome'] = txt((eu && (eu['Nome'] || eu['Nome Completo'])) || PAPEL_CHAT[req.papelChat], 80);
+  const id = await criar('mensagemchat', campos);
+  const resumo = (campos['Autor Nome'].split(' ')[0] + ': ' + (texto || '📎 ' + (campos['Ficheiro Nome'] || 'ficheiro'))).slice(0, 120);
+  await mudar('chatturma', x.c._id, { 'Ultima': new Date().toISOString(), 'Ultimo Texto': resumo, 'Mensagens': Number(x.c['Mensagens'] || 0) + 1 }).catch(e => console.error('[chat] resumo', e.message));
+  const m = await obter('mensagemchat', id).catch(() => null);
+  res.json({ ok: true, mensagem: m ? msgOut(m, req, x.gerir) : { id, eu: true, texto, data: new Date().toISOString() } });
+}));
+
+app.post('/chat/apagar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {};
+  const m = await obter('mensagemchat', String(b.id || '')).catch(() => null);
+  if (!m || m['Escola'] !== req.escola) return erro(res, 404, 'Mensagem não encontrada.');
+  const x = await abrirChat(req, m['Chat']);
+  const meu = m['Autor'] === req.sessao.u && m['Papel'] === req.papelChat;
+  if (!meu && !x.gerir) return erro(res, 403, 'Só pode apagar as suas mensagens.');
+  await mudar('mensagemchat', m._id, { 'Apagada': true, 'Texto': '', 'Ficheiro URL': '' });
+  if (m['Ficheiro URL']) await apagarFicheiroBunny(m['Ficheiro URL']);
+  res.json({ ok: true });
+}));
 
 app.use((req, res) => erro(res, 404, 'Rota não encontrada.'));
 app.listen(PORT, () => console.log(VERSAO + ' a ouvir na porta ' + PORT));
