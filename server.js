@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.15.0';
+const VERSAO = 'gescolar-proxy 5.16.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -212,7 +212,7 @@ async function abrirSessao(userId, pl) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -503,9 +503,9 @@ app.post('/professor-guardar', exigeDireccao, rota(async (req, res) => {
   let id = b.id ? String(b.id) : null, novo = !id;
   if (id) { await daMinhaEscola('professor', id, req.escola); await mudar('professor', id, campos); }
   else id = await criar('professor', campos);
-  let sms = false;
-  if (novo && b.convidar !== false && tel9(campos['Telefone']).length === 9) sms = await convidarProfessor(req.escola, Object.assign({ _id: id }, campos)).catch(() => false);
-  res.json({ ok: true, id, sms });
+  let c = false;
+  if (novo && b.convidar !== false) c = await convidarProfessor(req.escola, Object.assign({ _id: id }, campos)).catch(() => false);
+  res.json({ ok: true, id, sms: !!(c && c.sms), email: !!(c && c.email) });
 }));
 app.post('/professor-apagar', exigeDireccao, rota(async (req, res) => {
   const id = String((req.body || {}).id || '');
@@ -803,6 +803,47 @@ async function prepararCobranca(req, ids) {
 //  Todos os números saem com o prefixo 258.
 // ============================================================
 const SMS_URL = process.env.SMS_URL || 'https://my.turbo.host/api/international-sms/submit';
+// ---------- email (v5.16): Resend. O email vai junto com o SMS, para quando o SMS não chega ----------
+//    RESEND_KEY   chave da API do Resend (re_…)
+//    MAIL_FROM    remetente de um domínio verificado no Resend, ex.: Gescolar <nao-responder@gescolar.co.mz>
+const RESEND_KEY = (process.env.RESEND_KEY || '').trim();
+const MAIL_FROM = (process.env.MAIL_FROM || '').trim();
+const RESEND_URL = process.env.RESEND_URL || 'https://api.resend.com/emails';
+const escH = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// corpo do email com a cara do Gescolar; blocos = [{p:'texto'} | {codigo:'123456'} | {botao:'Texto', link:'https://…'} | {nota:'texto'}]
+function emailGescolar(escolaNome, titulo, blocos) {
+  const corpo = blocos.map(b => b.codigo ? '<div style="font:800 34px/1 Consolas,monospace;letter-spacing:8px;color:#0B2A4A;background:#EEF4FC;border-radius:12px;padding:18px 0;text-align:center;margin:18px 0">' + escH(b.codigo) + '</div>'
+    : b.botao ? '<div style="text-align:center;margin:22px 0"><a href="' + escH(b.link) + '" style="display:inline-block;background:#0A64DC;color:#fff;text-decoration:none;font:700 16px Arial,sans-serif;padding:14px 26px;border-radius:10px">' + escH(b.botao) + '</a></div><p style="font:13px/1.5 Arial,sans-serif;color:#5F6B7A;margin:0 0 14px;word-break:break-all">Se o botão não abrir, copie este endereço: ' + escH(b.link) + '</p>'
+    : b.nota ? '<p style="font:13px/1.5 Arial,sans-serif;color:#5F6B7A;margin:14px 0 0">' + escH(b.nota) + '</p>'
+    : '<p style="font:15px/1.55 Arial,sans-serif;color:#12233A;margin:0 0 12px">' + escH(b.p) + '</p>').join('');
+  return '<!doctype html><html><body style="margin:0;background:#F2F5F9;padding:24px 12px"><div style="max-width:520px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #E2E8F0">' +
+    '<div style="background:#0B2A4A;color:#fff;padding:18px 22px;font:800 18px Arial,sans-serif">Gescolar<span style="display:block;font:400 13px Arial,sans-serif;opacity:.8;margin-top:2px">' + escH(escolaNome || '') + '</span></div>' +
+    '<div style="padding:24px 22px"><h1 style="font:800 20px/1.3 Arial,sans-serif;color:#0B2A4A;margin:0 0 14px">' + escH(titulo) + '</h1>' + corpo + '</div>' +
+    '<div style="padding:14px 22px;background:#F7F9FC;font:12px Arial,sans-serif;color:#8A94A3">Gescolar · gestão escolar em Moçambique · gescolar.co.mz</div></div></body></html>';
+}
+function textoDeBlocos(titulo, blocos) { return titulo + '\n\n' + blocos.map(b => b.codigo ? 'Código: ' + b.codigo : b.botao ? b.botao + ': ' + b.link : (b.p || b.nota || '')).join('\n\n'); }
+// sem Resend, o email sai pelo «Send email» do próprio Bubble: backend workflow «enviar-email» com para, assunto, texto
+async function enviarEmailBubble(email, assunto, texto) {
+  try {
+    const d = await workflow('enviar-email', { para: email, assunto, texto });
+    console.log('[email-bubble] ' + email + ' → ' + JSON.stringify(d).slice(0, 120));
+    return { ok: true };
+  } catch (e) { console.error('[email-bubble] ' + email + ' → ' + e.message); return { ok: false, erro: e.message }; }
+}
+async function enviarEmail(para, assunto, html, texto) {
+  const email = String(para || '').trim().toLowerCase();
+  if (!emailOk(email)) return { ok: false, erro: 'email inválido' };
+  if (!RESEND_KEY || !MAIL_FROM) return enviarEmailBubble(email, assunto, texto);
+  try {
+    const r = await fetch(RESEND_URL, { method: 'POST', headers: { 'Authorization': 'Bearer ' + RESEND_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: MAIL_FROM, to: [email], subject: assunto, html, text: texto }), signal: AbortSignal.timeout(20000) });
+    const t = await r.text();
+    console.log('[email] ' + email + ' → ' + r.status + ' ' + t.slice(0, 200));
+    if (!r.ok) { let d = null; try { d = JSON.parse(t); } catch (e) {} return { ok: false, erro: String((d && (d.message || d.error)) || ('o Resend respondeu ' + r.status)).slice(0, 200) }; }
+    return { ok: true };
+  } catch (e) { console.error('[email]', e.message); return { ok: false, erro: e.message }; }
+}
+const mascararEmail = e => { const m = String(e || '').match(/^([^@]+)@(.+)$/); return m ? m[1].slice(0, 2) + '***@' + m[2] : ''; };
 const SMS_TOKEN = process.env.SMS_TOKEN || '';
 const SMS_ORIGEM = process.env.SMS_ORIGEM || '';
 // 84 123 4567 / +258 84 123 4567 / 00258841234567  →  258841234567
@@ -1084,21 +1125,21 @@ app.post('/acesso-codigo', rota(async (req, res) => {
   const esc = await escolaPorCodigo(b.escola);
   if (!esc) return erro(res, 404, 'Não encontrámos essa escola. Confirme o código da escola com a secretaria.');
   if (esc['Estado'] === 'suspensa') return erro(res, 402, 'O acesso desta escola está suspenso. Fale com a escola.');
-  let alvo = null, destino = '';
+  let alvo = null, destino = '', emailDestino = '';
   if (tipo === 'professor') {
     const tel = tel9(b.telefone);
     if (tel.length !== 9) return erro(res, 400, 'Escreva o seu número de telemóvel com 9 dígitos.');
     const profs = await procurarTodos('professor', daEscola(esc._id));
     alvo = profs.find(x => tel9(x['Telefone']) === tel && x['Activo'] !== false);
     if (!alvo) return erro(res, 404, 'Este número não está registado como professor nesta escola. Peça à Direcção para confirmar o seu número.');
-    destino = tel;
+    destino = tel; emailDestino = alvo['Email'] || '';
   } else if (tipo === 'encarregado') {
     const tel = tel9(b.telefone);
     if (tel.length !== 9) return erro(res, 400, 'Escreva o seu número de telemóvel com 9 dígitos.');
     const encs = await procurarTodos('encarregado', daEscola(esc._id));
     alvo = encs.find(e => tel9(e['Telefone']) === tel && e['Activo'] !== false);
     if (!alvo) return erro(res, 404, 'Este número não está registado como encarregado nesta escola. Peça à secretaria para confirmar o seu número.');
-    destino = tel;
+    destino = tel; emailDestino = alvo['Email'] || '';
   } else {
     const num = txt(b.numero, 30).toUpperCase().replace(/\s+/g, '');
     if (!num) return erro(res, 400, 'Escreva o seu número de estudante.');
@@ -1106,16 +1147,21 @@ app.post('/acesso-codigo', rota(async (req, res) => {
     alvo = l[0];
     if (!alvo || (alvo['Estado'] || 'activo') !== 'activo') return erro(res, 404, 'Não encontrámos esse número de estudante nesta escola.');
     destino = tel9(alvo['Telefone']);
-    if (destino.length !== 9 && alvo['Encarregado']) { const en = await obter('encarregado', alvo['Encarregado']).catch(() => null); destino = en ? tel9(en['Telefone']) : ''; }
-    if (destino.length !== 9) return erro(res, 409, 'Ainda não há telemóvel registado para este estudante. Peça à secretaria para registar o seu número ou o do encarregado.');
+    const en = alvo['Encarregado'] ? await obter('encarregado', alvo['Encarregado']).catch(() => null) : null;
+    if (destino.length !== 9 && en) destino = tel9(en['Telefone']);
+    emailDestino = (en && en['Email']) || '';
+    if (destino.length !== 9 && !emailOk(emailDestino)) return erro(res, 409, 'Ainda não há telemóvel registado para este estudante. Peça à secretaria para registar o seu número ou o do encarregado.');
   }
   if (travao('acesso|' + alvo._id, 3, 15)) return erro(res, 429, 'Já enviámos vários códigos. Espere 15 minutos e tente de novo.');
   const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   const pedido = crypto.randomBytes(16).toString('hex');
-  const r = await enviarSMS([destino], esc['Nome'] + ': o seu codigo de acesso ao Gescolar e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.');
-  if (!r.ok) return erro(res, 502, 'Não foi possível enviar o SMS agora. Tente de novo dentro de um minuto.');
+  const blocos = [{ p: 'Use este código para entrar no Gescolar (' + (tipo === 'professor' ? 'Professor' : tipo === 'estudante' ? 'Estudante' : 'Encarregado') + '):' }, { codigo }, { nota: 'O código vale 10 minutos. Não o partilhe com ninguém. Se não pediu este código, ignore este email.' }];
+  const [r, m] = await Promise.all([
+    destino.length === 9 ? enviarSMS([destino], esc['Nome'] + ': o seu codigo de acesso ao Gescolar e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.') : Promise.resolve({ ok: false }),
+    emailOk(String(emailDestino).toLowerCase()) ? enviarEmail(emailDestino, 'Código de acesso: ' + codigo, emailGescolar(esc['Nome'], 'O seu código de acesso', blocos), textoDeBlocos('O seu código de acesso', blocos)) : Promise.resolve({ ok: false })]);
+  if (!r.ok && !m.ok) return erro(res, 502, 'Não foi possível enviar o código agora. Tente de novo dentro de um minuto.');
   pedidosAcesso.set(pedido, { escola: esc._id, tipo, id: alvo._id, hash: hashCodigo(pedido + codigo), exp: Date.now() + 600e3, tent: 0 });
-  res.json({ ok: true, pedido, destino: mascarar(destino), escola: esc['Nome'] || '' });
+  res.json({ ok: true, pedido, destino: [r.ok ? mascarar(destino) : '', m.ok ? mascararEmail(emailDestino) : ''].filter(Boolean).join(' e '), sms: r.ok, email: m.ok, escola: esc['Nome'] || '' });
 }));
 // 2) confirma o código e abre a sessão
 app.post('/acesso-entrar', rota(async (req, res) => {
@@ -2360,28 +2406,38 @@ app.post('/equipa-estado', exigeSoDireccao, rota(async (req, res) => {
 //  CONVITES AOS PROFESSORES (v4.10)
 //  O professor entra em acesso.html?e=<código da escola> → Professor → telemóvel → código SMS.
 // ============================================================
+// convite por SMS e por email (o que o professor tiver). Devolve { sms, email } ou false se nada saiu
 async function convidarProfessor(escolaId, p, escRaw) {
-  const tel = tel9(p['Telefone']); if (tel.length !== 9) return false;
+  const tel = tel9(p['Telefone']), mail = String(p['Email'] || '').trim().toLowerCase();
+  if (tel.length !== 9 && !emailOk(mail)) return false;
   const esc = escRaw || await obter('escola', escolaId);
-  const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
-  const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre em ' + link + ' , escolha Professor e use este numero.');
-  return r.ok;
+  const linkC = linkFamilias(esc['Subdominio']), link = linkC.replace(/^https?:\/\//, '');
+  const blocos = [{ p: 'Olá ' + String(p['Nome'] || '').split(' ')[0] + ',' }, { p: (esc['Nome'] || 'A escola') + ' criou o seu acesso de professor no Gescolar. Lá vê as suas turmas e o horário, faz a chamada, lança as notas e conversa com os estudantes no chat da turma.' },
+    { botao: 'Entrar no Gescolar', link: linkC },
+    { p: tel.length === 9 ? 'Na página, escolha «Professor» e escreva o seu número de telemóvel (' + tel + '). Vai receber um código de 6 números por SMS e neste email.'
+      : 'Para entrar, a escola tem de registar o seu número de telemóvel: é com ele que entra. Peça à Direcção para o acrescentar à sua ficha.' },
+    { nota: 'Código da escola: ' + (esc['Subdominio'] || '') }];
+  const [r, m] = await Promise.all([
+    tel.length === 9 ? enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre em ' + link + ' , escolha Professor e use este numero.') : Promise.resolve({ ok: false }),
+    emailOk(mail) ? enviarEmail(mail, (esc['Nome'] || 'Gescolar') + ': o seu acesso de professor', emailGescolar(esc['Nome'], 'O seu acesso ao Gescolar', blocos), textoDeBlocos('O seu acesso ao Gescolar', blocos)) : Promise.resolve({ ok: false })]);
+  return (r.ok || m.ok) ? { sms: r.ok, email: m.ok } : false;
 }
 app.post('/professor-convite', exigeDireccao, rota(async (req, res) => {
   const p = await daMinhaEscola('professor', String((req.body || {}).id || ''), req.escola);
-  if (tel9(p['Telefone']).length !== 9) return erro(res, 400, 'Este professor não tem telemóvel registado. Edite-o e acrescente o número.');
+  if (tel9(p['Telefone']).length !== 9 && !emailOk(String(p['Email'] || '').toLowerCase())) return erro(res, 400, 'Este professor não tem telemóvel nem email registados. Edite-o e acrescente um deles.');
   if (travao('conv-prof|' + p._id, 3, 60)) return erro(res, 429, 'Já enviou o acesso a este professor várias vezes. Tente daqui a uma hora.');
-  if (!await convidarProfessor(req.escola, p)) return erro(res, 502, 'O SMS não foi enviado. Tente mais tarde.');
-  res.json({ ok: true });
+  const c = await convidarProfessor(req.escola, p);
+  if (!c) return erro(res, 502, 'O acesso não foi enviado (nem SMS nem email). Tente mais tarde.');
+  res.json({ ok: true, sms: c.sms, email: c.email });
 }));
 app.post('/professores-convite', exigeDireccao, rota(async (req, res) => {
   if (travao('conv-profs|' + req.escola, 1, 60)) return erro(res, 429, 'O convite já foi enviado há pouco. Pode voltar a enviar daqui a uma hora.');
   const [esc, profs] = await Promise.all([obter('escola', req.escola), procurarTodos('professor', daEscola(req.escola))]);
-  const alvo = profs.filter(p => p['Activo'] !== false && tel9(p['Telefone']).length === 9);
-  if (!alvo.length) return erro(res, 400, 'Nenhum professor tem telemóvel registado.');
-  let enviados = 0;
-  for (const p of alvo) if (await convidarProfessor(req.escola, p, esc).catch(() => false)) enviados++;
-  res.json({ ok: true, enviados, sem_telefone: profs.filter(p => p['Activo'] !== false).length - alvo.length });
+  const alvo = profs.filter(p => p['Activo'] !== false && (tel9(p['Telefone']).length === 9 || emailOk(String(p['Email'] || '').toLowerCase())));
+  if (!alvo.length) return erro(res, 400, 'Nenhum professor tem telemóvel ou email registado.');
+  let enviados = 0, sms = 0, emails = 0;
+  for (const p of alvo) { const c = await convidarProfessor(req.escola, p, esc).catch(() => false); if (c) { enviados++; if (c.sms) sms++; if (c.email) emails++; } }
+  res.json({ ok: true, enviados, sms, emails, sem_telefone: profs.filter(p => p['Activo'] !== false).length - alvo.length });
 }));
 
 // ============================================================
