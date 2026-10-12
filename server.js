@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.16.1';
+const VERSAO = 'gescolar-proxy 5.17.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -284,8 +284,8 @@ app.post('/registo', async (req, res) => {
     const nums = [...new Set([telAdm, telEsc].filter(t => t.length === 9))];
     if (nums.length) {
       const base = PORTAL_URL.replace(/acesso\.html.*$/, '').replace(/^https?:\/\//, '');
-      const r = await enviarSMS(nums, 'Gescolar: a escola ' + nome + ' foi criada. Codigo da escola: ' + sub + '. Direccao entra em ' + base + 'entrar.html com ' + email +
-        '. Familias, alunos e professores entram em ' + base + 'acesso.html?e=' + sub + ' com o telemovel.').catch(() => ({ ok: false }));
+      const r = await enviarSMS(nums, 'Gescolar: a escola ' + nome + ' foi criada. Codigo da escola: ' + sub + (SMS_LINKS ? '. Direccao entra em ' + base + 'entrar.html com ' + email + '. Familias, alunos e professores entram em ' + base + 'acesso.html?e=' + sub + ' com o telemovel.'
+        : '. A Direccao entra no Gescolar com o email ' + email + '. Familias, alunos e professores entram com o codigo da escola e o numero de telemovel.')).catch(() => ({ ok: false }));
       s.sms = !!r.ok;
     }
     res.json(s);
@@ -571,15 +571,15 @@ async function matricularCore(escolaId, b) {
   let sms = 0;
   const esc = await obter('escola', escolaId).catch(() => null);
   if (esc) {
-    const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, ''), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
+    const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
     if (telEst) {
       const r = await enviarSMS([telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
-        '. Veja notas, horario e propinas em ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
+        '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
       if (r.ok) sms++;
     }
     if (encTel && encTel !== telEst) {
       const r = await enviarSMS([encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
-        '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
+        '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
       if (r.ok) sms++;
     }
   }
@@ -855,6 +855,7 @@ function numeroSMS(t) {
 }
 // tira acentos e caracteres especiais para a mensagem caber num SMS normal (160 caracteres)
 function textoSMS(m) {
+  if (!SMS_LINKS) m = String(m || '').replace(/\b(?:https?:\/\/|www\.)\S+/gi, '').replace(/\s+([.,)])/g, '$1');   // sem links (v5.17)
   return String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/º/g, 'o').replace(/ª/g, 'a').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim().slice(0, 459);
 }
 async function enviarSMS(numeros, mensagem) {
@@ -1080,6 +1081,9 @@ const hashCodigo = c => crypto.createHmac('sha256', SESSION_SECRET || 'x').updat
 const tel9 = t => soDigitos(t).replace(/^00258/, '').replace(/^258(?=\d{9}$)/, '');
 const mascarar = t => { const d = tel9(t); return d.length === 9 ? d.slice(0, 2) + ' *** **' + d.slice(7) : '***'; };
 function linkFamilias(sub) { return PORTAL_URL + '?e=' + encodeURIComponent(sub || ''); }
+// v5.17: os SMS deixam de levar links (as operadoras bloqueiam SMS com links). SMS_LINKS=sim volta a pô-los.
+const SMS_LINKS = /^(sim|1|true)$/i.test(process.env.SMS_LINKS || '');
+const noGescolar = sub => SMS_LINKS ? 'em ' + linkFamilias(sub).replace(/^https?:\/\//, '') : 'no Gescolar (codigo da escola: ' + (sub || '') + ')';
 
 async function escolaPorCodigo(codigo) {
   const c = slug(String(codigo || '').replace(/\.gescolar\.co\.mz.*$/i, ''));
@@ -1233,8 +1237,8 @@ app.post('/familias-convite', exigeDireccao, rota(async (req, res) => {
   const [esc, encs] = await Promise.all([obter('escola', req.escola), procurarTodos('encarregado', daEscola(req.escola))]);
   const nums = [...new Set(encs.filter(e => e['Activo'] !== false && e['Recebe SMS'] !== false).map(e => tel9(e['Telefone'])).filter(t => t.length === 9))];
   if (!nums.length) return erro(res, 400, 'Ainda não há encarregados com telemóvel registado.');
-  const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
-  const msg = (esc['Nome'] || 'A escola') + ': ja pode ver propinas, recibos e notas do seu educando e pagar por M-Pesa ou e-Mola. Entre em ' + link + ' com o seu numero de telemovel.';
+  const link = noGescolar(esc['Subdominio']);
+  const msg = (esc['Nome'] || 'A escola') + ': ja pode ver propinas, recibos e notas do seu educando e pagar por M-Pesa ou e-Mola. Entre ' + link + ' com o seu numero de telemovel.';
   let enviados = 0, falhas = 0;
   for (let i = 0; i < nums.length; i += 50) {
     const r = await enviarSMS(nums.slice(i, i + 50), msg);
@@ -1361,7 +1365,7 @@ app.post('/comunicado-guardar', exigeDireccao, rota(async (req, res) => {
       const encIds = new Set(ests.filter(e => (e['Estado'] || 'activo') === 'activo').map(e => e['Encarregado']).filter(Boolean));
       const nums = [...new Set(encs.filter(e => encIds.has(e._id) && e['Activo'] !== false && e['Recebe SMS'] !== false).map(e => tel9(e['Telefone'])).filter(t => t.length === 9))];
       const curto = texto.length > 120 ? texto.slice(0, 117).replace(/\s+\S*$/, '') + '...' : texto;
-      const msg = (esc['Nome'] || 'Escola') + ': ' + titulo + '. ' + curto + (texto.length > 120 ? ' Veja tudo em ' + linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '') : '');
+      const msg = (esc['Nome'] || 'Escola') + ': ' + titulo + '. ' + curto + (texto.length > 120 ? ' Veja tudo ' + noGescolar(esc['Subdominio']) + '.' : '');
       for (let i = 0; i < nums.length; i += 50) { const r = await enviarSMS(nums.slice(i, i + 50), msg); if (r.ok) sms += r.numeros.length; }
       if (sms) await mudar('comunicado', id, { 'SMS Enviados': sms }).catch(() => {});
       else if (!nums.length) aviso = 'O comunicado foi publicado. Não há encarregados com telemóvel para receber o SMS.';
@@ -2390,8 +2394,11 @@ app.post('/equipa-criar', exigeSoDireccao, rota(async (req, res) => {
   await mudar('user', userId, { 'Escola': req.escola, 'Papel': papel, 'Nome Completo': nome, 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Activo': true });
   const esc = await obter('escola', req.escola).catch(() => null);
   const link = linkPagina('recuperar.html') + '?email=' + encodeURIComponent(email);
-  const r = await enviarSMS([tel], 'Gescolar: foi criada a sua conta (' + (papel === 'Direccao' ? 'Direccao' : 'Secretaria') + ') em ' + ((esc && esc['Nome']) || 'a escola') + '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, ''));
-  res.json({ ok: true, id: userId, sms: r.ok, link });
+  const papelN = papel === 'Direccao' ? 'Direccao' : 'Secretaria', escN = (esc && esc['Nome']) || 'a escola';
+  const r = await enviarSMS([tel], 'Gescolar: foi criada a sua conta (' + papelN + ') em ' + escN + (SMS_LINKS ? '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, '') : '. Enviamos para o seu email ' + email + ' o link para criar a palavra-passe.'));
+  const blocos = [{ p: 'Foi criada a sua conta (' + (papel === 'Direccao' ? 'Direcção' : 'Secretaria') + ') em ' + escN + ' no Gescolar.' }, { botao: 'Criar a palavra-passe', link }, { p: 'Depois entre no Gescolar com este email (' + email + ') e a palavra-passe que escolher.' }];
+  const m = await enviarEmail(email, 'Gescolar: a sua conta em ' + escN, emailGescolar(escN, 'Bem-vindo ao Gescolar', blocos), textoDeBlocos('Bem-vindo ao Gescolar', blocos));
+  res.json({ ok: true, id: userId, sms: r.ok, email: m.ok, link });
 }));
 app.post('/equipa-estado', exigeSoDireccao, rota(async (req, res) => {
   const b = req.body || {}, id = String(b.id || '');
@@ -2418,7 +2425,7 @@ async function convidarProfessor(escolaId, p, escRaw) {
       : 'Para entrar, a escola tem de registar o seu número de telemóvel: é com ele que entra. Peça à Direcção para o acrescentar à sua ficha.' },
     { nota: 'Código da escola: ' + (esc['Subdominio'] || '') }];
   const [r, m] = await Promise.all([
-    tel.length === 9 ? enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre em ' + link + ' , escolha Professor e use este numero.') : Promise.resolve({ ok: false }),
+    tel.length === 9 ? enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre ' + noGescolar(esc['Subdominio']) + ', escolha Professor e use este numero.') : Promise.resolve({ ok: false }),
     emailOk(mail) ? enviarEmail(mail, (esc['Nome'] || 'Gescolar') + ': o seu acesso de professor', emailGescolar(esc['Nome'], 'O seu acesso ao Gescolar', blocos), textoDeBlocos('O seu acesso ao Gescolar', blocos)) : Promise.resolve({ ok: false })]);
   return (r.ok || m.ok) ? { sms: r.ok, email: m.ok } : false;
 }
@@ -2547,10 +2554,10 @@ async function inscreverCore(escolaId, b) {
   const esc = await obter('escola', escolaId).catch(() => null);
   let sms = false;
   if (esc) {
-    const link = linkFamilias(esc['Subdominio']).replace(/^https?:\/\//, '');
-    const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Estudante).');
+    const link = noGescolar(esc['Subdominio']);
+    const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola ' + link + ' (escolha Estudante).');
     sms = r.ok;
-    if (encTel && encTel !== tel) await enviarSMS([encTel], (esc['Nome'] || 'A escola') + ': ' + nome + ' foi inscrito(a) no curso da carta ' + c['Categoria'] + ' com o numero ' + numero + '. Acompanhe aulas e prestacoes e pague por M-Pesa ou e-Mola em ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => {});
+    if (encTel && encTel !== tel) await enviarSMS([encTel], (esc['Nome'] || 'A escola') + ': ' + nome + ' foi inscrito(a) no curso da carta ' + c['Categoria'] + ' com o numero ' + numero + '. Acompanhe aulas e prestacoes e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => {});
   }
   cachePainel.delete(escolaId);
   return { id: insId, estudante: estId, numero, prestacoes: prest, sms };
