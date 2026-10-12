@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.18.0';
+const VERSAO = 'gescolar-proxy 5.19.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -4324,6 +4324,116 @@ app.post('/plano-visto', exigeDireccao, rota(async (req, res) => {
   const eu = await obter('user', req.sessao.u).catch(() => null);
   await mudar('planoaula', p._id, { 'Estado': decisao, 'Comentario': comentario, 'Visto Por': (eu && eu['Nome Completo']) || 'Direcção', 'Visto Em': new Date().toISOString() });
   res.json({ ok: true, estado: decisao });
+}));
+
+// ============================================================
+//  COBRANÇAS POR SMS (v5.19)
+//  Automático (se a escola ligar): aviso X dias antes de vencer e avisos depois do atraso
+//  (no dia seguinte e depois de 7 em 7 dias, no máximo 3). Um SMS por destinatário, juntando os educandos.
+//  Botão «Avisar devedores»: a Direcção manda quando quiser (uma vez por dia).
+//  Bubble: Escola → Cobranca Auto (yes/no), Cobranca Dias (number)
+//          Propina → Aviso Antes (date), Avisos Atraso (number), Ultimo Aviso (date)
+// ============================================================
+const COBRANCA_HORA = Math.max(6, Math.min(20, Number(process.env.COBRANCA_HORA || 9)));   // hora de Maputo a partir da qual saem os avisos
+const COBRANCA_MAX = 3, COBRANCA_INTERVALO = 7;
+const mtSMS = v => Number(v || 0).toLocaleString('pt-PT', { maximumFractionDigits: 2 }).replace(/\s/g, ' ') + ' MT';
+const dataMZ = iso => new Date(new Date(iso).getTime() + 2 * 3600e3).toISOString().slice(0, 10);
+const diasEntre = (a, b) => Math.round((Date.parse(b + 'T12:00:00Z') - Date.parse(a + 'T12:00:00Z')) / 864e5);
+const listaNomes = l => l.length <= 1 ? (l[0] || '') : l.slice(0, -1).join(', ') + ' e ' + l[l.length - 1];
+// junta as propinas por telefone de destino (encarregado que aceita SMS; senão o próprio estudante)
+async function destinosCobranca(escolaId, propinas) {
+  const f = daEscola(escolaId);
+  const [ests, encs] = await Promise.all([procurarTodos('estudante', f), procurarTodos('encarregado', f)]);
+  const EM = Object.fromEntries(ests.map(e => [e._id, e])), NM = Object.fromEntries(encs.map(e => [e._id, e]));
+  const grupos = {};
+  for (const x of propinas) {
+    const e = EM[x.p['Estudante']]; if (!e || (e['Estado'] || 'activo') !== 'activo') continue;
+    const en = NM[e['Encarregado']];
+    let tel = en && en['Activo'] !== false && en['Recebe SMS'] !== false ? tel9(en['Telefone']) : '';
+    if (tel.length !== 9) tel = tel9(e['Telefone']);
+    if (tel.length !== 9) continue;
+    (grupos[tel] = grupos[tel] || { tel, itens: [] }).itens.push(Object.assign({ nome: String(e['Nome'] || '').split(/\s+/)[0] }, x));
+  }
+  return Object.values(grupos);
+}
+function smsAntes(esc, g) {
+  const nomes = [...new Set(g.itens.map(i => i.nome))], total = g.itens.reduce((s, i) => s + i.c.total, 0), venc = g.itens.map(i => i.venc).sort()[0];
+  const tipo = g.itens.every(i => (i.p['Tipo'] || 'propina') === 'prestacao') ? 'a prestacao' : (g.itens.length > 1 ? 'as propinas' : 'a propina');
+  const mes = g.itens.length === 1 && g.itens[0].p['Mes'] ? ' de ' + MESES_NOME[g.itens[0].p['Mes']] : '';
+  return (esc['Nome'] || 'A escola') + ': lembrete - ' + tipo + mes + ' de ' + listaNomes(nomes) + ' (' + mtSMS(total) + ') vence' + (g.itens.length > 1 ? 'm' : '') + ' a ' + dmCurto(venc) +
+    '. Pague ' + noGescolar(esc['Subdominio']) + ' por M-Pesa ou e-Mola, ou na secretaria.';
+}
+function smsAtraso(esc, g) {
+  const nomes = [...new Set(g.itens.map(i => i.nome))], total = g.itens.reduce((s, i) => s + i.c.total, 0), multa = g.itens.reduce((s, i) => s + i.c.multa, 0);
+  return (esc['Nome'] || 'A escola') + ': ' + listaNomes(nomes) + ' tem ' + (g.itens.length > 1 ? g.itens.length + ' pagamentos' : 'um pagamento') + ' em atraso: ' + mtSMS(total) + (multa ? ' (inclui multa)' : '') +
+    '. Pague ' + noGescolar(esc['Subdominio']) + ' por M-Pesa ou e-Mola, ou na secretaria. Se ja pagou, ignore esta mensagem.';
+}
+async function propinasEmAberto(escolaId) {
+  const esc = await obter('escola', escolaId);
+  const regras = (await resumoEscola(escolaId) || {}).regras || {};
+  const ps = (await procurarTodos('propina', daEscola(escolaId), 20000)).filter(p => p['Estado'] !== 'paga' && p['Estado'] !== 'anulada' && p['Vencimento']);
+  return { esc, lista: ps.map(p => ({ p, c: calcPropina(p, regras), venc: dataMZ(p['Vencimento']) })) };
+}
+let cobrancasDia = '', cobrancasAgora = false;
+async function cobrancasAutomaticas() {
+  if (cobrancasAgora || !BUBBLE_BASE || !BUBBLE_TOKEN || !SMS_TOKEN) return;
+  const agora = new Date(Date.now() + 2 * 3600e3), hoje = agora.toISOString().slice(0, 10);
+  if (agora.getUTCHours() < COBRANCA_HORA || cobrancasDia === hoje) return;
+  cobrancasAgora = true;
+  try {
+    const escolas = (await procurarTodos('escola', [{ key: 'Cobranca Auto', constraint_type: 'equals', value: true }], 2000)).filter(e => e['Estado'] !== 'suspensa');
+    let n = 0;
+    for (const e of escolas) {
+      try {
+        const dias = Math.max(1, Math.min(15, Number(e['Cobranca Dias'] || 3)));
+        const { esc, lista } = await propinasEmAberto(e._id);
+        const antes = lista.filter(x => x.c.estado === 'aberta' && !x.p['Aviso Antes'] && diasEntre(hoje, x.venc) >= 0 && diasEntre(hoje, x.venc) <= dias);
+        const atraso = lista.filter(x => x.c.estado === 'atrasada' && Number(x.p['Avisos Atraso'] || 0) < COBRANCA_MAX && diasEntre(x.venc, hoje) >= 1 &&
+          (!x.p['Ultimo Aviso'] || diasEntre(dataMZ(x.p['Ultimo Aviso']), hoje) >= COBRANCA_INTERVALO));
+        for (const g of await destinosCobranca(e._id, antes)) {
+          if ((await enviarSMS([g.tel], smsAntes(esc, g))).ok) n++;
+          for (const i of g.itens) await mudar('propina', i.p._id, { 'Aviso Antes': new Date().toISOString() }).catch(() => {});
+        }
+        for (const g of await destinosCobranca(e._id, atraso)) {
+          if ((await enviarSMS([g.tel], smsAtraso(esc, g))).ok) n++;
+          for (const i of g.itens) await mudar('propina', i.p._id, { 'Avisos Atraso': Number(i.p['Avisos Atraso'] || 0) + 1, 'Ultimo Aviso': new Date().toISOString() }).catch(() => {});
+        }
+      } catch (err) { console.error('[cobrancas] escola ' + e._id + ':', err.message); }
+    }
+    cobrancasDia = hoje;
+    console.log('[cobrancas] ' + hoje + ': ' + n + ' SMS em ' + escolas.length + ' escola(s)');
+  } catch (err) { console.error('[cobrancas]', err.message); }
+  finally { cobrancasAgora = false; }
+}
+setInterval(() => { cobrancasAutomaticas(); }, 15 * 60e3);
+setTimeout(() => { cobrancasAutomaticas(); }, 90e3);
+
+// estado e definições (página Propinas da Direcção)
+app.post('/cobranca', exigeDireccao, rota(async (req, res) => {
+  const { esc, lista } = await propinasEmAberto(req.escola);
+  const atraso = lista.filter(x => x.c.estado === 'atrasada'), g = await destinosCobranca(req.escola, atraso);
+  res.json({ ok: true, auto: esc['Cobranca Auto'] === true, dias: Number(esc['Cobranca Dias'] || 3), hora: COBRANCA_HORA, sms: !!(SMS_TOKEN && SMS_ORIGEM),
+    devedores: g.length, valor: atraso.reduce((s, x) => s + x.c.total, 0), sem_telefone: new Set(atraso.map(x => x.p['Estudante'])).size - new Set([].concat(...g.map(z => z.itens.map(i => i.p['Estudante'])))).size,
+    exemplo: g[0] ? smsAtraso(esc, g[0]) : '' });
+}));
+app.post('/cobranca-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, dias = Math.max(1, Math.min(15, Math.round(Number(b.dias) || 3)));
+  await mudar('escola', req.escola, { 'Cobranca Auto': b.auto === true, 'Cobranca Dias': dias });
+  res.json({ ok: true, auto: b.auto === true, dias });
+}));
+app.post('/avisar-devedores', exigeDireccao, rota(async (req, res) => {
+  if (!SMS_TOKEN || !SMS_ORIGEM) return erro(res, 500, 'O SMS ainda não está configurado no servidor.');
+  if (travao('devedores|' + req.escola, 1, 20 * 60)) return erro(res, 429, 'Os devedores já foram avisados hoje. Pode voltar a avisar amanhã.');
+  const { esc, lista } = await propinasEmAberto(req.escola);
+  const atraso = lista.filter(x => x.c.estado === 'atrasada');
+  const grupos = await destinosCobranca(req.escola, atraso);
+  if (!grupos.length) return res.json({ ok: true, enviados: 0, destinatarios: 0 });
+  let enviados = 0;
+  for (const g of grupos) {
+    if ((await enviarSMS([g.tel], smsAtraso(esc, g))).ok) enviados++;
+    for (const i of g.itens) await mudar('propina', i.p._id, { 'Ultimo Aviso': new Date().toISOString() }).catch(() => {});
+  }
+  res.json({ ok: true, enviados, destinatarios: grupos.length });
 }));
 
 app.use((req, res) => erro(res, 404, 'Rota não encontrada.'));
