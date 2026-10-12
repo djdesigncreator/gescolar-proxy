@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.17.0';
+const VERSAO = 'gescolar-proxy 5.18.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -107,7 +107,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo', chatturma: 'Chat Turma', mensagemchat: 'Mensagem Chat',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo', chatturma: 'Chat Turma', mensagemchat: 'Mensagem Chat', planoaula: 'Plano Aula',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -4082,6 +4082,248 @@ app.post('/chat/apagar', exigeChat, rota(async (req, res) => {
   await mudar('mensagemchat', m._id, { 'Apagada': true, 'Texto': '', 'Ficheiro URL': '' });
   if (m['Ficheiro URL']) await apagarFicheiroBunny(m['Ficheiro URL']);
   res.json({ ok: true });
+}));
+
+// ============================================================
+//  IMPORTAR ESTUDANTES POR EXCEL (v5.18)
+//  A página lê o Excel (modelo do Gescolar) e manda as linhas. Primeiro com testar:true (só valida, mostra os erros
+//  linha a linha), depois sem testar para gravar. Os encarregados são reutilizados pelo telemóvel ou criados.
+// ============================================================
+async function criarEmLoteIds(tipo, lista) {
+  const ids = [];
+  for (let i = 0; i < lista.length; i += 200) {
+    const fatia = lista.slice(i, i + 200);
+    const r = await fetch(BUBBLE_BASE + '/' + tipo + '/bulk', { method: 'POST', headers: { 'Authorization': 'Bearer ' + BUBBLE_TOKEN, 'Content-Type': 'text/plain' }, body: fatia.map(x => JSON.stringify(x)).join('\n') });
+    const t = await r.text();
+    if (!r.ok) {
+      let msg = t; try { const d = JSON.parse(t); msg = (d.body && d.body.message) || d.message || t; } catch (e) {}
+      throw erroGravar(tipo, Object.assign(new Error(msg), { status: r.status === 404 ? 404 : 400, bubble: String(msg).slice(0, 200) }));
+    }
+    const linhas = t.split('\n').filter(Boolean);
+    fatia.forEach((x, k) => { let id = null; try { const d = JSON.parse(linhas[k] || '{}'); if (d.status === 'success') id = d.id; else if (k === 0 && !ids.length && d.message) console.error('[lote] ' + tipo + ': ' + d.message); } catch (e) {} ids.push(id); });
+  }
+  return ids;
+}
+const normNome = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9ºª]+/g, ' ').trim();
+// aceita AAAA-MM-DD, DD/MM/AAAA, DD-MM-AAAA ou DD.MM.AAAA
+function dataValida(iso) { const d = new Date(iso + 'T12:00:00Z'); return !isNaN(d) && d.toISOString().slice(0, 10) === iso && +iso.slice(0, 4) > 1900 ? iso : null; }
+function dataImport(v) {
+  const s = String(v || '').trim(); if (!s) return '';
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if (m) return dataValida(m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0'));
+  m = s.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})$/); if (m) return dataValida(m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0'));
+  return null;
+}
+app.post('/importar-estudantes', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, testar = b.testar !== false, comSMS = b.sms === true;
+  const linhas = Array.isArray(b.linhas) ? b.linhas.slice(0, 1000) : [];
+  if (!linhas.length) return erro(res, 400, 'O ficheiro não tem estudantes. Preencha a folha «Estudantes» do modelo a partir da linha 2.');
+  if (!testar && travao('importar|' + req.escola, 40, 60)) return erro(res, 429, 'Muitas importações seguidas. Espere um pouco.');
+  const f = daEscola(req.escola);
+  const [turmas, ests, encs, escola] = await Promise.all([procurarTodos('turma', f), procurarTodos('estudante', f), procurarTodos('encarregado', f), resumoEscola(req.escola)]);
+  const TN = {}; turmas.filter(t => t['Activa'] !== false).forEach(t => { TN[normNome(t['Nome'])] = t; TN[t._id] = t; });
+  const jaNaTurma = new Set(ests.filter(e => (e['Estado'] || 'activo') !== 'apagado').map(e => e['Turma'] + '|' + normNome(e['Nome'])));
+  const encPorTel = {}; encs.forEach(e => { const t = tel9(e['Telefone']); if (t.length === 9) encPorTel[t] = e; });
+  const novosEnc = {};   // telefone → {nome, email, parentesco}
+  const vistos = new Set(), resultado = [], validas = [];
+  linhas.forEach((l, i) => {
+    const n = Number(l.linha) || i + 2, erros = [];
+    const nome = txt(l.nome, 100).replace(/\s+/g, ' ');
+    if (nome.split(' ').filter(Boolean).length < 2) erros.push('falta o nome e o apelido do estudante');
+    const turma = TN[String(l.turma || '')] || TN[normNome(l.turma)];
+    if (!turma) erros.push(l.turma ? 'a turma «' + txt(l.turma, 40) + '» não existe (veja a folha Turmas)' : 'falta a turma');
+    const superior = turma && (turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP');
+    const sexo = String(l.sexo || '').trim().toUpperCase().charAt(0);
+    if (sexo && sexo !== 'M' && sexo !== 'F') erros.push('sexo deve ser M ou F');
+    const nasc = dataImport(l.nascimento);
+    if (nasc === null) erros.push('data de nascimento inválida (use DD/MM/AAAA)');
+    const telE = tel9(l.telefone);
+    if (String(l.telefone || '').trim() && (telE.length !== 9 || !/^8[2-7]/.test(telE))) erros.push('telemóvel do estudante inválido');
+    if (superior && telE.length !== 9) erros.push('no ensino superior o telemóvel do estudante é obrigatório');
+    const encNome = txt(l.enc_nome, 100).replace(/\s+/g, ' '), telEnc = tel9(l.enc_telefone), encEmail = txt(l.enc_email, 120).toLowerCase();
+    let enc = null;
+    if (encNome || String(l.enc_telefone || '').trim()) {
+      if (telEnc.length !== 9 || !/^8[2-7]/.test(telEnc)) erros.push('telemóvel do encarregado inválido (9 dígitos, começa por 82 a 87)');
+      else if (encPorTel[telEnc]) enc = { id: encPorTel[telEnc]._id, tel: encPorTel[telEnc]['Recebe SMS'] === false ? '' : telEnc };
+      else if (novosEnc[telEnc]) enc = { novo: telEnc, tel: telEnc };
+      else if (encNome.split(' ').filter(Boolean).length < 2) erros.push('falta o nome completo do encarregado');
+      else enc = { novo: telEnc, tel: telEnc, nome: encNome };
+      if (encEmail && !emailOk(encEmail)) erros.push('email do encarregado inválido');
+    } else if (turma && !superior) erros.push('encarregado obrigatório neste nível (nome e telemóvel)');
+    const chave = turma ? turma._id + '|' + normNome(nome) : '';
+    if (turma && nome && jaNaTurma.has(chave)) erros.push('já está matriculado nesta turma');
+    else if (chave && vistos.has(chave)) erros.push('repetido no ficheiro');
+    if (chave) vistos.add(chave);
+    if (erros.length) { resultado.push({ linha: n, nome, ok: false, erro: erros.join('; ') }); return; }
+    if (enc && enc.nome) novosEnc[telEnc] = { nome: encNome, email: encEmail, parentesco: txt(l.enc_parentesco, 30) };
+    validas.push({ n, nome, turma, superior, sexo, nasc, telE, enc });
+    resultado.push({ linha: n, nome, ok: true, turma: turma['Nome'] || '', novo_encarregado: !!(enc && enc.novo) });
+  });
+  const resumo = { total: linhas.length, validas: validas.length, com_erro: linhas.length - validas.length, novos_encarregados: Object.keys(novosEnc).length };
+  if (testar || !validas.length) return res.json({ ok: true, testar: true, resumo, linhas: resultado });
+  // 1) encarregados novos
+  const telsNovos = Object.keys(novosEnc);
+  const idsEnc = await criarEmLoteIds('encarregado', telsNovos.map(t => ({ 'Escola': req.escola, 'Nome': novosEnc[t].nome, 'Telefone': t.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': novosEnc[t].email, 'Parentesco': novosEnc[t].parentesco, 'Recebe SMS': true, 'Activo': true })));
+  const encId = {}; telsNovos.forEach((t, k) => { encId[t] = idsEnc[k]; });
+  // 2) estudantes, com número ano-sequência
+  const ano = (escola && escola.ano) || String(new Date().getFullYear());
+  let maior = ests.map(e => String(e['Numero'] || '')).filter(x => x.startsWith(ano + '-')).map(x => parseInt(x.split('-')[1], 10) || 0).reduce((a, c) => Math.max(a, c), 0);
+  const agora = new Date().toISOString();
+  const lote = validas.map(v => {
+    v.numero = ano + '-' + String(++maior).padStart(4, '0');
+    const c = { 'Escola': req.escola, 'Numero': v.numero, 'Nome': v.nome, 'Sexo': v.sexo || '', 'Turma': v.turma._id, 'Ano Lectivo': ano, 'Data Matricula': agora, 'Estado': 'activo' };
+    if (v.nasc) c['Data Nascimento'] = new Date(v.nasc + 'T12:00:00Z').toISOString();
+    if (v.telE.length === 9) c['Telefone'] = v.telE.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
+    const eid = v.enc ? (v.enc.id || encId[v.enc.novo]) : null; if (eid) c['Encarregado'] = eid;
+    return c;
+  });
+  const idsEst = await criarEmLoteIds('estudante', lote);
+  let criados = 0, sms = 0;
+  const esc = comSMS ? await obter('escola', req.escola).catch(() => null) : null;
+  for (let k = 0; k < validas.length; k++) {
+    const v = validas[k], r = resultado.find(x => x.linha === v.n);
+    if (!idsEst[k]) { r.ok = false; r.erro = 'o Bubble não gravou esta linha'; continue; }
+    criados++; r.numero = v.numero;
+    if (esc) {
+      const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = v.turma['Nome'] || '';
+      if (v.telE.length === 9 && (await enviarSMS([v.telE], en + ': ' + (v.superior ? 'bem-vindo(a), ' + v.nome.split(' ')[0] + '. Esta inscrito(a) em ' : v.nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + v.numero + '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + v.numero + ').')).ok) sms++;
+      if (v.enc && v.enc.tel && v.enc.tel !== v.telE && (await enviarSMS([v.enc.tel], en + ': ' + v.nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + v.numero + '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).')).ok) sms++;
+    }
+  }
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, testar: false, resumo: Object.assign(resumo, { criados, sms }), linhas: resultado });
+}));
+
+// ============================================================
+//  PLANOS DE AULA (v5.18) — modelo usado nas escolas moçambicanas
+//  Cabeçalho (unidade temática, tema, objectivos, meios, métodos…) e as quatro funções didácticas:
+//  Introdução e Motivação · Mediação e Assimilação · Domínio e Consolidação · Controlo e Avaliação.
+//  O professor faz (à mão ou com rascunho da IA, opcional), submete; a Direcção dá o visto ou devolve com comentário.
+//  Bubble: Plano Aula — Escola (Escola), Professor, Turma, Disciplina, Data, Tema, Estado, Dados, Comentario, Visto Por (text), Visto Em, Submetido Em (date)
+// ============================================================
+const FUNCOES_DIDACTICAS = ['Introdução e Motivação', 'Mediação e Assimilação', 'Domínio e Consolidação', 'Controlo e Avaliação'];
+const ESTADOS_PLANO = { rascunho: 'Rascunho', submetido: 'Submetido', aprovado: 'Aprovado', devolvido: 'Devolvido' };
+function lerDadosPlano(d) {
+  d = d && typeof d === 'object' ? d : {};
+  const t = (k, m) => txt(d[k], m || 600);
+  const dur = Math.max(10, Math.min(300, Math.round(Number(d.duracao) || 45)));
+  const fases = FUNCOES_DIDACTICAS.map((f, i) => { const x = (Array.isArray(d.fases) ? d.fases[i] : null) || {};
+    return { funcao: f, tempo: Math.max(0, Math.min(300, Math.round(Number(x.tempo) || 0))), conteudo: txt(x.conteudo, 1500), professor: txt(x.professor, 1500), aluno: txt(x.aluno, 1500), metodos: txt(x.metodos, 300), meios: txt(x.meios, 300) }; });
+  return { trimestre: Math.max(0, Math.min(3, Number(d.trimestre) || 0)), licao: txt(d.licao, 10), unidade: t('unidade', 200), tema: t('tema', 200), tipo: t('tipo', 80), duracao: dur,
+    objectivos: t('objectivos', 1500), competencias: t('competencias', 1000), meios: t('meios', 400), metodos: t('metodos', 400), bibliografia: t('bibliografia', 600), observacoes: t('observacoes', 1000), fases };
+}
+function planoOut(p, N) {
+  N = N || {};
+  return { id: p._id, professor: p['Professor'] || '', professor_nome: (N.prof || {})[p['Professor']] || '', turma: p['Turma'] || '', turma_nome: (N.turma || {})[p['Turma']] || '', classe: (N.classe || {})[p['Turma']] || '',
+    disciplina: p['Disciplina'] || '', disciplina_nome: (N.disc || {})[p['Disciplina']] || '', data: p['Data'] || '', tema: p['Tema'] || '', estado: p['Estado'] || 'rascunho',
+    comentario: p['Comentario'] || '', visto_por: p['Visto Por'] || '', visto_em: p['Visto Em'] || null, submetido_em: p['Submetido Em'] || null, actualizado: p['Modified Date'] || null,
+    dados: N.semDados ? undefined : lerDadosPlano(lerJSON(p['Dados'], {})) };
+}
+async function nomesPlanos(escola) {
+  const f = daEscola(escola);
+  const [ts, ds, ps, esc] = await Promise.all([procurarTodos('turma', f), procurarTodos('disciplina', f), procurarTodos('professor', f), obter('escola', escola).catch(() => null)]);
+  const N = { turma: {}, classe: {}, disc: {}, prof: {}, escola: (esc && esc['Nome']) || '', logotipo: (esc && esc['Logotipo']) || '' };
+  ts.forEach(t => { N.turma[t._id] = t['Nome'] || ''; N.classe[t._id] = t['Classe'] || ''; }); ds.forEach(d => { N.disc[d._id] = d['Nome'] || ''; }); ps.forEach(p => { N.prof[p._id] = p['Nome'] || ''; });
+  return N;
+}
+function validarSubmissao(d) {
+  if (!d.tema) return 'Escreva o tema da aula.';
+  if (!d.objectivos) return 'Escreva os objectivos da aula.';
+  const vazias = d.fases.filter(f => !f.conteudo && !f.professor && !f.aluno).map(f => f.funcao);
+  if (vazias.length) return 'Preencha as funções didácticas: falta ' + vazias.join(', ') + '.';
+  return null;
+}
+// professor: os seus planos e as turmas/disciplinas que dá
+app.post('/prof/planos', exigeProfessor, rota(async (req, res) => {
+  const [a, N, ps] = await Promise.all([atribuicoes(req.escola), nomesPlanos(req.escola), procurarTodos('planoaula', daEscola(req.escola).concat([{ key: 'Professor', constraint_type: 'equals', value: req.sessao.u }]), 1000)]);
+  const pares = a.pares.filter(p => p.professores.has(req.sessao.u) && N.turma[p.turma] && N.disc[p.disciplina])
+    .map(p => ({ turma: p.turma, turma_nome: N.turma[p.turma], classe: N.classe[p.turma], disciplina: p.disciplina, disciplina_nome: N.disc[p.disciplina] }))
+    .sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt'));
+  res.json({ ok: true, escola: N.escola, logotipo: N.logotipo, professor: N.prof[req.sessao.u] || '', ia: !!OPENAI_KEY, pares,
+    planos: ps.map(p => planoOut(p, Object.assign({ semDados: true }, N))).sort((x, y) => String(y.data).localeCompare(String(x.data)) || String(y.actualizado).localeCompare(String(x.actualizado))) });
+}));
+app.post('/prof/plano', exigeProfessor, rota(async (req, res) => {
+  const p = await daMinhaEscola('planoaula', String((req.body || {}).id || ''), req.escola);
+  if (p['Professor'] !== req.sessao.u) return erro(res, 404, 'Plano não encontrado.');
+  res.json({ ok: true, plano: planoOut(p, await nomesPlanos(req.escola)) });
+}));
+app.post('/prof/plano-guardar', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {}, turma = String(b.turma || ''), disc = String(b.disciplina || '');
+  if (!await podeLancar(req, turma, disc)) return erro(res, 403, 'Só pode fazer planos das disciplinas e turmas onde dá aulas.');
+  const data = dataImport(b.data); if (!data) return erro(res, 400, 'Escolha a data da aula.');
+  const d = lerDadosPlano(b.dados);
+  if (b.submeter) { const e = validarSubmissao(d); if (e) return erro(res, 400, e); }
+  const campos = { 'Turma': turma, 'Disciplina': disc, 'Data': data, 'Tema': d.tema || 'Sem tema', 'Dados': JSON.stringify(d) };
+  if (b.submeter) Object.assign(campos, { 'Estado': 'submetido', 'Submetido Em': new Date().toISOString() });
+  let id = b.id ? String(b.id) : '';
+  if (id) {
+    const p = await daMinhaEscola('planoaula', id, req.escola);
+    if (p['Professor'] !== req.sessao.u) return erro(res, 404, 'Plano não encontrado.');
+    if (p['Estado'] === 'aprovado') return erro(res, 409, 'Este plano já tem o visto da Direcção e não pode ser mudado. Faça uma cópia.');
+    if (!b.submeter && p['Estado'] === 'submetido') campos['Estado'] = 'rascunho';   // mexeu depois de submeter: volta a rascunho até submeter outra vez
+    await mudar('planoaula', id, campos);
+  } else {
+    if (travao('plano|' + req.sessao.u, 60, 60)) return erro(res, 429, 'Muitos planos seguidos. Espere um pouco.');
+    id = await criar('planoaula', Object.assign({ 'Escola': req.escola, 'Professor': req.sessao.u, 'Estado': b.submeter ? 'submetido' : 'rascunho', 'Comentario': '' }, campos));
+  }
+  res.json({ ok: true, id, estado: campos['Estado'] || (b.submeter ? 'submetido' : 'rascunho') });
+}));
+app.post('/prof/plano-apagar', exigeProfessor, rota(async (req, res) => {
+  const p = await daMinhaEscola('planoaula', String((req.body || {}).id || ''), req.escola);
+  if (p['Professor'] !== req.sessao.u) return erro(res, 404, 'Plano não encontrado.');
+  if (p['Estado'] === 'aprovado') return erro(res, 409, 'Um plano com o visto da Direcção não pode ser apagado.');
+  await apagar('planoaula', p._id);
+  res.json({ ok: true });
+}));
+// rascunho com IA (opcional): o professor revê e corrige tudo antes de guardar
+const IA_PLANO = 'És um professor experiente em Moçambique e preparas planos de aula no modelo usado nas escolas moçambicanas (MINEDH).\n' +
+  'Escreve em português de Moçambique (norma europeia: «actividade», «objectivo», «facto»).\n' +
+  'Responde só com JSON neste formato:\n' +
+  '{"objectivos":"…","competencias":"…","meios":"…","metodos":"…","bibliografia":"…","fases":[{"tempo":5,"conteudo":"…","professor":"…","aluno":"…","metodos":"…","meios":"…"}, …4 fases]}\n' +
+  'As 4 fases são, por esta ordem: Introdução e Motivação; Mediação e Assimilação; Domínio e Consolidação; Controlo e Avaliação.\n' +
+  'Regras:\n' +
+  '- A soma dos tempos das 4 fases é igual à duração da aula.\n' +
+  '- Objectivos específicos, mensuráveis, cada um numa linha começada por «- » e por um verbo no infinitivo (identificar, explicar, resolver…).\n' +
+  '- Actividades do professor e do aluno concretas, em frases curtas, uma por linha começada por «- ».\n' +
+  '- Usa meios simples que existem numa escola moçambicana (quadro, giz, livro do aluno, cartazes, objectos do dia-a-dia).\n' +
+  '- Adequa ao nível da classe indicada e ao programa de ensino de Moçambique. Não inventes números de página nem títulos de livros: na bibliografia escreve só «Livro do aluno da X.ª classe» e «Programa de Ensino da disciplina».\n' +
+  '- Não escrevas nomes de pessoas.';
+app.post('/prof/plano-ia', exigeProfessor, rota(async (req, res) => {
+  const b = req.body || {}, turma = String(b.turma || ''), disc = String(b.disciplina || '');
+  if (!await podeLancar(req, turma, disc)) return erro(res, 403, 'Só pode fazer planos das disciplinas e turmas onde dá aulas.');
+  const tema = txt(b.tema, 200); if (tema.length < 3) return erro(res, 400, 'Escreva primeiro o tema da aula.');
+  if (travao('plano-ia|' + req.sessao.u, 10, 60)) return erro(res, 429, 'Muitos pedidos à IA seguidos. Espere um pouco.');
+  const u = await iaReservar(req.escola);
+  const [t, d] = await Promise.all([obter('turma', turma), obter('disciplina', disc)]);
+  const dur = Math.max(10, Math.min(300, Math.round(Number(b.duracao) || 45)));
+  const pedido = 'Disciplina: ' + (d['Nome'] || '') + '\nClasse: ' + (t['Classe'] || t['Nome'] || '') + ' (nível: ' + (t['Nivel'] || '') + ')\n' +
+    (b.unidade ? 'Unidade temática: ' + txt(b.unidade, 200) + '\n' : '') + 'Tema da aula: ' + tema + '\n' + (b.tipo ? 'Tipo de aula: ' + txt(b.tipo, 80) + '\n' : '') + 'Duração: ' + dur + ' minutos';
+  const r = await openaiJSON(IA_PLANO, pedido, 3500);
+  const usados = await iaContar(req.escola, u);
+  const dados = lerDadosPlano(Object.assign({}, r, { tema, unidade: b.unidade, tipo: b.tipo, duracao: dur }));
+  res.json({ ok: true, dados, usados, limite: IA_LIMITE });
+}));
+// Direcção: ver, dar o visto ou devolver
+app.post('/planos', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, f = daEscola(req.escola).concat(b.estado && ESTADOS_PLANO[b.estado] ? [{ key: 'Estado', constraint_type: 'equals', value: b.estado }] : []);
+  const [N, ps] = await Promise.all([nomesPlanos(req.escola), procurarTodos('planoaula', f, 2000)]);
+  const L = ps.filter(p => b.estado ? true : p['Estado'] !== 'rascunho').map(p => planoOut(p, Object.assign({ semDados: true }, N)))
+    .sort((x, y) => (x.estado === 'submetido' ? 0 : 1) - (y.estado === 'submetido' ? 0 : 1) || String(y.submetido_em || y.data).localeCompare(String(x.submetido_em || x.data)));
+  res.json({ ok: true, escola: N.escola, logotipo: N.logotipo, planos: L, por_ver: ps.filter(p => p['Estado'] === 'submetido').length });
+}));
+app.post('/plano', exigeDireccao, rota(async (req, res) => {
+  const p = await daMinhaEscola('planoaula', String((req.body || {}).id || ''), req.escola);
+  res.json({ ok: true, plano: planoOut(p, await nomesPlanos(req.escola)) });
+}));
+app.post('/plano-visto', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, decisao = b.decisao === 'aprovado' ? 'aprovado' : b.decisao === 'devolvido' ? 'devolvido' : '';
+  if (!decisao) return erro(res, 400, 'Escolha: dar o visto ou devolver.');
+  const p = await daMinhaEscola('planoaula', String(b.id || ''), req.escola);
+  if (p['Estado'] === 'rascunho') return erro(res, 409, 'Este plano ainda é um rascunho do professor.');
+  const comentario = txt(b.comentario, 800);
+  if (decisao === 'devolvido' && comentario.length < 3) return erro(res, 400, 'Escreva ao professor o que deve corrigir.');
+  const eu = await obter('user', req.sessao.u).catch(() => null);
+  await mudar('planoaula', p._id, { 'Estado': decisao, 'Comentario': comentario, 'Visto Por': (eu && eu['Nome Completo']) || 'Direcção', 'Visto Em': new Date().toISOString() });
+  res.json({ ok: true, estado: decisao });
 }));
 
 app.use((req, res) => erro(res, 404, 'Rota não encontrada.'));
