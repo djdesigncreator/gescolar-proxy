@@ -5585,6 +5585,81 @@ app.post('/verify-code', async (req, res) => {
 });
 
 // ======================================================
+// Sessão (autenticação a sério)
+// ======================================================
+// Até aqui, qualquer rota que recebesse um "owner" confiava nele sem mais
+// nada - bastava alguém saber o unique id de outra conta para se fazer
+// passar por ela. Esta secção resolve isso: dá a cada login/confirmação
+// um token de sessão aleatório (64 caracteres, nunca adivinhável), grava-o
+// no User, e cada rota que mexe em dados de uma conta passa a exigir esse
+// token em vez de confiar só no owner.
+//
+// Campos novos no Bubble antes disto funcionar: tipo User, campo
+// "Token Sessao" (text) e "Token Sessao Expira" (date).
+//
+// Esta rota só pode ser chamada pelo próprio Bubble (workflows de login,
+// signup e verify-code), nunca directamente pelo browser - por isso exige
+// a mesma ADMIN_SECRET usada no /plan-warnings-teste-7hq2fx. Define essa
+// chave também no API Connector do Bubble, como um "Private key" do
+// corpo do pedido (nunca Private no cabeçalho, para não ires parar à
+// mesma armadilha de outra vez).
+const SESSAO_DIAS_VALIDADE = 90;
+
+app.post('/sessao-criar', async (req, res) => {
+  try {
+    const { owner, key } = req.body;
+    if (!ADMIN_SECRET || key !== ADMIN_SECRET) {
+      return res.json({ status: 'error', message: 'Não autorizado.' });
+    }
+    if (!owner) {
+      return res.json({ status: 'error', message: 'Falta o owner.' });
+    }
+
+    const usuario = await bubbleGet('user', owner);
+    if (!usuario) {
+      return res.json({ status: 'error', message: 'Utilizador não encontrado.' });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expira = new Date(Date.now() + SESSAO_DIAS_VALIDADE * 24 * 60 * 60 * 1000);
+
+    await bubblePatch('user', owner, {
+      'Token Sessao': token,
+      'Token Sessao Expira': expira.toISOString()
+    });
+
+    return res.json({ status: 'success', token: token });
+  } catch (erro) {
+    console.error('Erro em /sessao-criar:', erro);
+    return res.json({ status: 'error', message: 'Não foi possível criar a sessão. Tenta novamente.' });
+  }
+});
+
+// Confere se um par owner+token corresponde a uma sessão válida e ainda
+// dentro do prazo. Devolve o utilizador (já carregado, para não teres de
+// o voltar a pedir à Data API) quando está tudo certo, ou null quando não
+// está - a rota que chamar isto decide o que responder ao browser nesse
+// caso (ver exemplo de uso mais abaixo).
+async function validarSessao(owner, token) {
+  try {
+    if (!owner || !token) return null;
+    const usuario = await bubbleGet('user', owner);
+    if (!usuario) return null;
+
+    const tokenCerto = usuario['Token Sessao'];
+    if (!tokenCerto || tokenCerto !== token) return null;
+
+    const expiraEm = usuario['Token Sessao Expira'] ? new Date(usuario['Token Sessao Expira']) : null;
+    if (!expiraEm || isNaN(expiraEm.getTime()) || expiraEm.getTime() < Date.now()) return null;
+
+    return usuario;
+  } catch (erro) {
+    console.error('Erro em validarSessao:', erro);
+    return null;
+  }
+}
+
+// ======================================================
 // Aviso de expiração de plano
 // ======================================================
 // Em vez de depender de um workflow agendado no Bubble (o que obrigaria a
