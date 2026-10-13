@@ -5562,7 +5562,11 @@ app.post('/verify-code', async (req, res) => {
     }
 
     if (usuario['Token Confirmado']) {
-      return res.json({ status: 'success' }); // já estava confirmado antes, sem mal nenhum
+      // já estava confirmado antes, sem mal nenhum - mas ainda assim dá-lhe
+      // uma sessão nova, para o caso de ter chegado aqui sem token (ex:
+      // clicou duas vezes seguidas no botão de confirmar).
+      const tokenExistente = await criarTokenSessao(owner).catch(() => null);
+      return res.json({ status: 'success', token: tokenExistente });
     }
 
     const codigoCerto = String(usuario['Token'] || '').trim().toUpperCase();
@@ -5577,7 +5581,19 @@ app.post('/verify-code', async (req, res) => {
     }
 
     await bubblePatch('user', owner, { 'Token Confirmado': true });
-    return res.json({ status: 'success' });
+
+    // A confirmação do código é o momento em que a conta passa a estar
+    // "entrada" a sério - por isso já lhe damos aqui um token de sessão
+    // verdadeiro, em vez de mandar a pessoa fazer login outra vez a
+    // seguir. O dashboard vai usar este token em todos os pedidos
+    // seguintes (ver /sessao-criar, mais abaixo, para o mesmo mecanismo
+    // usado pelo login feito no Bubble).
+    const token = await criarTokenSessao(owner).catch((erro) => {
+      console.error('Não foi possível criar sessão após /verify-code:', erro);
+      return null;
+    });
+
+    return res.json({ status: 'success', token: token });
   } catch (erro) {
     console.error('Erro em /verify-code:', erro);
     return res.json({ status: 'error', message: 'Não foi possível confirmar o código. Tenta novamente.' });
@@ -5605,6 +5621,29 @@ app.post('/verify-code', async (req, res) => {
 // mesma armadilha de outra vez).
 const SESSAO_DIAS_VALIDADE = 90;
 
+// Gera um token de sessão novo para este owner e grava-o no Bubble. Partilhada
+// por duas chamadoras: a rota /sessao-criar (chamada de fora, pelo Bubble, por
+// isso protegida por ADMIN_SECRET) e /verify-code (chamada aqui dentro do
+// próprio servidor, já depois de confirmar que o owner é quem diz ser - não
+// precisa de chave outra vez). Lança erro se o owner não existir; quem chama
+// decide o que fazer com isso.
+async function criarTokenSessao(owner) {
+  const usuario = await bubbleGet('user', owner);
+  if (!usuario) {
+    throw new Error('Utilizador não encontrado.');
+  }
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const expira = new Date(Date.now() + SESSAO_DIAS_VALIDADE * 24 * 60 * 60 * 1000);
+
+  await bubblePatch('user', owner, {
+    'Token Sessao': token,
+    'Token Sessao Expira': expira.toISOString()
+  });
+
+  return token;
+}
+
 app.post('/sessao-criar', async (req, res) => {
   try {
     const { owner, key } = req.body;
@@ -5615,19 +5654,7 @@ app.post('/sessao-criar', async (req, res) => {
       return res.json({ status: 'error', message: 'Falta o owner.' });
     }
 
-    const usuario = await bubbleGet('user', owner);
-    if (!usuario) {
-      return res.json({ status: 'error', message: 'Utilizador não encontrado.' });
-    }
-
-    const token = crypto.randomBytes(32).toString('hex');
-    const expira = new Date(Date.now() + SESSAO_DIAS_VALIDADE * 24 * 60 * 60 * 1000);
-
-    await bubblePatch('user', owner, {
-      'Token Sessao': token,
-      'Token Sessao Expira': expira.toISOString()
-    });
-
+    const token = await criarTokenSessao(owner);
     return res.json({ status: 'success', token: token });
   } catch (erro) {
     console.error('Erro em /sessao-criar:', erro);
