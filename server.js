@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.19.0';
+const VERSAO = 'gescolar-proxy 5.20.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -107,7 +107,7 @@ const bubble = (method, path, body) => pedido(BUBBLE_BASE + path, method, body);
 // nome da tabela como aparece no Bubble (o URL da Data API não tem espaços)
 const NOME_TABELA = { chamada: 'Chamada', falta: 'Falta', pauta: 'Pauta', horario: 'Horario', propina: 'Propina', pagamento: 'Pagamento', comunicado: 'Comunicado',
   subscricao: 'Subscricao', transferencia: 'Transferencia', cursoconducao: 'Curso Conducao', inscricaoconducao: 'Inscricao Conducao', viatura: 'Viatura',
-  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo', chatturma: 'Chat Turma', mensagemchat: 'Mensagem Chat', planoaula: 'Plano Aula',
+  aulapratica: 'Aula Pratica', exameconducao: 'Exame Conducao', linkinscricao: 'Link Inscricao', inscricaoonline: 'Inscricao Online', diarioentrada: 'Diario Entrada', autorizadorecolha: 'Autorizado Recolha', perguntacodigo: 'Pergunta Codigo', testecodigo: 'Teste Codigo', aulateorica: 'Aula Teorica', licaocodigo: 'Licao Codigo', chatturma: 'Chat Turma', mensagemchat: 'Mensagem Chat', planoaula: 'Plano Aula', aulavideo: 'Aula Video', aulaaovivo: 'Aula Ao Vivo',
   turma: 'Turma', disciplina: 'Disciplina', professor: 'Professor', estudante: 'Estudante', encarregado: 'Encarregado', escola: 'Escola' };
 const nomeTabela = t => NOME_TABELA[t] || t;
 // erro do Bubble ao ler uma lista: quase sempre é a tabela que não existe (404) ou um campo que falta (400)
@@ -212,7 +212,7 @@ async function abrirSessao(userId, pl) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', aulas_gravadas: STREAM_OK ? 'configurado' : 'em falta', aulas_ao_vivo: AGORA_OK ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -4434,6 +4434,274 @@ app.post('/avisar-devedores', exigeDireccao, rota(async (req, res) => {
     for (const i of g.itens) await mudar('propina', i.p._id, { 'Ultimo Aviso': new Date().toISOString() }).catch(() => {});
   }
   res.json({ ok: true, enviados, destinatarios: grupos.length });
+}));
+
+// ============================================================
+//  AULAS ONLINE (v5.20) — só no plano Pro (e Rede), e durante o período de teste
+//  1) Aulas gravadas no Bunny Stream: o professor ou a Direcção carregam do browser (TUS, com retoma), a turma vê no portal.
+//     STREAM_LIBRARY, STREAM_KEY (API key da library), STREAM_CDN (opcional, miniaturas), STREAM_TOKEN_KEY (opcional: links do leitor que expiram)
+//  2) Aulas ao vivo com Agora.io: o professor transmite, os alunos vêem, escrevem e levantam a mão; o professor deixa falar.
+//     AGORA_APP_ID, AGORA_CERT
+//  Bubble: Aula Video  — Escola (Escola), Turma, Disciplina, Titulo, Descricao, Video, Estado, Autor, Autor Nome, Papel (text), Duracao, Tamanho (number)
+//          Aula Ao Vivo — Escola (Escola), Turma, Disciplina, Titulo, Canal, Estado, Autor, Autor Nome (text), Inicio, Fim (date)
+// ============================================================
+const STREAM_LIBRARY = (process.env.STREAM_LIBRARY || '').trim(), STREAM_KEY = (process.env.STREAM_KEY || '').trim();
+const STREAM_CDN = (process.env.STREAM_CDN || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, ''), STREAM_TOKEN_KEY = (process.env.STREAM_TOKEN_KEY || '').trim();
+const STREAM_OK = !!(STREAM_LIBRARY && STREAM_KEY), STREAM_API = (process.env.STREAM_API_BASE || 'https://video.bunnycdn.com') + '/library/' + STREAM_LIBRARY;
+const AGORA_APP_ID = (process.env.AGORA_APP_ID || '').trim(), AGORA_CERT = (process.env.AGORA_CERT || '').trim(), AGORA_OK = !!(AGORA_APP_ID && AGORA_CERT);
+const VIDEO_MAX_GB = Math.max(1, Math.min(10, Number(process.env.VIDEO_MAX_GB || 2)));
+const LIVE_HORAS = 4;
+
+// --- token RTC do Agora (AccessToken2, «007»), igual ao do pacote oficial agora-token ---
+function agoraToken(canal, uid, publicar, segundos) {
+  const u16 = v => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b; }, u32 = v => { const b = Buffer.alloc(4); b.writeUInt32LE(v >>> 0); return b; };
+  const str = s => { const b = Buffer.isBuffer(s) ? s : Buffer.from(String(s)); return Buffer.concat([u16(b.length), b]); };
+  const hmac = (k, m) => crypto.createHmac('sha256', k).update(m).digest();
+  const ts = Math.floor(Date.now() / 1000), salt = crypto.randomInt(1, 99999999), privs = publicar ? [1, 2, 3, 4] : [1];
+  const svc = Buffer.concat([u16(1), u16(privs.length)].concat(...privs.map(p => [u16(p), u32(segundos)]), [str(canal), str(uid ? String(uid) : '')]));
+  const info = Buffer.concat([str(AGORA_APP_ID), u32(ts), u32(segundos), u32(salt), u16(1), svc]);
+  const signing = hmac(u32(salt), hmac(u32(ts), AGORA_CERT));
+  return '007' + require('zlib').deflateSync(Buffer.concat([str(hmac(signing, info)), info])).toString('base64');
+}
+const uidAgora = (u, papel) => (parseInt(crypto.createHash('sha1').update(papel + '|' + u).digest('hex').slice(0, 8), 16) % 2000000000) + 1000;
+
+// --- plano ---
+async function aulasOnlineOk(escolaId) {
+  const e = await obter('escola', escolaId).catch(() => null);
+  if (!e) return false;
+  const s = situacaoEscola(e);
+  return s.estado === 'teste' || ['Pro', 'Rede'].includes(e['Plano']);
+}
+async function exigirPro(req) { if (!await aulasOnlineOk(req.escola)) throw Object.assign(new Error('As aulas online (gravadas e ao vivo) fazem parte do plano Pro. Mude de plano em «Assinatura do Gescolar».'), { publico: 402 }); }
+
+// --- quem pode o quê ---
+async function paresAulas(req) {
+  const a = await atribuicoes(req.escola);
+  const ps = req.papelChat === 'professor' ? a.pares.filter(p => p.professores.has(req.sessao.u)) : a.pares;
+  return ps.map(p => p.turma + '|' + p.disciplina);
+}
+async function podeVerAula(req, turma) {
+  const p = req.papelChat;
+  if (p === 'direccao') return true;
+  if (p === 'professor') return (await paresAulas(req)).some(k => k.startsWith(turma + '|'));
+  return (await turmasDoPortal(req)).includes(turma);
+}
+async function podeGerirAula(req, reg) {
+  if (req.papelChat === 'direccao') return true;
+  if (req.papelChat === 'professor') return reg['Autor'] === req.sessao.u || (await paresAulas(req)).includes(reg['Turma'] + '|' + reg['Disciplina']);
+  return false;
+}
+async function nomeDe(req) {
+  const t = { professor: 'professor', estudante: 'estudante', encarregado: 'encarregado' }[req.papelChat];
+  const eu = t ? await obter(t, req.sessao.u).catch(() => null) : await obter('user', req.sessao.u).catch(() => null);
+  return txt((eu && (eu['Nome'] || eu['Nome Completo'])) || PAPEL_CHAT[req.papelChat] || '', 80);
+}
+
+// --- Bunny Stream ---
+async function stream(method, caminho, corpo) {
+  if (!STREAM_OK) throw pub('As aulas gravadas ainda não estão ligadas: faltam STREAM_LIBRARY e STREAM_KEY no Render.');
+  const r = await fetch(STREAM_API + caminho, { method, headers: { 'AccessKey': STREAM_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' }, body: corpo ? JSON.stringify(corpo) : undefined, signal: AbortSignal.timeout(30000) })
+    .catch(e => { console.error('[stream]', e.message); throw pub('O Bunny Stream não respondeu. Tente de novo.'); });
+  const t = await r.text(); let d = null; try { d = t ? JSON.parse(t) : null; } catch (e) {}
+  if (!r.ok) { console.error('[stream]', method, caminho, r.status, t.slice(0, 200)); throw pub(r.status === 401 ? 'O Bunny Stream recusou a chave: confira STREAM_KEY e STREAM_LIBRARY no Render.' : 'O Bunny Stream respondeu ' + r.status + '. Tente de novo.'); }
+  return d;
+}
+async function colecaoDaEscola(escolaId) {
+  const e = await obter('escola', escolaId);
+  if (e['Stream Colecao']) return e['Stream Colecao'];
+  const c = await stream('POST', '/collections', { name: 'Gescolar · ' + (e['Subdominio'] || escolaId) });
+  await mudar('escola', escolaId, { 'Stream Colecao': c.guid }).catch(err => console.error('[stream] coleção', err.message));
+  return c.guid;
+}
+function linkLeitor(guid) {
+  const base = 'https://iframe.mediadelivery.net/embed/' + STREAM_LIBRARY + '/' + guid;
+  const q = 'autoplay=false&preload=true&responsive=true';
+  if (!STREAM_TOKEN_KEY) return base + '?' + q;
+  const exp = Math.floor(Date.now() / 1000) + 6 * 3600;
+  return base + '?token=' + crypto.createHash('sha256').update(STREAM_TOKEN_KEY + guid + exp).digest('hex') + '&expires=' + exp + '&' + q;
+}
+const ESTADO_STREAM = { 0: 'enviando', 1: 'processando', 2: 'processando', 3: 'processando', 4: 'pronto', 5: 'erro', 6: 'erro', 7: 'processando' };
+function videoOut(v, N, gerir) {
+  return { id: v._id, titulo: v['Titulo'] || '', descricao: v['Descricao'] || '', turma: v['Turma'] || '', turma_nome: (N.turma || {})[v['Turma']] || '', disciplina: v['Disciplina'] || '', disciplina_nome: (N.disc || {})[v['Disciplina']] || '',
+    estado: v['Estado'] || 'enviando', duracao: Number(v['Duracao'] || 0), autor: v['Autor Nome'] || '', papel: v['Papel'] || '', data: v['Created Date'] || null,
+    miniatura: STREAM_CDN && v['Video'] && v['Estado'] === 'pronto' ? 'https://' + STREAM_CDN + '/' + v['Video'] + '/thumbnail.jpg' : '', pode_apagar: !!gerir };
+}
+function liveOut(l, N, gerir) {
+  let estado = l['Estado'] || 'agendada';
+  if (estado === 'aovivo' && l['Inicio'] && Date.now() - Date.parse(l['Inicio']) > LIVE_HORAS * 3600e3) estado = 'terminada';
+  const st = LIVES.get(l._id);
+  return { id: l._id, titulo: l['Titulo'] || '', turma: l['Turma'] || '', turma_nome: (N.turma || {})[l['Turma']] || '', disciplina: l['Disciplina'] || '', disciplina_nome: (N.disc || {})[l['Disciplina']] || '',
+    estado, inicio: l['Inicio'] || null, fim: l['Fim'] || null, autor: l['Autor Nome'] || '', pode_gerir: !!gerir, online: st ? presentes(st).length : 0 };
+}
+
+// lista para cada papel: vídeos, aulas ao vivo e (para quem carrega) as turmas e disciplinas
+app.post('/aulas/lista', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, p = req.papelChat, f = daEscola(req.escola);
+  const pro = await aulasOnlineOk(req.escola);
+  const N = await nomesPlanos(req.escola);
+  let turmas = null, pares = [];
+  if (p === 'professor' || p === 'direccao') {
+    pares = (await paresAulas(req)).map(k => { const [t, d] = k.split('|'); return { turma: t, turma_nome: N.turma[t] || '', disciplina: d, disciplina_nome: N.disc[d] || '' }; })
+      .filter(x => x.turma_nome && x.disciplina_nome).sort((x, y) => x.turma_nome.localeCompare(y.turma_nome, 'pt') || x.disciplina_nome.localeCompare(y.disciplina_nome, 'pt'));
+    if (p === 'professor') turmas = [...new Set(pares.map(x => x.turma))];
+  } else turmas = await turmasDoPortal(req, b.estudante ? String(b.estudante) : '');
+  const filtroT = l => turmas === null ? l : l.filter(x => turmas.includes(x['Turma']));
+  const [vs, ls] = await Promise.all([procurarTodos('aulavideo', f, 3000).catch(e => { if (e.publico) throw e; return []; }), procurarTodos('aulaaovivo', f, 2000).catch(e => { if (e.publico) throw e; return []; })]);
+  const meusPares = new Set(pares.map(x => x.turma + '|' + x.disciplina));
+  const gere = r => p === 'direccao' || (p === 'professor' && (r['Autor'] === req.sessao.u || meusPares.has(r['Turma'] + '|' + r['Disciplina'])));
+  const videos = filtroT(vs).filter(v => p === 'direccao' || p === 'professor' || v['Estado'] === 'pronto').map(v => videoOut(v, N, gere(v))).sort((x, y) => String(y.data).localeCompare(String(x.data)));
+  const lives = filtroT(ls).map(l => liveOut(l, N, gere(l))).filter(l => l.estado !== 'terminada' || p !== 'estudante' && p !== 'encarregado')
+    .sort((x, y) => (x.estado === 'aovivo' ? 0 : x.estado === 'agendada' ? 1 : 2) - (y.estado === 'aovivo' ? 0 : y.estado === 'agendada' ? 1 : 2) || String(x.inicio).localeCompare(String(y.inicio)));
+  res.json({ ok: true, papel: p, pro, stream: STREAM_OK, agora: AGORA_OK, max_gb: VIDEO_MAX_GB, pares, videos, lives: lives.slice(0, 100) });
+}));
+
+// --- aulas gravadas ---
+app.post('/videos/criar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, turma = String(b.turma || ''), disc = String(b.disciplina || '');
+  if (req.papelChat !== 'professor' && req.papelChat !== 'direccao') return erro(res, 403, 'Só os professores e a Direcção carregam aulas.');
+  await exigirPro(req);
+  if (!(await paresAulas(req)).includes(turma + '|' + disc)) return erro(res, 403, 'Só pode carregar aulas das turmas e disciplinas onde dá aulas.');
+  const titulo = txt(b.titulo, 120); if (titulo.length < 3) return erro(res, 400, 'Escreva o título da aula.');
+  const tamanho = Number(b.tamanho) || 0;
+  if (tamanho > VIDEO_MAX_GB * 1073741824) return erro(res, 400, 'O vídeo tem mais de ' + VIDEO_MAX_GB + ' GB. Corte-o em partes ou reduza a qualidade.');
+  if (!/^video\//.test(String(b.tipo || 'video/'))) return erro(res, 400, 'Escolha um ficheiro de vídeo (mp4, mov, webm…).');
+  if (travao('video|' + req.escola, 60, 60)) return erro(res, 429, 'Muitos vídeos seguidos. Espere um pouco.');
+  const colecao = await colecaoDaEscola(req.escola);
+  const v = await stream('POST', '/videos', { title: titulo, collectionId: colecao });
+  const id = await criar('aulavideo', { 'Escola': req.escola, 'Turma': turma, 'Disciplina': disc, 'Titulo': titulo, 'Descricao': txt(b.descricao, 600), 'Video': v.guid, 'Estado': 'enviando',
+    'Autor': req.sessao.u, 'Autor Nome': await nomeDe(req), 'Papel': req.papelChat, 'Duracao': 0, 'Tamanho': tamanho });
+  const expira = Math.floor(Date.now() / 1000) + 24 * 3600;
+  res.json({ ok: true, id, tus: { endpoint: 'https://video.bunnycdn.com/tusupload', biblioteca: STREAM_LIBRARY, video: v.guid, expira,
+    assinatura: crypto.createHash('sha256').update(STREAM_LIBRARY + STREAM_KEY + expira + v.guid).digest('hex') } });
+}));
+async function actualizarVideo(v) {
+  if (!v['Video'] || v['Estado'] === 'pronto' || v['Estado'] === 'erro') return v;
+  const d = await stream('GET', '/videos/' + v['Video']).catch(() => null);
+  if (!d) return v;
+  const estado = ESTADO_STREAM[d.status] || 'processando';
+  const campos = { 'Estado': estado === 'enviando' && v['Estado'] === 'processando' ? 'processando' : estado, 'Duracao': Number(d.length || 0) };
+  if (campos['Estado'] !== v['Estado'] || campos['Duracao'] !== Number(v['Duracao'] || 0)) { await mudar('aulavideo', v._id, campos).catch(() => {}); Object.assign(v, campos); }
+  v.progresso = Number(d.encodeProgress || 0);
+  return v;
+}
+app.post('/videos/enviado', exigeChat, rota(async (req, res) => {
+  const v = await daMinhaEscola('aulavideo', String((req.body || {}).id || ''), req.escola);
+  if (v['Autor'] !== req.sessao.u) return erro(res, 403, 'Sem acesso.');
+  if (v['Estado'] === 'enviando') await mudar('aulavideo', v._id, { 'Estado': 'processando' });
+  res.json({ ok: true });
+}));
+app.post('/videos/estado', exigeChat, rota(async (req, res) => {
+  const ids = (Array.isArray((req.body || {}).ids) ? req.body.ids : []).slice(0, 20).map(String);
+  const out = [];
+  for (const id of ids) { const v = await obter('aulavideo', id).catch(() => null); if (!v || v['Escola'] !== req.escola) continue; const x = await actualizarVideo(v); out.push({ id, estado: x['Estado'], duracao: Number(x['Duracao'] || 0), progresso: x.progresso || 0 }); }
+  res.json({ ok: true, videos: out });
+}));
+app.post('/videos/ver', exigeChat, rota(async (req, res) => {
+  const v = await daMinhaEscola('aulavideo', String((req.body || {}).id || ''), req.escola);
+  if (!await podeVerAula(req, v['Turma'])) return erro(res, 404, 'Aula não encontrada.');
+  await exigirPro(req);
+  if (v['Estado'] !== 'pronto') { await actualizarVideo(v); if (v['Estado'] !== 'pronto') return erro(res, 409, v['Estado'] === 'erro' ? 'O Bunny não conseguiu converter este vídeo. Apague-o e carregue de novo.' : 'O vídeo ainda está a ser preparado. Tente daqui a alguns minutos.'); }
+  res.json({ ok: true, url: linkLeitor(v['Video']), titulo: v['Titulo'] || '' });
+}));
+app.post('/videos/apagar', exigeChat, rota(async (req, res) => {
+  const v = await daMinhaEscola('aulavideo', String((req.body || {}).id || ''), req.escola);
+  if (!await podeGerirAula(req, v)) return erro(res, 403, 'Só quem carregou o vídeo, o professor da disciplina ou a Direcção o pode apagar.');
+  if (v['Video'] && STREAM_OK) await stream('DELETE', '/videos/' + v['Video']).catch(e => console.error('[stream] apagar', e.message));
+  await apagar('aulavideo', v._id);
+  res.json({ ok: true });
+}));
+
+// --- aulas ao vivo ---
+const LIVES = new Map();   // id → { nomes: Map(uid→{nome,papel,visto}), maos: Map(uid→ts), falar: Set(uid), msgs: [], seq }
+function estadoLive(id) { let s = LIVES.get(id); if (!s) { s = { nomes: new Map(), maos: new Map(), falar: new Set(), msgs: [], seq: 0, criado: Date.now() }; LIVES.set(id, s); } return s; }
+const presentes = s => [...s.nomes.entries()].filter(([, v]) => Date.now() - v.visto < 25000);
+setInterval(() => { for (const [id, s] of LIVES) if (Date.now() - s.criado > (LIVE_HORAS + 1) * 3600e3) LIVES.delete(id); }, 600e3).unref();
+async function abrirLive(req, id) {
+  const l = await daMinhaEscola('aulaaovivo', String(id || ''), req.escola);
+  if (!await podeVerAula(req, l['Turma'])) throw Object.assign(new Error('Aula não encontrada.'), { publico: 404 });
+  return { l, host: req.papelChat === 'direccao' || req.papelChat === 'professor' && await podeGerirAula(req, l) };
+}
+app.post('/aovivo/criar', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, turma = String(b.turma || ''), disc = String(b.disciplina || '');
+  if (req.papelChat !== 'professor' && req.papelChat !== 'direccao') return erro(res, 403, 'Só os professores e a Direcção dão aulas ao vivo.');
+  await exigirPro(req);
+  if (!AGORA_OK) return erro(res, 500, 'As aulas ao vivo ainda não estão ligadas: faltam AGORA_APP_ID e AGORA_CERT no Render.');
+  if (!(await paresAulas(req)).includes(turma + '|' + disc)) return erro(res, 403, 'Só pode dar aulas ao vivo nas turmas e disciplinas onde dá aulas.');
+  const titulo = txt(b.titulo, 120); if (titulo.length < 3) return erro(res, 400, 'Escreva o tema da aula.');
+  const agora = b.agora !== false;
+  let inicio = new Date().toISOString();
+  if (!agora) { const d = new Date(String(b.inicio || '')); if (isNaN(d) || d.getTime() < Date.now() - 300e3) return erro(res, 400, 'Escolha a data e a hora da aula.'); inicio = d.toISOString(); }
+  const id = await criar('aulaaovivo', { 'Escola': req.escola, 'Turma': turma, 'Disciplina': disc, 'Titulo': titulo, 'Estado': agora ? 'aovivo' : 'agendada', 'Inicio': inicio, 'Autor': req.sessao.u, 'Autor Nome': await nomeDe(req) });
+  await mudar('aulaaovivo', id, { 'Canal': 'gs_' + id }).catch(() => {});
+  res.json({ ok: true, id });
+}));
+app.post('/aovivo/comecar', exigeChat, rota(async (req, res) => {
+  const { l, host } = await abrirLive(req, (req.body || {}).id);
+  if (!host) return erro(res, 403, 'Só o professor pode começar a aula.');
+  await mudar('aulaaovivo', l._id, { 'Estado': 'aovivo', 'Inicio': new Date().toISOString() });
+  res.json({ ok: true });
+}));
+app.post('/aovivo/terminar', exigeChat, rota(async (req, res) => {
+  const { l, host } = await abrirLive(req, (req.body || {}).id);
+  if (!host) return erro(res, 403, 'Só o professor pode terminar a aula.');
+  await mudar('aulaaovivo', l._id, { 'Estado': 'terminada', 'Fim': new Date().toISOString() });
+  const s = LIVES.get(l._id); if (s) { s.terminada = true; s.seq++; }
+  res.json({ ok: true });
+}));
+app.post('/aovivo/apagar', exigeChat, rota(async (req, res) => {
+  const { l, host } = await abrirLive(req, (req.body || {}).id);
+  if (!host) return erro(res, 403, 'Sem acesso.');
+  if (l['Estado'] === 'aovivo') return erro(res, 409, 'Termine primeiro a aula.');
+  await apagar('aulaaovivo', l._id); res.json({ ok: true });
+}));
+app.post('/aovivo/entrar', exigeChat, rota(async (req, res) => {
+  const { l, host } = await abrirLive(req, (req.body || {}).id);
+  await exigirPro(req);
+  if (!AGORA_OK) return erro(res, 500, 'As aulas ao vivo ainda não estão ligadas no servidor.');
+  const est = liveOut(l, {}, host).estado;
+  if (est !== 'aovivo') return erro(res, 409, est === 'agendada' ? 'A aula ainda não começou. Espere pelo professor.' : 'Esta aula já terminou.');
+  const uid = uidAgora(req.sessao.u, req.papelChat), s = estadoLive(l._id);
+  s.nomes.set(uid, { nome: await nomeDe(req), papel: req.papelChat, host, visto: Date.now() });
+  if (host) s.host = uid;
+  const canal = l['Canal'] || 'gs_' + l._id;
+  res.json({ ok: true, app: AGORA_APP_ID, canal, uid, host, token: agoraToken(canal, uid, host, LIVE_HORAS * 3600), titulo: l['Titulo'] || '', pode_mao: req.papelChat === 'estudante', seq: s.seq });
+}));
+app.post('/aovivo/eventos', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, { l, host } = await abrirLive(req, b.id);
+  const uid = uidAgora(req.sessao.u, req.papelChat), s = estadoLive(l._id);
+  const eu = s.nomes.get(uid); if (eu) eu.visto = Date.now();
+  const depois = Number(b.depois) || 0;
+  res.json({ ok: true, seq: s.seq, terminada: !!s.terminada || l['Estado'] === 'terminada', host_uid: s.host || null,
+    msgs: s.msgs.filter(m => m.n > depois), maos: [...s.maos.keys()], falar: [...s.falar], eu_falo: s.falar.has(uid),
+    pessoas: presentes(s).map(([u, v]) => ({ uid: u, nome: v.nome, papel: v.papel, host: !!v.host })), sou_host: host });
+}));
+app.post('/aovivo/sinal', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, { l } = await abrirLive(req, b.id);
+  const uid = uidAgora(req.sessao.u, req.papelChat), s = estadoLive(l._id), eu = s.nomes.get(uid);
+  if (!eu) return erro(res, 409, 'Entre primeiro na aula.');
+  if (b.tipo === 'mao') { if (req.papelChat !== 'estudante') return erro(res, 403, 'Só os estudantes levantam a mão.'); s.maos.set(uid, Date.now()); }
+  else if (b.tipo === 'baixar') { s.maos.delete(uid); s.falar.delete(uid); }
+  else if (b.tipo === 'msg') {
+    const texto = txt(b.texto, 400); if (!texto) return erro(res, 400, 'Escreva a mensagem.');
+    if (req.papelChat === 'encarregado') return erro(res, 403, 'Os encarregados podem assistir, mas não escrever.');
+    if (travao('live-msg|' + uid, 12, 1)) return erro(res, 429, 'Muitas mensagens seguidas.');
+    s.msgs.push({ n: ++s.seq, uid, nome: eu.nome, papel: eu.papel, host: !!eu.host, texto, ts: Date.now() }); if (s.msgs.length > 300) s.msgs.shift();
+  } else return erro(res, 400, 'Sinal desconhecido.');
+  s.seq++; res.json({ ok: true });
+}));
+app.post('/aovivo/permitir', exigeChat, rota(async (req, res) => {
+  const b = req.body || {}, { l, host } = await abrirLive(req, b.id);
+  if (!host) return erro(res, 403, 'Só o professor decide quem fala.');
+  const s = estadoLive(l._id), uid = Number(b.uid);
+  if (b.falar) { if (s.falar.size >= 3) return erro(res, 400, 'Já há 3 alunos a falar. Tire a palavra a um antes de dar a outro.'); s.falar.add(uid); s.maos.delete(uid); }
+  else { s.falar.delete(uid); s.maos.delete(uid); }
+  s.seq++; res.json({ ok: true });
+}));
+app.post('/aovivo/token-falar', exigeChat, rota(async (req, res) => {
+  const { l } = await abrirLive(req, (req.body || {}).id);
+  const uid = uidAgora(req.sessao.u, req.papelChat), s = estadoLive(l._id);
+  if (!s.falar.has(uid)) return erro(res, 403, 'O professor ainda não lhe deu a palavra.');
+  res.json({ ok: true, token: agoraToken(l['Canal'] || 'gs_' + l._id, uid, true, LIVE_HORAS * 3600) });
 }));
 
 app.use((req, res) => erro(res, 404, 'Rota não encontrada.'));
