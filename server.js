@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.20.0';
+const VERSAO = 'gescolar-proxy 5.21.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -854,9 +854,26 @@ function numeroSMS(t) {
   return /^2588[2-7]\d{7}$/.test(d) ? d : null;
 }
 // tira acentos e caracteres especiais para a mensagem caber num SMS normal (160 caracteres)
+// v5.21.1: as operadoras bloqueiam SMS com links ou com qualquer coisa parecida (ex.: «gescolar.co.mz», «nome@x.com», «.233»).
+// Sem SMS_LINKS=sim, tira links e emails, junta milhares («1.500» → «1500»), decimais com vírgula («12.5» → «12,5»), tira o ponto dos ordinais («2.º» → «2o»)
+// e nunca deixa um ponto colado a letras ou números (vira «. »).
+function semLinksSMS(m) {
+  return String(m || '')
+    .replace(/\b(?:https?:\/\/|www\.)\S+/gi, '')
+    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, '')
+    .replace(/\b([A-Za-z][\w-]*)(?:\.[A-Za-z][\w-]*)*\.(?:co\.mz|com|mz|net|org|io|app|site|run|me|info|online|pt|br)\b\/?\S*/gi, '$1')
+    .replace(/(\d)\.\s?(?=[ºª])/g, '$1')
+    .replace(/\d{1,3}(?:\.\d{3})+(?!\d)/g, x => x.replace(/\./g, ''))
+    .replace(/(\d)\.(?=\d)/g, '$1,')
+    .replace(/:\/\//g, ' ')
+    .replace(/\.(?=[^\s.])/g, '. ')
+    .replace(/\s+([.,)])/g, '$1');
+}
 function textoSMS(m) {
-  if (!SMS_LINKS) m = String(m || '').replace(/\b(?:https?:\/\/|www\.)\S+/gi, '').replace(/\s+([.,)])/g, '$1');   // sem links (v5.17)
-  return String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/º/g, 'o').replace(/ª/g, 'a').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim().slice(0, 459);
+  if (!SMS_LINKS) m = semLinksSMS(m);
+  let t = String(m || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/º/g, 'o').replace(/ª/g, 'a').replace(/[^\x20-\x7E\n]/g, '').replace(/[ \t]+/g, ' ').trim();
+  if (!SMS_LINKS) t = t.replace(/\.(?=[^\s.])/g, '. ').replace(/[ \t]+/g, ' ');
+  return t.slice(0, 459);
 }
 async function enviarSMS(numeros, mensagem) {
   if (!SMS_TOKEN || !SMS_ORIGEM) return { ok: false, erro: 'SMS_TOKEN ou SMS_ORIGEM em falta no container' };
