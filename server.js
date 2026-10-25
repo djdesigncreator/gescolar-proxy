@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.21.1';
+const VERSAO = 'gescolar-proxy 5.22.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -212,7 +212,7 @@ async function abrirSessao(userId, pl) {
 
 // ============================================================
 app.get('/', (req, res) => {
-  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', aulas_gravadas: STREAM_OK ? 'configurado' : 'em falta', aulas_ao_vivo: AGORA_OK ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
+  res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', c2b: MOZ_C2B_MODO === 'checkout' ? 'checkout ' + MOZ_C2B_PATH : 'directo (antigo)', b2c: MOZ_B2C_MODO === 'payout' ? MOZ_PAYOUT_PATH : 'antigo', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', aulas_gravadas: STREAM_OK ? 'configurado' : 'em falta', aulas_ao_vivo: AGORA_OK ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
 });
 
 // ============================================================
@@ -616,6 +616,40 @@ const numMoz = n9 => (MOZ_NUM_258 ? '258' : '') + n9;
 // corpo do pedido C2B (M-Pesa/e-Mola): exactamente estes 5 campos
 const corpoC2B = (metodo, valor, n9, nome) => ({ wallet: MOZ_WALLET, payment_method: metodo, amount: String(valor), number: numMoz(n9), name: String(nome || '').slice(0, 80) });
 
+// ============================================================
+//  v5.22.0 — C2B por checkout (payprocess) e B2C por payout
+//  A integração antiga (/payment e /b2c-*-imale) fica em standby: volta com MOZ_C2B_MODO=directo e MOZ_B2C_MODO=antigo.
+//  C2B novo: POST /payprocess { metod_payment, amount, description (até 14), name, number, wallet }
+//            → devolve https://paysuite.tech/checkout/<código>. O <código> fica em Referencia e chega no webhook como "reason".
+//            O cliente paga dentro de um iframe (400 × 450) na própria página; quando o webhook confirma, a janela fecha.
+//  B2C novo: POST /payout { phone, holder, method, amount, wallet, secret_id }
+// ============================================================
+const MOZ_C2B_MODO = /^directo|antigo$/i.test(String(process.env.MOZ_C2B_MODO || '').trim()) ? 'directo' : 'checkout';
+const MOZ_B2C_MODO = /^antigo|directo$/i.test(String(process.env.MOZ_B2C_MODO || '').trim()) ? 'antigo' : 'payout';
+const MOZ_C2B_PATH = String(process.env.MOZ_C2B_PATH || 'payprocess').replace(/^\/+|\/+$/g, '');
+const MOZ_PAYOUT_PATH = String(process.env.MOZ_PAYOUT_PATH || 'payout').replace(/^\/+|\/+$/g, '');
+const descricaoC2B = t => (String(t || 'Pagamento').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\w .-]/g, '').replace(/\s+/g, ' ').trim() || 'Pagamento').slice(0, 14).trim();
+function codigoCheckout(link) {
+  try { const u = new URL(link); const m = u.pathname.match(/\/checkout\/([^/?#]+)/i); if (m) return decodeURIComponent(m[1]); const partes = u.pathname.split('/').filter(Boolean); return partes[partes.length - 1] || null; }
+  catch (e) { const m = String(link || '').match(/\/checkout\/([^/?#\s]+)/i); return m ? m[1] : null; }
+}
+// Inicia um C2B (M-Pesa / e-Mola). Devolve { ref, iframe?, raw }.
+async function iniciarC2B(metodo, valor, n9, nome, descricao) {
+  if (MOZ_C2B_MODO === 'directo') {
+    const d = await mozPedido('payment', corpoC2B(metodo, valor, n9, nome));
+    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
+    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
+    return { ref: String(idp), iframe: null, raw: d };
+  }
+  const d = await mozPedido(MOZ_C2B_PATH, { metod_payment: metodo, amount: String(valor), description: descricaoC2B(descricao), name: String(nome || 'Cliente').slice(0, 80), number: numMoz(n9), wallet: MOZ_WALLET });
+  const link = acharLink(d);
+  if (!link) throw new Error('a MozPayment não devolveu o link do checkout: ' + JSON.stringify(d).slice(0, 200));
+  const ref = codigoCheckout(link);
+  if (!ref) throw new Error('o link do checkout não tem código: ' + link);
+  return { ref: String(ref), iframe: link, raw: d };
+}
+const msgC2B = (r, n9) => r.iframe ? 'Complete o pagamento na janela que abriu. Fecha sozinha quando o pagamento for confirmado.' : 'Pedido enviado para o ' + n9.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.';
+
 // procura um campo em qualquer nível da resposta (a MozPayment nem sempre devolve no mesmo sítio)
 function achar(obj, nomes, prof) {
   if (!obj || typeof obj !== 'object' || (prof || 0) > 4) return undefined;
@@ -972,11 +1006,9 @@ async function cobrarOnline(req, res) {
       await mudar('pagamento', pagId, { 'Referencia': sessao, 'Raw': JSON.stringify(d).slice(0, 4000) });
       return res.json({ ok: true, pagamento: pagId, estado: 'pendente', link, total });
     }
-    const d = await mozPedido('payment', corpoC2B(metodo, total, numero, nome));
-    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
-    await mudar('pagamento', pagId, { 'Referencia': String(idp), 'Raw': JSON.stringify(d).slice(0, 4000) });
-    res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
+    const c2b = await iniciarC2B(metodo, total, numero, nome, ps.length === 1 ? 'Propina' : 'Propinas');
+    await mudar('pagamento', pagId, { 'Referencia': c2b.ref, 'Raw': JSON.stringify(c2b.raw).slice(0, 4000) });
+    res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, iframe: c2b.iframe, mensagem: c2b.iframe ? msgC2B(c2b, numero) : 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
   } catch (e) {
     console.error('[pagar]', e.message);
     if (e.semResposta) {   // pode ter chegado ao telemóvel: o pagamento fica pendente e o webhook ainda o pode confirmar
@@ -2206,11 +2238,9 @@ app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
       await mudar('subscricao', id, { 'Referencia': String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || ''), 'Raw': JSON.stringify(d).slice(0, 4000) });
       return res.json({ ok: true, id, link, total: valor });
     }
-    const d = await mozPedido('payment', corpoC2B(metodo, valor, numero, (e['Nome'] || 'Escola').slice(0, 80)));
-    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
-    await mudar('subscricao', id, { 'Referencia': String(idp), 'Raw': JSON.stringify(d).slice(0, 4000) });
-    res.json({ ok: true, id, total: valor, mensagem: 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.' });
+    const c2b = await iniciarC2B(metodo, valor, numero, (e['Nome'] || 'Escola').slice(0, 80), 'Gescolar ' + plano);
+    await mudar('subscricao', id, { 'Referencia': c2b.ref, 'Raw': JSON.stringify(c2b.raw).slice(0, 4000) });
+    res.json({ ok: true, id, total: valor, iframe: c2b.iframe, mensagem: msgC2B(c2b, numero) });
   } catch (err) {
     console.error('[assinatura]', err.message);
     await mudar('subscricao', id, { 'Estado': 'falhado', 'Raw': String(err.message).slice(0, 2000) }).catch(() => {});
@@ -3622,11 +3652,9 @@ app.post('/pub/inscrever', rota(async (req, res) => {
       await mudar('inscricaoonline', id, { 'Referencia': sessao });
       return res.json({ ok: true, id, chave, estado: 'pendente', checkout: link });
     }
-    const d = await mozPedido('payment', corpoC2B(metodo, preco, numero, nome));
-    const idp = achar(d, ['idpayment', 'id_payment', 'idPayment', 'payment_id', 'paymentId', 'reference', 'id']);
-    if (!idp) throw new Error('a MozPayment não devolveu a referência do pagamento: ' + JSON.stringify(d).slice(0, 200));
-    await mudar('inscricaoonline', id, { 'Referencia': String(idp) });
-    res.json({ ok: true, id, chave, estado: 'pendente' });
+    const c2b = await iniciarC2B(metodo, preco, numero, nome, 'Inscricao');
+    await mudar('inscricaoonline', id, { 'Referencia': c2b.ref });
+    res.json({ ok: true, id, chave, estado: 'pendente', iframe: c2b.iframe });
   } catch (e) {
     console.error('[inscricao] pagamento', e.message);
     if (e.semResposta) return res.json({ ok: true, id, chave, estado: 'pendente' });
@@ -3668,7 +3696,11 @@ async function aplicarInscricao(i, b, estado) {
 const MOZ_SECRET_ID = process.env.MOZ_SECRET_ID || '';
 const LEV_MIN = Math.max(1, Number(process.env.LEVANTAMENTO_MIN || 100));
 const CANAIS = { mpesa: 'M-Pesa', emola: 'e-Mola', cartao: 'Visa / Mastercard' };
-const B2C = { mpesa: 'b2c-mpesa-imale', emola: 'b2c-emola-imale' };
+// v5.21.2: os endpoints de levantamento podem ser mudados no Render sem mexer no código.
+//   MOZ_B2C_MPESA (por defeito b2c-mpesa-imale) · MOZ_B2C_EMOLA (por defeito b2c-emola-imale)
+//   Aceita só o nome (b2c-mpesa-novo) ou o endereço completo (https://mozpayment.co.mz/api/1.1/wf/b2c-mpesa-novo).
+const caminhoB2C = (v, padrao) => String(v || padrao).trim().replace(/^https?:\/\/[^]*?\/wf\//i, '').replace(/^\/+|\/+$/g, '') || padrao;
+const B2C = { mpesa: caminhoB2C(process.env.MOZ_B2C_MPESA, 'b2c-mpesa-imale'), emola: caminhoB2C(process.env.MOZ_B2C_EMOLA, 'b2c-emola-imale') };
 const levando = new Set();   // uma operação de cada vez por escola
 const contaTransf = t => !['falhada', 'cancelada'].includes(t['Estado'] || 'concluida');
 async function saldoDaEscola(escola) {
@@ -3726,7 +3758,12 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
     const id = await criar('transferencia', { 'Escola': req.escola, 'Valor': valor, 'Data': new Date().toISOString(), 'Canal': canal, 'Estado': 'pendente', 'Numero': numero,
       'Metodo': CANAIS[canal] + ' (levantamento)', 'Pedido Por': quem, 'Feita Por': quem });
     let d;
-    try { d = await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero: numMoz(numero), secret_id: MOZ_SECRET_ID, payment_metodo: canal }); }
+    const titular = txt(b.titular, 80) || (await obter('escola', req.escola).catch(() => ({})))['Nome'] || quem;
+    try {
+      d = MOZ_B2C_MODO === 'payout'
+        ? await mozPedido(MOZ_PAYOUT_PATH, { phone: numMoz(numero), holder: titular, method: canal, amount: String(valor), wallet: MOZ_WALLET, secret_id: MOZ_SECRET_ID })
+        : await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero: numMoz(numero), secret_id: MOZ_SECRET_ID, payment_metodo: canal });
+    }
     catch (e) {
       console.error('[levantar]', e.message);
       if (e.semResposta) {   // pode ter saído: fica pendente (continua a contar) até a Plataforma confirmar
