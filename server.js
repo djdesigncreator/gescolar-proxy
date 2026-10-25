@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.22.0';
+const VERSAO = 'gescolar-proxy 5.22.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -642,8 +642,9 @@ async function iniciarC2B(metodo, valor, n9, nome, descricao) {
     return { ref: String(idp), iframe: null, raw: d };
   }
   const d = await mozPedido(MOZ_C2B_PATH, { metod_payment: metodo, amount: String(valor), description: descricaoC2B(descricao), name: String(nome || 'Cliente').slice(0, 80), number: numMoz(n9), wallet: MOZ_WALLET });
-  const link = acharLink(d);
-  if (!link) throw new Error('a MozPayment não devolveu o link do checkout: ' + JSON.stringify(d).slice(0, 200));
+  const link = normalLink(achar(d, ['url_checkout', 'checkout_url', 'urlCheckout'])) || acharLink(d);   // a MozPayment devolve o link em url_checkout
+  if (!link) throw new Error('a MozPayment não devolveu o link do checkout (url_checkout): ' + JSON.stringify(d).slice(0, 200));
+  console.log('[checkout] url_checkout=' + link);
   const ref = codigoCheckout(link);
   if (!ref) throw new Error('o link do checkout não tem código: ' + link);
   return { ref: String(ref), iframe: link, embed: await podeEmbutir(link), raw: d };
