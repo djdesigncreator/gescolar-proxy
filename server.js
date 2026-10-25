@@ -646,7 +646,30 @@ async function iniciarC2B(metodo, valor, n9, nome, descricao) {
   if (!link) throw new Error('a MozPayment não devolveu o link do checkout: ' + JSON.stringify(d).slice(0, 200));
   const ref = codigoCheckout(link);
   if (!ref) throw new Error('o link do checkout não tem código: ' + link);
-  return { ref: String(ref), iframe: link, raw: d };
+  return { ref: String(ref), iframe: link, embed: await podeEmbutir(link), raw: d };
+}
+// O fornecedor pode proibir a página dentro de iframes (X-Frame-Options / CSP frame-ancestors).
+// Nesse caso a janela mostra um botão para abrir o checkout num separador novo, e a confirmação continua a vir pelo webhook.
+// MOZ_CHECKOUT_EMBED: auto (por defeito) · sim (força iframe) · nao (abre sempre num separador)
+const MOZ_CHECKOUT_EMBED = String(process.env.MOZ_CHECKOUT_EMBED || 'auto').toLowerCase();
+const EMBED_CACHE = new Map();
+async function podeEmbutir(link) {
+  if (/^(sim|1|true)$/.test(MOZ_CHECKOUT_EMBED)) return true;
+  if (/^(nao|não|0|false)$/.test(MOZ_CHECKOUT_EMBED)) return false;
+  let host = ''; try { host = new URL(link).host; } catch (e) { return true; }
+  const guardado = EMBED_CACHE.get(host); if (guardado && Date.now() - guardado.em < 6 * 3600e3) return guardado.ok;
+  let ok = true;
+  try {
+    const r = await fetch(link, { method: 'GET', redirect: 'follow', signal: AbortSignal.timeout(6000) });
+    const xfo = String(r.headers.get('x-frame-options') || '').toLowerCase();
+    const csp = String(r.headers.get('content-security-policy') || '').toLowerCase();
+    const fa = (csp.match(/frame-ancestors([^;]*)/) || [])[1];
+    if (/deny|sameorigin/.test(xfo)) ok = false;
+    if (fa !== undefined) { const v = fa.trim(); ok = v.includes('*') ? true : ORIGENS.some(o => v.includes(o.replace(/^https?:\/\//, ''))); }
+    console.log('[checkout] ' + host + ' x-frame-options=' + (xfo || '—') + ' frame-ancestors=' + (fa === undefined ? '—' : fa.trim()) + ' → ' + (ok ? 'iframe' : 'separador novo'));
+  } catch (e) { console.warn('[checkout] não deu para verificar ' + host + ': ' + e.message); return true; }
+  EMBED_CACHE.set(host, { ok, em: Date.now() });
+  return ok;
 }
 const msgC2B = (r, n9) => r.iframe ? 'Complete o pagamento na janela que abriu. Fecha sozinha quando o pagamento for confirmado.' : 'Pedido enviado para o ' + n9.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. Confirme com o PIN.';
 
@@ -1008,7 +1031,7 @@ async function cobrarOnline(req, res) {
     }
     const c2b = await iniciarC2B(metodo, total, numero, nome, ps.length === 1 ? 'Propina' : 'Propinas');
     await mudar('pagamento', pagId, { 'Referencia': c2b.ref, 'Raw': JSON.stringify(c2b.raw).slice(0, 4000) });
-    res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, iframe: c2b.iframe, mensagem: c2b.iframe ? msgC2B(c2b, numero) : 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
+    res.json({ ok: true, pagamento: pagId, estado: 'pendente', total, iframe: c2b.iframe, embed: c2b.embed, mensagem: c2b.iframe ? msgC2B(c2b, numero) : 'Pedido enviado para o ' + numero.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') + '. O encarregado confirma com o PIN.' });
   } catch (e) {
     console.error('[pagar]', e.message);
     if (e.semResposta) {   // pode ter chegado ao telemóvel: o pagamento fica pendente e o webhook ainda o pode confirmar
@@ -2240,7 +2263,7 @@ app.post('/assinatura-pagar', exigeSoDireccao, rota(async (req, res) => {
     }
     const c2b = await iniciarC2B(metodo, valor, numero, (e['Nome'] || 'Escola').slice(0, 80), 'Gescolar ' + plano);
     await mudar('subscricao', id, { 'Referencia': c2b.ref, 'Raw': JSON.stringify(c2b.raw).slice(0, 4000) });
-    res.json({ ok: true, id, total: valor, iframe: c2b.iframe, mensagem: msgC2B(c2b, numero) });
+    res.json({ ok: true, id, total: valor, iframe: c2b.iframe, embed: c2b.embed, mensagem: msgC2B(c2b, numero) });
   } catch (err) {
     console.error('[assinatura]', err.message);
     await mudar('subscricao', id, { 'Estado': 'falhado', 'Raw': String(err.message).slice(0, 2000) }).catch(() => {});
@@ -3654,7 +3677,7 @@ app.post('/pub/inscrever', rota(async (req, res) => {
     }
     const c2b = await iniciarC2B(metodo, preco, numero, nome, 'Inscricao');
     await mudar('inscricaoonline', id, { 'Referencia': c2b.ref });
-    res.json({ ok: true, id, chave, estado: 'pendente', iframe: c2b.iframe });
+    res.json({ ok: true, id, chave, estado: 'pendente', iframe: c2b.iframe, embed: c2b.embed });
   } catch (e) {
     console.error('[inscricao] pagamento', e.message);
     if (e.semResposta) return res.json({ ok: true, id, chave, estado: 'pendente' });
@@ -3773,11 +3796,16 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
       await mudar('transferencia', id, { 'Estado': 'falhada', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
       return erro(res, 502, 'O levantamento não foi feito: ' + String(e.message).slice(0, 200));
     }
-    const st = String(achar(d, ['status', 'estado']) || '').toLowerCase();
-    const falhou = ['failed', 'falhou', 'error', 'erro', 'rejected', 'cancelled'].some(x => st.includes(x));
-    const ref = String(achar(d, ['transaction_id', 'transactionId', 'idpayment', 'id_payment', 'reference', 'referencia', 'id']) || '');
-    await mudar('transferencia', id, { 'Estado': falhou ? 'falhada' : 'concluida', 'Referencia': ref, 'Raw': JSON.stringify(d).slice(0, 4000) });
+    // o estado da operação (dentro de "response", se vier) decide: aceite ≠ concluído
+    const interno = d && typeof d.response === 'object' && d.response ? d.response : d;
+    const st = String(achar(interno, ['status', 'estado', 'payout_status']) || achar(d, ['status', 'estado']) || '').toLowerCase();
+    const falhou = ['failed', 'falhou', 'error', 'erro', 'rejected', 'cancelled', 'canceled', 'declined', 'insuf'].some(x => st.includes(x));
+    const pendente = !falhou && ['pending', 'pendente', 'processing', 'queued', 'initiated', 'accepted', 'aceite'].some(x => st.includes(x));
+    const ref = String(achar(d, ['transaction_id', 'transactionId', 'payout_id', 'payoutId', 'idpayment', 'id_payment', 'reference', 'referencia', 'id']) || '');
+    const estadoT = falhou ? 'falhada' : (pendente || !ref) ? 'pendente' : 'concluida';
+    await mudar('transferencia', id, { 'Estado': estadoT, 'Referencia': ref, 'Raw': JSON.stringify(d).slice(0, 4000) });
     if (falhou) return erro(res, 502, 'A MozPayment recusou o levantamento: ' + (achar(d, ['message', 'mensagem', 'erro']) || st));
+    if (estadoT === 'pendente') return res.json({ ok: true, id, estado: 'pendente', referencia: ref, mensagem: 'O levantamento foi aceite e está a ser processado. Fica pendente até a MozPayment confirmar.' });
     const esc = await obter('escola', req.escola).catch(() => null);
     if (esc && tel9(esc['Telefone']).length === 9) enviarSMS([esc['Telefone']], 'Gescolar: levantamento de ' + mt(valor) + ' por ' + CANAIS[canal] + ' para o ' + numero + ' feito por ' + quem + '.').catch(() => {});
     res.json({ ok: true, id, estado: 'concluida', referencia: ref });
@@ -3848,7 +3876,9 @@ app.post('/wh-moz/:chave', async (req, res) => {
   if (!chaveCerta(req.params.chave)) return res.sendStatus(404);
   const b = req.body || {};
   const estado = estadoMoz(b.status);
-  const candidatos = [b.reason, b.reference, b.transaction_id].map(x => txt(x, 120)).filter(Boolean);
+  // a referência pode vir em reason, reference, payment_id ou dentro de um link /checkout/<código>
+  const brutos = [b.reason, b.reference, b.payment_id, b.checkout_id, b.transaction_id].map(x => txt(x, 300)).filter(Boolean);
+  const candidatos = [...new Set(brutos.flatMap(x => { const c = /\/checkout\//i.test(x) ? codigoCheckout(x) : null; return c ? [c, x] : [x]; }).map(x => String(x).trim().slice(0, 120)).filter(Boolean))];
   console.log('[webhook] reason=' + (b.reason || '') + ' reference=' + (b.reference || '') + ' status=' + b.status + ' metodo=' + (b.payment_method || '') + ' valor=' + (b.amount || ''));
   try {
     if (MOZ_WALLET && b.wallet && String(b.wallet) !== MOZ_WALLET) { console.warn('[webhook] carteira diferente: ' + b.wallet); return res.json({ ok: true, ignorado: 'carteira' }); }
@@ -3857,6 +3887,16 @@ app.post('/wh-moz/:chave', async (req, res) => {
     if (!p) {
       for (const c of candidatos) { const l = await procurar('subscricao', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) return res.json(await aplicarSubscricao(l[0], b, estado)); }
       for (const c of candidatos) { const l = await procurar('inscricaoonline', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []); if (l[0]) return res.json(await aplicarInscricao(l[0], b, estado)); }
+      for (const c of candidatos) {   // levantamento (B2C payout) que ficou pendente
+        const l = await procurar('transferencia', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []);
+        if (l[0]) {
+          const t = l[0];
+          if (['concluida', 'falhada'].includes(t['Estado'])) return res.json({ ok: true, ja: 'aplicado' });
+          const novo = estado === 'pago' ? 'concluida' : (estado === 'falhado' || estado === 'expirado') ? 'falhada' : null;
+          if (novo) await mudar('transferencia', t._id, { 'Estado': novo, 'Raw': JSON.stringify(b).slice(0, 4000) });
+          return res.json({ ok: true, levantamento: novo || 'pendente' });
+        }
+      }
       console.warn('[webhook] referência desconhecida: ' + candidatos.join(' / ')); return res.json({ ok: true, ignorado: 'referência desconhecida' });
     }
     if (p['Estado'] === 'pago') return res.json({ ok: true, ja: 'aplicado' });
