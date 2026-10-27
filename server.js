@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.22.1';
+const VERSAO = 'gescolar-proxy 5.22.2';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -2361,6 +2361,24 @@ app.post('/pl/transferencia', exigePlataforma, rota(async (req, res) => {
   if (!(valor > 0)) return erro(res, 400, 'Escreva o valor transferido.');
   const data = b.data && !isNaN(Date.parse(b.data)) ? new Date(b.data + 'T12:00:00Z').toISOString() : new Date().toISOString();
   const eu = await obter('user', req.sessao.u).catch(() => null);
+  // M-Pesa / e-Mola com «Enviar agora»: o dinheiro sai pela MozPayment (payout) e só fica concluído quando a resposta o confirma
+  const canal = /m-?pesa/i.test(b.metodo) ? 'mpesa' : /e-?mola/i.test(b.metodo) ? 'emola' : '';
+  if (b.enviar && canal) {
+    const numero = tel9(b.numero);
+    if (numero.length !== 9) return erro(res, 400, 'Escreva o número que vai receber, com 9 dígitos.');
+    if (canal === 'mpesa' && !['84', '85'].includes(numero.slice(0, 2))) return erro(res, 400, 'M-Pesa só envia para números Vodacom (84 ou 85).');
+    if (canal === 'emola' && !['86', '87'].includes(numero.slice(0, 2))) return erro(res, 400, 'e-Mola só envia para números Movitel (86 ou 87).');
+    if (levando.has(e._id)) return erro(res, 409, 'Já está um envio em curso para esta escola. Espere que termine.');
+    levando.add(e._id);
+    try {
+      const id = await criar('transferencia', { 'Escola': e._id, 'Valor': valor, 'Data': data, 'Canal': canal, 'Numero': numero, 'Estado': 'pendente', 'Metodo': CANAIS[canal] + ' (transferência da Plataforma)',
+        'Notas': txt(b.notas, 300), 'Pedido Por': (eu && eu['Nome Completo']) || 'Plataforma', 'Feita Por': (eu && eu['Nome Completo']) || 'Plataforma' });
+      const r = await enviarPayout(id, txt(b.titular, 80) || e['Nome'] || 'Escola');
+      if (r.estado === 'falhada') return erro(res, 502, 'O envio não foi feito: ' + (r.erro || 'a MozPayment recusou') + '. O valor continua no saldo da escola.');
+      if (r.estado === 'concluida' && b.sms && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: transferimos ' + mt(valor) + ' para o ' + numero + ' (' + CANAIS[canal] + ', propinas pagas online). Ref. ' + r.ref + '.').catch(() => {});
+      return res.json({ ok: true, id, estado: r.estado, referencia: r.ref || '', mensagem: r.estado === 'concluida' ? 'Enviado: ' + mt(valor) + ' para o ' + numero + '.' : (r.erro || 'Aceite pela MozPayment; fica pendente até confirmar.') });
+    } finally { levando.delete(e._id); }
+  }
   const id = await criar('transferencia', { 'Escola': e._id, 'Valor': valor, 'Data': data, 'Referencia': txt(b.referencia, 80), 'Metodo': txt(b.metodo, 40), 'Notas': txt(b.notas, 300), 'Feita Por': (eu && eu['Nome Completo']) || 'Plataforma' });
   if (b.sms && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: transferimos ' + mt(valor) + ' para ' + (e['Nome'] || 'a escola') + ' (propinas pagas online)' + (b.referencia ? '. Ref. ' + txt(b.referencia, 40) : '') + '.').catch(() => {});
   res.json({ ok: true, id });
@@ -3761,6 +3779,41 @@ app.post('/saldo', exigeSoDireccao, rota(async (req, res) => {
   const [s, esc] = await Promise.all([saldoDaEscola(req.escola), obter('escola', req.escola)]);
   res.json(Object.assign({ ok: true, minimo: LEV_MIN, b2c: !!MOZ_SECRET_ID, telefone: tel9(esc['Telefone']) }, s));
 }));
+// ---------- B2C partilhado (v5.22.2): levantamento da escola e transferência da Plataforma usam o mesmo envio ----------
+// Envia o dinheiro de uma Transferencia (Canal mpesa|emola, Numero, Valor) e grava o resultado.
+// Devolve { estado: 'concluida'|'pendente'|'falhada', ref, erro? }. Nunca dá como concluída só porque o pedido foi aceite.
+const payoutEmCurso = new Set();
+async function enviarPayout(tid, holder) {
+  if (payoutEmCurso.has(tid)) return { estado: 'pendente', erro: 'Este envio já está a decorrer.' };
+  payoutEmCurso.add(tid);
+  try {
+    const t = await obter('transferencia', tid);
+    const canal = String(t['Canal'] || ''), numero = tel9(t['Numero']), valor = Number(t['Valor'] || 0);
+    if (!B2C[canal]) return { estado: 'falhada', erro: 'Só M-Pesa ou e-Mola podem ser enviados automaticamente.' };
+    if (numero.length !== 9) return { estado: 'falhada', erro: 'O número de destino não é válido.' };
+    if (!MOZ_SECRET_ID || !MOZ_WALLET) return { estado: 'falhada', erro: 'Os envios ainda não estão configurados no servidor (MOZ_SECRET_ID / MOZ_WALLET).' };
+    let d;
+    try {
+      d = MOZ_B2C_MODO === 'payout'
+        ? await mozPedido(MOZ_PAYOUT_PATH, { phone: numMoz(numero), holder: String(holder || 'Gescolar').slice(0, 80), method: canal, amount: String(valor), wallet: MOZ_WALLET, secret_id: MOZ_SECRET_ID })
+        : await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero: numMoz(numero), secret_id: MOZ_SECRET_ID, payment_metodo: canal });
+    } catch (e) {
+      console.error('[payout] ' + tid + ' ' + e.message);
+      if (e.semResposta) { await mudar('transferencia', tid, { 'Estado': 'pendente', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {}); return { estado: 'pendente', erro: 'A MozPayment está a demorar a responder. Fica pendente até confirmar.' }; }
+      await mudar('transferencia', tid, { 'Estado': 'falhada', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
+      return { estado: 'falhada', erro: String(e.message).slice(0, 200) };
+    }
+    const interno = d && typeof d.response === 'object' && d.response ? d.response : d;
+    const st = String(achar(interno, ['status', 'estado', 'payout_status']) || achar(d, ['status', 'estado']) || '').toLowerCase();
+    const falhou = ['failed', 'falhou', 'error', 'erro', 'rejected', 'cancelled', 'canceled', 'declined', 'insuf'].some(x => st.includes(x));
+    const pendente = !falhou && ['pending', 'pendente', 'processing', 'queued', 'initiated', 'accepted', 'aceite'].some(x => st.includes(x));
+    const ref = String(achar(d, ['transaction_id', 'transactionId', 'payout_id', 'payoutId', 'idpayment', 'id_payment', 'reference', 'referencia', 'id']) || '');
+    const estado = falhou ? 'falhada' : (pendente || !ref) ? 'pendente' : 'concluida';
+    console.log('[payout] ' + tid + ' ' + canal + ' ' + numero + ' ' + valor + ' MT → ' + estado + (ref ? ' ref=' + ref : '') + ' (status=' + (st || '—') + ')');
+    await mudar('transferencia', tid, { 'Estado': estado, 'Referencia': ref || t['Referencia'] || '', 'Raw': JSON.stringify(d).slice(0, 4000) });
+    return { estado, ref, erro: falhou ? (achar(d, ['message', 'mensagem', 'erro']) || st) : undefined };
+  } finally { payoutEmCurso.delete(tid); }
+}
 app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
   const b = req.body || {}, canal = String(b.canal || '');
   if (!B2C[canal]) return erro(res, 400, 'Escolha M-Pesa ou e-Mola.');
@@ -3783,30 +3836,10 @@ app.post('/levantar', exigeSoDireccao, rota(async (req, res) => {
       'Metodo': CANAIS[canal] + ' (levantamento)', 'Pedido Por': quem, 'Feita Por': quem });
     let d;
     const titular = txt(b.titular, 80) || (await obter('escola', req.escola).catch(() => ({})))['Nome'] || quem;
-    try {
-      d = MOZ_B2C_MODO === 'payout'
-        ? await mozPedido(MOZ_PAYOUT_PATH, { phone: numMoz(numero), holder: titular, method: canal, amount: String(valor), wallet: MOZ_WALLET, secret_id: MOZ_SECRET_ID })
-        : await mozPedido(B2C[canal], { carteira: MOZ_WALLET, valor: String(valor), numero: numMoz(numero), secret_id: MOZ_SECRET_ID, payment_metodo: canal });
-    }
-    catch (e) {
-      console.error('[levantar]', e.message);
-      if (e.semResposta) {   // pode ter saído: fica pendente (continua a contar) até a Plataforma confirmar
-        await mudar('transferencia', id, { 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
-        return res.json({ ok: true, id, estado: 'pendente', mensagem: 'A MozPayment está a demorar a responder. O levantamento fica pendente; confirme no telemóvel se o dinheiro chegou.' });
-      }
-      await mudar('transferencia', id, { 'Estado': 'falhada', 'Raw': String(e.message).slice(0, 2000) }).catch(() => {});
-      return erro(res, 502, 'O levantamento não foi feito: ' + String(e.message).slice(0, 200));
-    }
-    // o estado da operação (dentro de "response", se vier) decide: aceite ≠ concluído
-    const interno = d && typeof d.response === 'object' && d.response ? d.response : d;
-    const st = String(achar(interno, ['status', 'estado', 'payout_status']) || achar(d, ['status', 'estado']) || '').toLowerCase();
-    const falhou = ['failed', 'falhou', 'error', 'erro', 'rejected', 'cancelled', 'canceled', 'declined', 'insuf'].some(x => st.includes(x));
-    const pendente = !falhou && ['pending', 'pendente', 'processing', 'queued', 'initiated', 'accepted', 'aceite'].some(x => st.includes(x));
-    const ref = String(achar(d, ['transaction_id', 'transactionId', 'payout_id', 'payoutId', 'idpayment', 'id_payment', 'reference', 'referencia', 'id']) || '');
-    const estadoT = falhou ? 'falhada' : (pendente || !ref) ? 'pendente' : 'concluida';
-    await mudar('transferencia', id, { 'Estado': estadoT, 'Referencia': ref, 'Raw': JSON.stringify(d).slice(0, 4000) });
-    if (falhou) return erro(res, 502, 'A MozPayment recusou o levantamento: ' + (achar(d, ['message', 'mensagem', 'erro']) || st));
-    if (estadoT === 'pendente') return res.json({ ok: true, id, estado: 'pendente', referencia: ref, mensagem: 'O levantamento foi aceite e está a ser processado. Fica pendente até a MozPayment confirmar.' });
+    const rp = await enviarPayout(id, titular);
+    const ref = rp.ref || '';
+    if (rp.estado === 'falhada') return erro(res, 502, 'O levantamento não foi feito: ' + (rp.erro || 'a MozPayment recusou') + '. O valor continua no saldo.');
+    if (rp.estado === 'pendente') return res.json({ ok: true, id, estado: 'pendente', referencia: ref, mensagem: rp.erro || 'O levantamento foi aceite e está a ser processado. Fica pendente até a MozPayment confirmar.' });
     const esc = await obter('escola', req.escola).catch(() => null);
     if (esc && tel9(esc['Telefone']).length === 9) enviarSMS([esc['Telefone']], 'Gescolar: levantamento de ' + mt(valor) + ' por ' + CANAIS[canal] + ' para o ' + numero + ' feito por ' + quem + '.').catch(() => {});
     res.json({ ok: true, id, estado: 'concluida', referencia: ref });
@@ -3836,8 +3869,18 @@ app.post('/pl/saques', exigePlataforma, rota(async (req, res) => {
   const [trs, escolas] = await Promise.all([procurarTodos('transferencia', [], 20000), procurarTodos('escola', [], 5000)]);
   const EN = Object.fromEntries(escolas.map(e => [e._id, e['Nome'] || '']));
   res.json({ ok: true, saques: trs.filter(t => ['pedido', 'pendente'].includes(t['Estado'])).map(t => ({ id: t._id, escola: t['Escola'], escola_nome: EN[t['Escola']] || '', canal: t['Canal'] || '',
-    canal_nome: CANAIS[t['Canal']] || '', valor: Number(t['Valor'] || 0), estado: t['Estado'], numero: t['Numero'] || '', notas: t['Notas'] || '', por: t['Pedido Por'] || '', data: t['Data'] || t['Created Date'] || null }))
+    canal_nome: CANAIS[t['Canal']] || '', valor: Number(t['Valor'] || 0), estado: t['Estado'], numero: t['Numero'] || '', notas: t['Notas'] || '', resposta: String(t['Raw'] || '').slice(0, 200), referencia: t['Referencia'] || '', por: t['Pedido Por'] || '', data: t['Data'] || t['Created Date'] || null }))
     .sort((a, b) => String(a.data || '').localeCompare(String(b.data || ''))) });
+}));
+app.post('/pl/saque-enviar', exigePlataforma, rota(async (req, res) => {
+  const t = await obter('transferencia', String((req.body || {}).id || '')).catch(() => null);
+  if (!t) return erro(res, 404, 'Pedido não encontrado.');
+  if (!B2C[t['Canal']]) return erro(res, 400, 'Só levantamentos M-Pesa ou e-Mola podem ser enviados pela MozPayment.');
+  if (t['Estado'] === 'concluida') return erro(res, 409, 'Este envio já está concluído.');
+  const e = await obter('escola', t['Escola']).catch(() => ({}));
+  const r = await enviarPayout(t._id, (e && e['Nome']) || 'Escola');
+  if (r.estado === 'falhada') return erro(res, 502, 'O envio falhou: ' + (r.erro || 'a MozPayment recusou'));
+  res.json({ ok: true, estado: r.estado, referencia: r.ref || '' });
 }));
 app.post('/pl/saque-estado', exigePlataforma, rota(async (req, res) => {
   const b = req.body || {};
