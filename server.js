@@ -49,7 +49,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.22.2';
+const VERSAO = 'gescolar-proxy 5.23.1';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -283,8 +283,8 @@ app.post('/registo', async (req, res) => {
     const telAdm = tel9(b.admin_tel), telEsc = tel9(b.telefone);
     const nums = [...new Set([telAdm, telEsc].filter(t => t.length === 9))];
     if (nums.length) {
-      const base = PORTAL_URL.replace(/acesso\.html.*$/, '').replace(/^https?:\/\//, '');
-      const r = await enviarSMS(nums, 'Gescolar: a escola ' + nome + ' foi criada. Codigo da escola: ' + sub + (SMS_LINKS ? '. Direccao entra em ' + base + 'entrar.html com ' + email + '. Familias, alunos e professores entram em ' + base + 'acesso.html?e=' + sub + ' com o telemovel.'
+      const base = PORTAL_URL.replace(/[^/]*$/, '').replace(/^https?:\/\//, '');
+      const r = await enviarSMS(nums, 'Gescolar: a escola ' + nome + ' foi criada. Codigo da escola: ' + sub + (SMS_LINKS ? '. Direccao entra em ' + base + 'entrar com ' + email + '. Familias, alunos e professores entram em ' + base + 'acesso?e=' + sub + ' com o telemovel.'
         : '. A Direccao entra no Gescolar com o email ' + email + '. Familias, alunos e professores entram com o codigo da escola e o numero de telemovel.')).catch(() => ({ ok: false }));
       s.sms = !!r.ok;
     }
@@ -1147,7 +1147,8 @@ app.post('/recibo', exigeQualquer, rota(async (req, res) => {
 //  Campo novo no Bubble (opcional): Estudante → Telefone (text), para estudantes com telemóvel próprio.
 // ============================================================
 const PORTAL_DIAS = 30;
-const PORTAL_URL = (process.env.PORTAL_URL || 'https://djdesigncreator.github.io/gescolar-web/acesso.html').replace(/\/+$/, '');
+// Links sem «.html» (o GitHub Pages abre /acesso como acesso.html). PORTAL_URL pode vir com ou sem .html.
+const PORTAL_URL = (process.env.PORTAL_URL || 'https://gescolar.co.mz/acesso').replace(/\/+$/, '').replace(/\.html$/, '');
 const pedidosAcesso = new Map();
 setInterval(() => { const a = Date.now(); for (const [k, v] of pedidosAcesso) if (v.exp < a) pedidosAcesso.delete(k); }, 300e3).unref();
 const hashCodigo = c => crypto.createHmac('sha256', SESSION_SECRET || 'x').update(String(c)).digest('hex');
@@ -2482,7 +2483,7 @@ app.post('/equipa-criar', exigeSoDireccao, rota(async (req, res) => {
   if (!userId) throw new Error('signup não devolveu user_id');
   await mudar('user', userId, { 'Escola': req.escola, 'Papel': papel, 'Nome Completo': nome, 'Telefone': tel.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Activo': true });
   const esc = await obter('escola', req.escola).catch(() => null);
-  const link = linkPagina('recuperar.html') + '?email=' + encodeURIComponent(email);
+  const link = linkPagina('recuperar') + '?email=' + encodeURIComponent(email);
   const papelN = papel === 'Direccao' ? 'Direccao' : 'Secretaria', escN = (esc && esc['Nome']) || 'a escola';
   const r = await enviarSMS([tel], 'Gescolar: foi criada a sua conta (' + papelN + ') em ' + escN + (SMS_LINKS ? '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, '') : '. Enviamos para o seu email ' + email + ' o link para criar a palavra-passe.'));
   const blocos = [{ p: 'Foi criada a sua conta (' + (papel === 'Direccao' ? 'Direcção' : 'Secretaria') + ') em ' + escN + ' no Gescolar.' }, { botao: 'Criar a palavra-passe', link }, { p: 'Depois entre no Gescolar com este email (' + email + ') e a palavra-passe que escolher.' }];
@@ -3528,7 +3529,7 @@ const inscOut = i => ({ id: i._id, link: i['Link'] || '', nome: i['Nome'] || '',
   enc_telefone: i['Encarregado Telefone'] || '', email: i['Email'] || '', respostas: (() => { try { return JSON.parse(i['Respostas'] || '{}'); } catch (e) { return {}; } })(),
   valor: Number(i['Valor'] || 0), metodo: i['Metodo'] || '', estado: i['Estado'] || 'pendente', referencia: i['Referencia'] || '', pago_em: i['Pago Em'] || null,
   criado: i['Created Date'] || null, numero: i['Numero'] || '', estudante: i['Estudante'] || '' });
-function linkPublico(sub, codigo) { return PORTAL_URL.replace(/acesso\.html.*$/, '') + 'inscricao.html?e=' + encodeURIComponent(sub || '') + '&l=' + encodeURIComponent(codigo || ''); }
+function linkPublico(sub, codigo) { return PORTAL_URL.replace(/[^/]*$/, '') + 'inscricao?e=' + encodeURIComponent(sub || '') + '&l=' + encodeURIComponent(codigo || ''); }
 
 // ---------- Direcção ----------
 app.post('/links', exigeDireccao, rota(async (req, res) => {
