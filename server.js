@@ -50,7 +50,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.26.0';
+const VERSAO = 'gescolar-proxy 5.27.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -71,7 +71,8 @@ const app = express();
 app.set('trust proxy', true);
 // o envio de ficheiros no chat precisa de pedidos maiores; o resto fica com 1 MB
 const jsonPequeno = express.json({ limit: '1mb' }), jsonGrande = express.json({ limit: '30mb' });
-app.use((req, res, next) => (req.path === '/chat/enviar' ? jsonGrande : jsonPequeno)(req, res, next));
+const COM_FICHEIROS = new Set(['/chat/enviar', '/matricular', '/estudante-documentos-guardar', '/pub/inscrever']);   // v5.27: documentos da matrícula
+app.use((req, res, next) => (COM_FICHEIROS.has(req.path) ? jsonGrande : jsonPequeno)(req, res, next));
 
 // ---------- CORS ----------
 app.use((req, res, next) => {
@@ -210,7 +211,7 @@ async function resumoEscola(id) {
   return {
     id: e._id, nome: e['Nome'], subdominio: e['Subdominio'], estado: e['Estado'], plano: e['Plano'],
     niveis: (e['Niveis'] || []).map(n => CODIGO_NIVEL[n] || n), ano: e['Ano Lectivo'], teste_ate: e['Teste Ate'] || null, valida_ate: e['Valida Ate'] || null,
-    situacao: situacaoEscola(e), sms: creditosDe(e),
+    situacao: situacaoEscola(e), sms: creditosDe(e), ano_matricula: e['Ano Matricula'] || e['Ano Lectivo'] || '',
     regras: { dia_limite: e['Dia Limite'], multa: e['Multa Percent'], multa_max: e['Multa Max'], aprovacao: e['Nota Aprovacao'], dispensa: e['Nota Dispensa'], formula: e['Formula Media'], admissao: e['Nota Admissao'], peso_exame: e['Peso Exame'] }
   };
 }
@@ -426,7 +427,11 @@ async function daMinhaEscola(tipo, id, escola) {
 function rota(fn) {
   return async (req, res) => {
     try { await fn(req, res); }
-    catch (e) { console.error('[' + req.path + ']', e.message); erro(res, e.publico || 500, e.publico ? e.message : 'Não foi possível concluir. Tente de novo.'); }
+    catch (e) {
+      console.error('[' + req.path + ']', e.message);
+      if (e.pode_forcar || e.cheia || e.repetido) return res.status(e.publico || 409).json({ ok: false, erro: e.message, pode_forcar: true });
+      erro(res, e.publico || 500, e.publico ? e.message : 'Não foi possível concluir. Tente de novo.');
+    }
   };
 }
 const num = (v, def) => { const n = Number(v); return isFinite(n) ? n : def; };
@@ -700,7 +705,7 @@ app.post('/professor-apagar', exigeDireccao, rota(async (req, res) => {
 }));
 
 // ---------- estudantes e encarregados ----------
-const estOut = (e, encs) => { const en = encs && encs.find(x => x._id === e['Encarregado']); return { id: e._id, numero: e['Numero'], nome: e['Nome'], sexo: e['Sexo'] || '', nascimento: e['Data Nascimento'] || null, turma: e['Turma'] || null, estado: e['Estado'] || 'activo', encarregado: en ? { id: en._id, nome: en['Nome'], telefone: en['Telefone'] || '', parentesco: en['Parentesco'] || '' } : null }; };
+const estOut = (e, encs) => { const en = encs && encs.find(x => x._id === e['Encarregado']); return { id: e._id, numero: e['Numero'], nome: e['Nome'], sexo: e['Sexo'] || '', nascimento: e['Data Nascimento'] || null, turma: e['Turma'] || null, estado: e['Estado'] || 'activo', ano_lectivo: e['Ano Lectivo'] || '', classe: e['Classe'] || '', tipo_matricula: e['Tipo Matricula'] || 'nova', origem: e['Origem'] || 'balcao', docs_completos: e['Docs Completos'] === undefined ? null : !!e['Docs Completos'], motivo_saida: e['Motivo Saida'] || '', encarregado: en ? { id: en._id, nome: en['Nome'], telefone: en['Telefone'] || '', parentesco: en['Parentesco'] || '' } : null }; };
 app.post('/estudantes', exigeDireccao, rota(async (req, res) => {
   const f = daEscola(req.escola), turma = (req.body || {}).turma;
   const filtros = turma ? f.concat([{ key: 'Turma', constraint_type: 'equals', value: String(turma) }]) : f;
@@ -725,56 +730,414 @@ async function encarregadoDe(escolaId, b, obrigatorio) {
   const encId = await criar('encarregado', { 'Escola': escolaId, 'Nome': nomeEnc, 'Telefone': telEnc.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3'), 'Email': txt(b.enc_email, 120).toLowerCase(), 'Parentesco': txt(b.enc_parentesco, 30), 'Recebe SMS': true, 'Activo': true });
   return { encId, encTel: telEnc };
 }
+// ============================================================
+//  MATRÍCULAS (v5.27): documentos por classe, matrícula igual ao balcão e online, turmas automáticas, saídas e renovações
+//  Bubble:
+//   Escola     + Matriculas Abertas (yes/no) · Ano Matricula (text) · Turma Max (number) · Turmas Auto (yes/no) · Docs Matricula (text, JSON)
+//   Estudante  + Classe (text) · Curso (text) · Ano Curso (number) · Tipo Matricula (text) · Origem (text) · Escola Anterior (text)
+//              · Documentos (text, JSON) · Docs Completos (yes/no) · Data Saida (date) · Motivo Saida (text) · Historico (text, JSON)
+//   Link Inscricao   + Classe (text) · Curso (text) · Ano Curso (number)
+//   Inscricao Online + Classe (text) · Curso (text) · Ano Curso (number) · Sexo (text) · Tipo Matricula (text) · Escola Anterior (text) · Documentos (text, JSON)
+// ============================================================
+const DOC = (nome, obrig) => ({ nome, obrigatorio: obrig !== false });
+// documentos pedidos por defeito nas escolas moçambicanas (a escola ajusta em Matrículas → Documentos)
+const DOCS_MATRICULA = {
+  'ESC': [DOC('Cédula pessoal, certidão de nascimento ou BI da criança'), DOC('Cartão de vacinas'), DOC('2 fotografias tipo passe'), DOC('BI do encarregado de educação')],
+  'PRI:1ª': [DOC('Cédula pessoal, certidão de nascimento ou BI'), DOC('2 fotografias tipo passe'), DOC('Cartão de vacinas', false), DOC('BI do encarregado de educação')],
+  'PRI': [DOC('Cédula pessoal, certidão de nascimento ou BI'), DOC('2 fotografias tipo passe'), DOC('Boletim ou declaração da classe anterior'), DOC('BI do encarregado de educação')],
+  'SEC:7ª': [DOC('BI ou certidão de nascimento'), DOC('2 fotografias tipo passe'), DOC('Certificado ou declaração da 6ª classe'), DOC('BI do encarregado de educação')],
+  'SEC:10ª': [DOC('BI'), DOC('2 fotografias tipo passe'), DOC('Certificado ou declaração da 9ª classe'), DOC('BI do encarregado de educação')],
+  'SEC': [DOC('BI ou certidão de nascimento'), DOC('2 fotografias tipo passe'), DOC('Declaração ou boletim da classe anterior'), DOC('BI do encarregado de educação')],
+  'TEC': [DOC('BI'), DOC('2 fotografias tipo passe'), DOC('Certificado da classe de ingresso (6ª/7ª para o básico, 9ª/10ª para o médio)'), DOC('NUIT', false), DOC('BI do encarregado de educação')],
+  'SUP': [DOC('BI'), DOC('2 fotografias tipo passe'), DOC('Certificado da 12ª classe ou equivalente'), DOC('Certidão de notas'), DOC('NUIT'), DOC('Atestado médico', false)],
+  'TRANSF': [DOC('Guia ou declaração de transferência'), DOC('Processo individual do aluno'), DOC('Pautas ou boletins da escola de proveniência')]
+};
+const TIPOS_MAT = { nova: 'Nova matrícula', renovacao: 'Renovação', transferencia: 'Transferência' };
+function configMatriculas(e) {
+  const docs = lerJSON(e && e['Docs Matricula'], null);
+  return {
+    ano: String((e && (e['Ano Matricula'] || e['Ano Lectivo'])) || new Date().getFullYear()),
+    abertas: !e || e['Matriculas Abertas'] !== false,
+    turma_max: Math.max(1, Number((e && e['Turma Max']) || 40)),
+    turmas_auto: !e || e['Turmas Auto'] !== false,
+    docs: docs && typeof docs === 'object' && !Array.isArray(docs) ? docs : DOCS_MATRICULA
+  };
+}
+// documentos exigidos: chave mais específica primeiro (SEC:10ª → SEC); transferências juntam os da transferência
+function docsExigidos(cfg, nivel, classe, tipo) {
+  const D = cfg.docs || DOCS_MATRICULA, l = (classe && D[nivel + ':' + classe]) || D[nivel] || [];
+  return l.concat(tipo === 'transferencia' ? (D['TRANSF'] || []) : []).map(d => ({ nome: txt(d.nome, 120), obrigatorio: d.obrigatorio !== false })).filter(d => d.nome);
+}
+function estadoDocs(exigidos, docs) {
+  const falta = exigidos.filter(d => d.obrigatorio && !(docs && docs[d.nome] && docs[d.nome].entregue)).map(d => d.nome);
+  return { completos: !falta.length, falta };
+}
+function lerDocsEnviados(lista) {   // [{nome, entregue, ficheiro:{nome,dados}}] vindos do formulário
+  return (Array.isArray(lista) ? lista : []).slice(0, 20).map(d => ({ nome: txt(d && d.nome, 120), entregue: !!(d && (d.entregue || (d.ficheiro && d.ficheiro.dados))), ficheiro: d && d.ficheiro && d.ficheiro.dados ? d.ficheiro : null })).filter(d => d.nome);
+}
+const DOC_TIPOS = { pdf: 1, jpg: 1, jpeg: 1, png: 1, webp: 1 };
+async function guardarDocumento(escolaId, dono, f) {
+  const nome = nomeFicheiroLimpo(f.nome), ext = ((nome.match(/\.([a-z0-9]{2,5})$/i) || [])[1] || '').toLowerCase();
+  if (!DOC_TIPOS[ext]) throw pub('Os documentos têm de ser PDF ou imagem (JPG, PNG).');
+  const dados = String(f.dados).replace(/^data:[^,]*,/, '').replace(/\s/g, '');
+  if (!/^[A-Za-z0-9+/]+=*$/.test(dados)) throw pub('O ficheiro chegou estragado. Tente outra vez.');
+  const bytes = Math.floor(dados.length * 3 / 4);
+  if (bytes > 5 * 1048576) throw pub('Cada documento pode ter no máximo 5 MB.');
+  if (travao('docs:' + escolaId, 400, 60)) throw pub('Foram enviados muitos documentos na última hora. Tente mais tarde.');
+  return BUNNY_OK ? await guardarFicheiroBunny('/' + escolaId + '/docs/' + dono + '/' + Date.now().toString(36) + crypto.randomBytes(4).toString('hex') + '/' + nome, dados) : await guardarFicheiroBubble(nome, dados);
+}
+async function juntarDocs(escolaId, dono, atuais, enviados, quem) {
+  const docs = Object.assign({}, atuais || {});
+  for (const d of enviados) {
+    const ant = docs[d.nome] || {};
+    const reg = { entregue: d.entregue, data: d.entregue ? (ant.data || new Date().toISOString()) : null, por: quem || ant.por || '' };
+    if (d.ficheiro) { reg.ficheiro = await guardarDocumento(escolaId, dono, d.ficheiro); reg.nome_ficheiro = nomeFicheiroLimpo(d.ficheiro.nome); }
+    else if (ant.ficheiro && d.entregue) { reg.ficheiro = ant.ficheiro; reg.nome_ficheiro = ant.nome_ficheiro; }
+    if (!d.entregue && ant.ficheiro) apagarFicheiroBunny(ant.ficheiro).catch(() => {});
+    docs[d.nome] = reg;
+  }
+  return docs;
+}
+const docsOut = docs => Object.fromEntries(Object.entries(docs || {}).map(([k, v]) => [k, { entregue: !!v.entregue, data: v.data || null, ficheiro: v.ficheiro ? linkFicheiro(v.ficheiro) : '', nome_ficheiro: v.nome_ficheiro || '' }]));
+// ---------- turmas automáticas ----------
+const ativoEst = e => (e['Estado'] || 'activo') === 'activo';
+function nomeTurmaAuto(nivel, classe, curso, ano, n) {
+  if (curso) return (curso['Sigla'] || curso['Nome']) + ' ' + ano + 'º ano - Turma ' + n;
+  if (nivel === 'ESC') return (classe === 'Berçário' ? 'Berçário' : 'Sala dos ' + classe) + ' - Turma ' + n;
+  return classe + ' Classe - Turma ' + n;
+}
+const numTurma = nome => { const m = String(nome || '').match(/turma\s*(\d+)\s*$/i); return m ? Number(m[1]) : 0; };
+// alvo: { nivel, classe } ou { nivel, curso, ano } · devolve a turma com vaga (ou cria a seguinte) para o ano lectivo
+async function escolherTurma(escolaId, alvo, anoLectivo, cfg) {
+  {
+    const f = daEscola(escolaId);
+    const [ts, ests] = await Promise.all([procurarTodos('turma', f), procurarTodos('estudante', f)]);
+    const nv = NIVEIS[alvo.nivel];
+    const doGrupo = ts.filter(t => t['Activa'] !== false && t['Nivel'] === nv && String(t['Ano Lectivo'] || anoLectivo) === String(anoLectivo) &&
+      (alvo.curso ? t['Curso'] === alvo.curso._id && Number(t['Ano Curso'] || 0) === Number(alvo.ano) : classeNorm(alvo.nivel, t['Classe']) === alvo.classe));
+    const ocup = id => ests.filter(e => ativoEst(e) && e['Turma'] === id).length;
+    doGrupo.sort((a, b) => (numTurma(a['Nome']) || 999) - (numTurma(b['Nome']) || 999) || String(a['Nome']).localeCompare(String(b['Nome']), 'pt', { numeric: true }));
+    const livre = doGrupo.find(t => ocup(t._id) < (Number(t['Capacidade']) || cfg.turma_max));
+    if (livre) return { turma: livre, criada: false };
+    const qual = alvo.curso ? alvo.curso['Nome'] + ' ' + alvo.ano + 'º ano' : (alvo.nivel === 'ESC' ? 'sala dos ' + alvo.classe : alvo.classe + ' classe');
+    if (!cfg.turmas_auto) throw pub(doGrupo.length ? 'Todas as turmas da ' + qual + ' estão cheias. Aumente a capacidade ou crie outra turma.' : 'Ainda não há turma da ' + qual + ' para ' + anoLectivo + '. Crie a turma primeiro.');
+    const n = Math.max(doGrupo.length, ...doGrupo.map(t => numTurma(t['Nome']))) + 1;
+    const classe = alvo.curso ? alvo.ano + 'º ano' : alvo.classe;
+    const modelo = doGrupo[doGrupo.length - 1];
+    const todas = await procurarTodos('disciplina', f);
+    const campos = { 'Escola': escolaId, 'Nome': nomeTurmaAuto(alvo.nivel, alvo.classe, alvo.curso, alvo.ano, n), 'Nivel': nv, 'Classe': classe,
+      'Curso': alvo.curso ? alvo.curso._id : '', 'Ano Curso': alvo.curso ? Number(alvo.ano) : 0, 'Area': '', 'Turno': (modelo && modelo['Turno']) || 'Manhã', 'Sala': '',
+      'Capacidade': cfg.turma_max, 'Propina Mensal': modelo ? Number(modelo['Propina Mensal'] || 0) : (alvo.curso ? Number(alvo.curso['Propina Mensal'] || 0) : 0),
+      'Ano Lectivo': String(anoLectivo), 'Activa': true };
+    campos['Codigo'] = slug(campos['Nome']).toUpperCase().replace(/-/g, '').slice(0, 12);
+    campos['Disciplinas'] = todas.filter(d => discServeTurma(d, campos)).map(d => d._id);
+    const id = await criar('turma', campos);
+    console.log('[matriculas] turma criada: ' + campos['Nome'] + ' (' + escolaId + ')');
+    return { turma: Object.assign({ _id: id }, campos), criada: true };
+  }
+}
+// resolve classe/curso a partir do pedido (ou da turma escolhida)
+async function alvoDe(escolaId, b) {
+  const nivel = String(b.nivel || '').toUpperCase();
+  if (CLASSES[nivel]) { const classe = classeNorm(nivel, b.classe); if (!CLASSES[nivel].includes(classe)) throw pub(nivel === 'ESC' ? 'Escolha a sala (idade).' : 'Escolha a classe.'); return { nivel, classe }; }
+  if (nivel === 'TEC' || nivel === 'SUP') {
+    const curso = await daMinhaEscola('curso', String(b.curso || ''), escolaId).catch(() => null);
+    if (!curso || curso['Activo'] === false) throw pub('Escolha o curso.');
+    const ano = Math.round(num(b.ano, 1)) || 1;
+    if (ano < 1 || ano > Number(curso['Duracao'] || 1)) throw pub('Escolha o ano do curso.');
+    return { nivel, curso, ano };
+  }
+  throw pub('Escolha o nível de ensino.');
+}
+
+// matrícula partilhada: balcão (Direcção), inscrições online aprovadas e renovações — as mesmas regras para todos
 async function matricularCore(escolaId, b) {
   const nome = txt(b.nome, 100);
   if (nome.split(/\s+/).length < 2) throw pub('Escreva o nome e o apelido do estudante.');
-  const turmaId = String(b.turma || '');
-  const turma = await daMinhaEscola('turma', turmaId, escolaId);
-  const escola = await resumoEscola(escolaId);
-  // no ensino superior o estudante é adulto: o telemóvel dele é obrigatório e o encarregado é opcional
-  const superior = turma['Nivel'] === NIVEIS.SUP || turma['Nivel'] === 'SUP';
-  if (superior && tel9(b.telefone).length !== 9) throw pub('No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
-  // encarregado: reutiliza pelo telefone, senão cria
-  // v5.12: encarregado obrigatório em todos os níveis, excepto no ensino superior (opcional)
-  const { encId, encTel } = await encarregadoDe(escolaId, b, !superior);
-  // número de estudante: ano-sequência
-  const todos = await procurarTodos('estudante', daEscola(escolaId));
-  const ano = (escola && escola.ano) || String(new Date().getFullYear());
-  const maior = todos.map(e => String(e['Numero'] || '')).filter(n => n.startsWith(ano + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, c) => Math.max(a, c), 0);
-  const numero = ano + '-' + String(maior + 1).padStart(4, '0');
-  const campos = { 'Escola': escolaId, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Turma': turma._id, 'Ano Lectivo': ano,
-    'Data Matricula': new Date().toISOString(), 'Estado': 'activo', 'Saude Notas': txt(b.saude, 300) };
-  if (b.nascimento && !isNaN(Date.parse(b.nascimento))) campos['Data Nascimento'] = new Date(b.nascimento).toISOString();
-  if (encId) campos['Encarregado'] = encId;
-  const telEst = tel9(b.telefone);
-  if (telEst) {
-    if (telEst.length !== 9 || !/^8[2-7]/.test(telEst)) throw pub('O telemóvel do estudante deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEst.length + ' dígito(s).');
-    campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
-  }
-  const id = await criar('estudante', campos);
-  // SMS de boas-vindas com o número e o link de acesso (sem palavra-passe: entra com o telemóvel e recebe um código)
-  let sms = 0;
-  const esc = await obter('escola', escolaId).catch(() => null);
-  if (esc) {
-    const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
+  const esc = await obter('escola', escolaId);
+  const cfg = configMatriculas(esc), anoLectivo = String(b.ano_lectivo || cfg.ano);
+  if (!cfg.abertas && !b.forcar) { const e = pub('As matrículas para ' + anoLectivo + ' estão fechadas. Abra-as em Matrículas → Configuração.'); e.publico = 423; throw e; }
+  const tipo = TIPOS_MAT[b.tipo] ? b.tipo : 'nova';
+  if (tipo === 'transferencia' && txt(b.escola_anterior, 120).length < 3) throw pub('Escreva o nome da escola de onde o aluno vem transferido.');
+  return naFilaSMS('turma|' + escolaId, async () => {
+    // turma: a escolhida (se tiver vaga) ou a primeira com vaga da classe/curso; se estiverem todas cheias, cria a seguinte
+    let turma, criada = false, alvo;
+    const ests = await procurarTodos('estudante', daEscola(escolaId));
+    if (b.turma) {
+      turma = await daMinhaEscola('turma', String(b.turma), escolaId);
+      const nv = CODIGO_NIVEL[turma['Nivel']] || turma['Nivel'];
+      alvo = { nivel: nv, classe: classeNorm(nv, turma['Classe']) };
+      const ocup = ests.filter(e => ativoEst(e) && e['Turma'] === turma._id).length, cap = Number(turma['Capacidade']) || cfg.turma_max;
+      if (ocup >= cap && !b.forcar) { const e = pub('A turma ' + turma['Nome'] + ' está cheia (' + ocup + ' de ' + cap + '). Escolha «Automática» ou confirme que quer passar o limite.'); e.publico = 409; e.cheia = true; throw e; }
+    } else {
+      alvo = await alvoDe(escolaId, b);
+      const r = await escolherTurma(escolaId, alvo, anoLectivo, cfg);
+      turma = r.turma; criada = r.criada;
+    }
+    const nivel = CODIGO_NIVEL[turma['Nivel']] || turma['Nivel'];
+    const superior = nivel === 'SUP';
+    if (superior && tel9(b.telefone).length !== 9) throw pub('No ensino superior o telemóvel do estudante é obrigatório: é por ele que recebe o acesso e entra no portal.');
+    // evitar matrícula repetida: mesmo nome e mesma data de nascimento, ainda activo
+    const chave = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const nasc = b.nascimento && !isNaN(Date.parse(b.nascimento)) ? new Date(b.nascimento).toISOString().slice(0, 10) : '';
+    const rep = ests.find(e => ativoEst(e) && chave(e['Nome']) === chave(nome) && (!nasc || !e['Data Nascimento'] || String(e['Data Nascimento']).slice(0, 10) === nasc));
+    if (rep && !b.forcar) { const e = pub('Já existe um estudante activo com o nome ' + rep['Nome'] + ' (nº ' + (rep['Numero'] || '') + '). Se for outra pessoa, confirme para matricular na mesma.'); e.publico = 409; e.repetido = true; throw e; }
+    const { encId, encTel } = await encarregadoDe(escolaId, b, !superior);
+    const maior = ests.map(e => String(e['Numero'] || '')).filter(n => n.startsWith(anoLectivo + '-')).map(n => parseInt(n.split('-')[1], 10) || 0).reduce((a, c) => Math.max(a, c), 0);
+    const numero = anoLectivo + '-' + String(maior + 1).padStart(4, '0');
+    const classeDocs = turma['Curso'] ? '' : classeNorm(nivel, turma['Classe']);
+    const exig = docsExigidos(cfg, nivel, classeDocs, tipo);
+    const id0 = crypto.randomBytes(6).toString('hex');
+    const docs = await juntarDocs(escolaId, id0, b.docs_atuais || {}, lerDocsEnviados(b.docs), b.quem);
+    const ed = estadoDocs(exig, docs);
+    const campos = { 'Escola': escolaId, 'Numero': numero, 'Nome': nome, 'Sexo': b.sexo === 'F' ? 'F' : (b.sexo === 'M' ? 'M' : ''), 'Turma': turma._id, 'Ano Lectivo': anoLectivo,
+      'Data Matricula': new Date().toISOString(), 'Estado': 'activo', 'Saude Notas': txt(b.saude, 300),
+      'Classe': turma['Classe'] || '', 'Curso': turma['Curso'] || '', 'Ano Curso': Number(turma['Ano Curso'] || 0), 'Tipo Matricula': tipo, 'Origem': ['balcao', 'online', 'importacao', 'renovacao'].includes(b.origem) ? b.origem : 'balcao',
+      'Escola Anterior': txt(b.escola_anterior, 120), 'Documentos': JSON.stringify(docs), 'Docs Completos': ed.completos };
+    if (nasc) campos['Data Nascimento'] = new Date(nasc + 'T12:00:00Z').toISOString();
+    if (encId) campos['Encarregado'] = encId;
+    const telEst = tel9(b.telefone);
     if (telEst) {
-      const r = await smsEscola(escolaId, [telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
-        '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
-      if (r.ok) sms++;
+      if (telEst.length !== 9 || !/^8[2-7]/.test(telEst)) throw pub('O telemóvel do estudante deve ter 9 dígitos e começar por 82 a 87 (ex.: 84 123 4567). Escreveu ' + telEst.length + ' dígito(s).');
+      campos['Telefone'] = telEst.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
     }
-    if (encTel && encTel !== telEst) {
-      const r = await smsEscola(escolaId, [encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
-        '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
-      if (r.ok) sms++;
+    const id = await criar('estudante', campos);
+    let sms = 0;
+    const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
+    if (b.sms !== false) {
+      if (telEst) {
+        const r = await smsEscola(escolaId, [telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
+          '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
+        if (r.ok) sms++;
+      }
+      if (encTel && encTel !== telEst) {
+        const r = await smsEscola(escolaId, [encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
+          '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
+        if (r.ok) sms++;
+      }
     }
-  }
-  cachePainel.delete(escolaId);
-  return { id, numero, sms };
+    cachePainel.delete(escolaId);
+    return { id, numero, sms, turma: { id: turma._id, nome: turma['Nome'] }, turma_criada: criada, docs_completos: ed.completos, falta: ed.falta };
+  });
 }
+
 app.post('/matricular', exigeDireccao, rota(async (req, res) => {
-  const r = await matricularCore(req.escola, req.body || {});
+  const r = await matricularCore(req.escola, Object.assign({}, req.body || {}, { origem: 'balcao', quem: 'Secretaria', docs_atuais: {} }));
   res.json(Object.assign({ ok: true }, r));
 }));
+// ---------- rotas das matrículas (v5.27) ----------
+app.post('/matriculas-config', exigeDireccao, rota(async (req, res) => {
+  const [e, cs] = await Promise.all([obter('escola', req.escola), procurarTodos('curso', daEscola(req.escola)).catch(() => [])]);
+  const cfg = configMatriculas(e);
+  res.json({ ok: true, config: cfg, padrao: DOCS_MATRICULA, estrutura: ESTRUTURA, ano_escola: e['Ano Lectivo'] || '', cursos: cs.filter(c => c['Activo'] !== false).map(cursoEnsinoOut) });
+}));
+app.post('/matriculas-config-guardar', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {}, ano = String(b.ano || '').trim();
+  if (!/^20\d{2}$/.test(ano)) return erro(res, 400, 'Escreva o ano lectivo das matrículas, por exemplo 2027.');
+  const max = Math.round(num(b.turma_max, 40));
+  if (max < 5 || max > 200) return erro(res, 400, 'O máximo de alunos por turma vai de 5 a 200.');
+  const docs = {};
+  if (b.docs && typeof b.docs === 'object') for (const [k, l] of Object.entries(b.docs)) {
+    if (!/^(ESC|PRI|SEC|TEC|SUP|TRANSF)(:[^:]{1,12})?$/.test(k) || !Array.isArray(l)) continue;
+    docs[k] = l.slice(0, 15).map(d => ({ nome: txt(d && d.nome, 120), obrigatorio: !(d && d.obrigatorio === false) })).filter(d => d.nome);
+  }
+  await mudar('escola', req.escola, { 'Ano Matricula': ano, 'Matriculas Abertas': !!b.abertas, 'Turma Max': max, 'Turmas Auto': !!b.turmas_auto, 'Docs Matricula': JSON.stringify(Object.keys(docs).length ? docs : DOCS_MATRICULA) });
+  cachePainel.delete(req.escola);
+  res.json({ ok: true });
+}));
+// o que aparece no formulário de matrícula: turmas da classe com vagas e documentos pedidos
+app.post('/matricula-opcoes', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, e = await obter('escola', req.escola), cfg = configMatriculas(e);
+  const alvo = await alvoDe(req.escola, b);
+  const f = daEscola(req.escola);
+  const [ts, ests] = await Promise.all([procurarTodos('turma', f), procurarTodos('estudante', f)]);
+  const ano = String(b.ano_lectivo || cfg.ano);
+  const L = ts.filter(t => t['Activa'] !== false && t['Nivel'] === NIVEIS[alvo.nivel] && String(t['Ano Lectivo'] || ano) === ano &&
+    (alvo.curso ? t['Curso'] === alvo.curso._id && Number(t['Ano Curso'] || 0) === alvo.ano : classeNorm(alvo.nivel, t['Classe']) === alvo.classe))
+    .map(t => { const n = ests.filter(x => ativoEst(x) && x['Turma'] === t._id).length, cap = Number(t['Capacidade']) || cfg.turma_max; return { id: t._id, nome: t['Nome'], estudantes: n, capacidade: cap, vagas: Math.max(0, cap - n) }; })
+    .sort((a, b2) => a.nome.localeCompare(b2.nome, 'pt', { numeric: true }));
+  const tipo = TIPOS_MAT[b.tipo] ? b.tipo : 'nova';
+  res.json({ ok: true, ano, abertas: cfg.abertas, turmas_auto: cfg.turmas_auto, turma_max: cfg.turma_max, turmas: L, documentos: docsExigidos(cfg, alvo.nivel, alvo.curso ? '' : alvo.classe, tipo) });
+}));
+app.post('/estudante-documentos', exigeDireccao, rota(async (req, res) => {
+  const e = await daMinhaEscola('estudante', String((req.body || {}).id || ''), req.escola), esc = await obter('escola', req.escola), cfg = configMatriculas(esc);
+  const nv = CODIGO_NIVEL[(await obter('turma', e['Turma']).catch(() => ({})))['Nivel']] || '';
+  const exig = docsExigidos(cfg, nv, e['Curso'] ? '' : classeNorm(nv, e['Classe']), e['Tipo Matricula']);
+  const docs = lerJSON(e['Documentos'], {});
+  const extra = Object.keys(docs).filter(k => !exig.some(d => d.nome === k)).map(k => ({ nome: k, obrigatorio: false }));
+  res.json({ ok: true, nome: e['Nome'], exigidos: exig.concat(extra), docs: docsOut(docs), estado: estadoDocs(exig, docs) });
+}));
+app.post('/estudante-documentos-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, e = await daMinhaEscola('estudante', String(b.id || ''), req.escola), esc = await obter('escola', req.escola), cfg = configMatriculas(esc);
+  const docs = await juntarDocs(req.escola, e._id, lerJSON(e['Documentos'], {}), lerDocsEnviados(b.docs), b.quem || 'Direcção');
+  const nv = CODIGO_NIVEL[(await obter('turma', e['Turma']).catch(() => ({})))['Nivel']] || '';
+  const ed = estadoDocs(docsExigidos(cfg, nv, e['Curso'] ? '' : classeNorm(nv, e['Classe']), e['Tipo Matricula']), docs);
+  await mudar('estudante', e._id, { 'Documentos': JSON.stringify(docs), 'Docs Completos': ed.completos });
+  res.json({ ok: true, estado: ed, docs: docsOut(docs) });
+}));
+// mudar de turma (com autorização para passar o limite)
+app.post('/estudante-turma', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {};
+  const r = await naFilaSMS('turma|' + req.escola, async () => {
+    const e = await daMinhaEscola('estudante', String(b.id || ''), req.escola), t = await daMinhaEscola('turma', String(b.turma || ''), req.escola);
+    if (e['Turma'] === t._id) return { ok: true, igual: true };
+    const cfg = configMatriculas(await obter('escola', req.escola));
+    const n = (await procurarTodos('estudante', [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Turma', constraint_type: 'equals', value: t._id }])).filter(ativoEst).length;
+    const cap = Number(t['Capacidade']) || cfg.turma_max;
+    if (n >= cap && !b.forcar) { const x = pub('A turma ' + t['Nome'] + ' está cheia (' + n + ' de ' + cap + ').'); x.publico = 409; x.pode_forcar = true; throw x; }
+    const hist = lerJSON(e['Historico'], []); hist.push({ tipo: 'mudanca', data: new Date().toISOString(), de: e['Turma'], para: t._id, motivo: txt(b.motivo, 200) });
+    await mudar('estudante', e._id, { 'Turma': t._id, 'Classe': t['Classe'] || e['Classe'] || '', 'Curso': t['Curso'] || '', 'Ano Curso': Number(t['Ano Curso'] || 0), 'Historico': JSON.stringify(hist.slice(-50)) });
+    return { ok: true };
+  });
+  cachePainel.delete(req.escola);
+  res.json(r);
+}));
+// cancelar a matrícula ou registar a saída por transferência
+app.post('/estudante-saida', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, e = await daMinhaEscola('estudante', String(b.id || ''), req.escola);
+  const tipo = { cancelado: 'cancelado', transferido: 'transferido', activo: 'activo' }[b.tipo];
+  if (!tipo) return erro(res, 400, 'Escolha: cancelar a matrícula, transferido para outra escola, ou reactivar.');
+  if (tipo !== 'activo' && txt(b.motivo, 300).length < 3) return erro(res, 400, 'Escreva o motivo (ou a escola de destino).');
+  const hist = lerJSON(e['Historico'], []); hist.push({ tipo, data: new Date().toISOString(), turma: e['Turma'], motivo: txt(b.motivo, 300) });
+  await mudar('estudante', e._id, { 'Estado': tipo, 'Data Saida': tipo === 'activo' ? null : new Date().toISOString(), 'Motivo Saida': tipo === 'activo' ? '' : txt(b.motivo, 300), 'Historico': JSON.stringify(hist.slice(-50)) });
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, estado: tipo });
+}));
+// renovação: passa os estudantes escolhidos para o ano lectivo seguinte, na classe (ou ano do curso) de destino, com turma automática
+app.post('/renovar-matriculas', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {}, esc = await obter('escola', req.escola), cfg = configMatriculas(esc);
+  const ano = String(b.ano_lectivo || cfg.ano);
+  if (!/^20\d{2}$/.test(ano)) return erro(res, 400, 'Ano lectivo inválido.');
+  const ids = (Array.isArray(b.estudantes) ? b.estudantes : []).map(String).slice(0, 300);
+  if (!ids.length) return erro(res, 400, 'Escolha os estudantes a renovar.');
+  const alvo = await alvoDe(req.escola, b);
+  const feitos = [], erros = [];
+  for (const id of ids) {
+    try {
+      const r = await naFilaSMS('turma|' + req.escola, async () => {
+        const e = await daMinhaEscola('estudante', id, req.escola);
+        if (!ativoEst(e)) throw pub(e['Nome'] + ' não está activo.');
+        if (String(e['Ano Lectivo']) === ano) throw pub(e['Nome'] + ' já está matriculado em ' + ano + '.');
+        const { turma } = await escolherTurma(req.escola, alvo, ano, cfg);
+        const hist = lerJSON(e['Historico'], []); hist.push({ tipo: 'renovacao', data: new Date().toISOString(), ano: e['Ano Lectivo'], turma: e['Turma'], classe: e['Classe'] || '' });
+        await mudar('estudante', e._id, { 'Turma': turma._id, 'Ano Lectivo': ano, 'Classe': turma['Classe'] || '', 'Curso': turma['Curso'] || '', 'Ano Curso': Number(turma['Ano Curso'] || 0),
+          'Tipo Matricula': 'renovacao', 'Origem': 'renovacao', 'Data Matricula': new Date().toISOString(), 'Historico': JSON.stringify(hist.slice(-50)) });
+        return { id: e._id, nome: e['Nome'], turma: turma['Nome'] };
+      });
+      feitos.push(r);
+    } catch (err) { erros.push(err.publico ? err.message : 'Erro ao renovar ' + id); }
+  }
+  cachePainel.delete(req.escola);
+  res.json({ ok: true, renovados: feitos.length, feitos, erros });
+}));
+// ---------- relatórios (v5.27) ----------
+//  tipos: matriculas-ano · turma · classes · matriculas · inscricoes · documentos · saidas · geral · historico
+const SEXO = s => s === 'F' ? 'F' : s === 'M' ? 'M' : '—';
+const dmy = d => d ? String(d).slice(8, 10) + '/' + String(d).slice(5, 7) + '/' + String(d).slice(0, 4) : '';
+app.post('/relatorio', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, f = daEscola(req.escola);
+  const [esc, ts, ests, encs, cs, profs, ins, links] = await Promise.all([obter('escola', req.escola), procurarTodos('turma', f), procurarTodos('estudante', f), procurarTodos('encarregado', f),
+    procurarTodos('curso', f).catch(() => []), procurarTodos('professor', f), procurarTodos('inscricaoonline', f, 20000).catch(() => []), procurarTodos('linkinscricao', f).catch(() => [])]);
+  const cfg = configMatriculas(esc), ano = String(b.ano || cfg.ano);
+  const T = Object.fromEntries(ts.map(t => [t._id, t])), C = Object.fromEntries(cs.map(c => [c._id, c])), EN = Object.fromEntries(encs.map(e => [e._id, e])), P = Object.fromEntries(profs.map(p => [p._id, p['Nome']]));
+  const nvT = t => CODIGO_NIVEL[t && t['Nivel']] || (t && t['Nivel']) || '';
+  const grupo = t => !t ? '—' : t['Curso'] ? ((C[t['Curso']] || {})['Nome'] || 'Curso') + ' · ' + (t['Ano Curso'] || '') + 'º ano' : classeNorm(nvT(t), t['Classe']) ? (nvT(t) === 'ESC' ? 'Sala ' + classeNorm(nvT(t), t['Classe']) : classeNorm(nvT(t), t['Classe']) + ' Classe') : (t['Classe'] || '—');
+  const ordemGrupo = t => { const nv = nvT(t), i = ['ESC', 'PRI', 'SEC', 'TEC', 'SUP', 'CON'].indexOf(nv), cl = CLASSES[nv] ? CLASSES[nv].indexOf(classeNorm(nv, t['Classe'])) : (Number(t['Ano Curso']) || 0); return i * 100 + (cl < 0 ? 99 : cl); };
+  // filtros comuns
+  const passa = e => {
+    const t = T[e['Turma']];
+    if (b.nivel && nvT(t) !== b.nivel) return false;
+    if (b.classe && classeNorm(nvT(t), t && t['Classe']) !== b.classe) return false;
+    if (b.curso && (!t || t['Curso'] !== b.curso)) return false;
+    if (b.turma && e['Turma'] !== b.turma) return false;
+    if (b.sexo && e['Sexo'] !== b.sexo) return false;
+    return true;
+  };
+  const doAno = e => String(e['Ano Lectivo'] || '') === ano;
+  const activos = ests.filter(e => ativoEst(e) && doAno(e) && passa(e));
+  const conta = l => ({ total: l.length, m: l.filter(e => e['Sexo'] === 'M').length, f: l.filter(e => e['Sexo'] === 'F').length });
+  const out = { ok: true, escola: { nome: esc['Nome'] || '', logotipo: esc['Logotipo'] || '', nuit: esc['NUIT'] || '' }, ano, gerado: new Date().toISOString(), resumo: [], colunas: [], linhas: [] };
+  const tipo = String(b.tipo || '');
+  if (tipo === 'matriculas-ano') {
+    const doA = ests.filter(e => doAno(e) && passa(e) && (e['Estado'] || 'activo') !== 'apagado');
+    const k = conta(doA.filter(ativoEst));
+    const pend = ins.filter(i => ['pendente', 'paga'].includes(i['Estado']) && (!i['Created Date'] || String(i['Created Date']).slice(0, 4) >= String(Number(ano) - 1)));
+    out.titulo = 'Matrículas do ano lectivo ' + ano;
+    out.resumo = [['Matriculados (activos)', k.total], ['Novas matrículas', doA.filter(e => (e['Tipo Matricula'] || 'nova') === 'nova').length], ['Renovações', doA.filter(e => e['Tipo Matricula'] === 'renovacao').length],
+      ['Transferências recebidas', doA.filter(e => e['Tipo Matricula'] === 'transferencia').length], ['Inscrições por matricular', pend.length], ['Masculino', k.m], ['Feminino', k.f]];
+    const G = {}; doA.filter(ativoEst).forEach(e => { const t = T[e['Turma']], g = (NIVEIS_NOME[nvT(t)] || '—') + ' · ' + grupo(t); (G[g] = G[g] || { o: ordemGrupo(t || {}), l: [] }).l.push(e); });
+    out.colunas = ['Nível e classe', 'Alunos', 'M', 'F', 'Novas', 'Renovações', 'Transferências'];
+    out.linhas = Object.entries(G).sort((a, c) => a[1].o - c[1].o || a[0].localeCompare(c[0], 'pt', { numeric: true })).map(([g, x]) => { const k2 = conta(x.l); return [g, k2.total, k2.m, k2.f, x.l.filter(e => (e['Tipo Matricula'] || 'nova') === 'nova').length, x.l.filter(e => e['Tipo Matricula'] === 'renovacao').length, x.l.filter(e => e['Tipo Matricula'] === 'transferencia').length]; });
+  } else if (tipo === 'turma') {
+    const t = T[b.turma]; if (!t) return erro(res, 400, 'Escolha a turma.');
+    const l = ests.filter(e => ativoEst(e) && e['Turma'] === t._id && (!b.sexo || e['Sexo'] === b.sexo)).sort((a, c) => String(a['Nome']).localeCompare(String(c['Nome']), 'pt'));
+    const k = conta(l), cap = Number(t['Capacidade']) || cfg.turma_max;
+    out.titulo = 'Turma ' + t['Nome'] + ' · ' + (t['Ano Lectivo'] || ano);
+    out.resumo = [['Classe / curso', grupo(t)], ['Director(a) de turma', P[t['Director Turma']] || P[t['Professor Titular']] || '—'], ['Alunos', k.total + ' de ' + cap], ['Vagas', Math.max(0, cap - k.total)], ['Masculino', k.m], ['Feminino', k.f], ['Turno', t['Turno'] || '—']];
+    out.colunas = ['Nº', 'Número', 'Nome', 'Sexo', 'Nascimento', 'Encarregado', 'Telemóvel do encarregado', 'Documentos'];
+    out.linhas = l.map((e, i) => { const en = EN[e['Encarregado']] || {}; return [i + 1, e['Numero'] || '', e['Nome'] || '', SEXO(e['Sexo']), dmy(e['Data Nascimento']), en['Nome'] || '—', en['Telefone'] || '—', e['Docs Completos'] === false ? 'Incompletos' : e['Docs Completos'] ? 'Completos' : '—']; });
+  } else if (tipo === 'classes') {
+    const G = {};
+    ts.filter(t => t['Activa'] !== false && String(t['Ano Lectivo'] || ano) === ano && (!b.nivel || nvT(t) === b.nivel)).forEach(t => { const g = (NIVEIS_NOME[nvT(t)] || '') + ' · ' + grupo(t); (G[g] = G[g] || { o: ordemGrupo(t), ts: [] }).ts.push(t); });
+    out.titulo = 'Alunos por classe · ' + ano;
+    out.colunas = ['Nível e classe', 'Turmas', 'Alunos', 'M', 'F', 'Capacidade', 'Vagas', 'Distribuição pelas turmas'];
+    let tot = 0;
+    out.linhas = Object.entries(G).sort((a, c) => a[1].o - c[1].o || a[0].localeCompare(c[0], 'pt', { numeric: true })).map(([g, x]) => {
+      const l = ests.filter(e => ativoEst(e) && x.ts.some(t => t._id === e['Turma'])), k = conta(l), cap = x.ts.reduce((s, t) => s + (Number(t['Capacidade']) || cfg.turma_max), 0); tot += k.total;
+      return [g, x.ts.length, k.total, k.m, k.f, cap, Math.max(0, cap - k.total), x.ts.sort((p, q) => String(p['Nome']).localeCompare(String(q['Nome']), 'pt', { numeric: true })).map(t => t['Nome'] + ': ' + l.filter(e => e['Turma'] === t._id).length).join(' · ')];
+    });
+    out.resumo = [['Classes / anos com turmas', out.linhas.length], ['Turmas', Object.values(G).reduce((s, x) => s + x.ts.length, 0)], ['Alunos', tot]];
+  } else if (tipo === 'matriculas') {
+    const l = ests.filter(e => doAno(e) && passa(e) && (e['Estado'] || 'activo') !== 'apagado').sort((a, c) => String(c['Data Matricula'] || '').localeCompare(String(a['Data Matricula'] || '')));
+    out.titulo = 'Lista de matrículas · ' + ano;
+    out.colunas = ['Data', 'Número', 'Nome', 'Sexo', 'Classe / curso', 'Turma', 'Tipo', 'Origem', 'Estado'];
+    out.linhas = l.map(e => { const t = T[e['Turma']]; return [dmy(e['Data Matricula']), e['Numero'] || '', e['Nome'] || '', SEXO(e['Sexo']), grupo(t), (t && t['Nome']) || '—', TIPOS_MAT[e['Tipo Matricula']] || 'Nova matrícula', { balcao: 'Presencial', online: 'Online', importacao: 'Importação', renovacao: 'Renovação' }[e['Origem']] || 'Presencial', e['Estado'] || 'activo']; });
+    out.resumo = [['Matrículas', l.length], ['Presenciais', l.filter(e => !e['Origem'] || e['Origem'] === 'balcao').length], ['Online', l.filter(e => e['Origem'] === 'online').length], ['Importadas', l.filter(e => e['Origem'] === 'importacao').length]];
+  } else if (tipo === 'inscricoes') {
+    const LN = Object.fromEntries(links.map(l => [l._id, l['Titulo'] || '']));
+    const EST_I = { pendente: 'À espera do pagamento', paga: 'Por matricular', matriculada: 'Matriculada', recusada: 'Recusada', falhada: 'Pagamento falhou' };
+    const l = ins.filter(i => !b.estado || i['Estado'] === b.estado).sort((a, c) => String(c['Created Date'] || '').localeCompare(String(a['Created Date'] || '')));
+    out.titulo = 'Inscrições online';
+    out.colunas = ['Data', 'Candidato', 'Classe / curso', 'Link', 'Encarregado', 'Telemóvel', 'Valor', 'Estado', 'Nº atribuído'];
+    out.linhas = l.map(i => [dmy(i['Created Date']), i['Nome'] || '', i['Curso'] ? ((C[i['Curso']] || {})['Nome'] || '') + ' ' + (i['Ano Curso'] || '') + 'º ano' : (i['Classe'] || ''), LN[i['Link']] || '', i['Encarregado Nome'] || '', i['Encarregado Telefone'] || i['Telefone'] || '', Number(i['Valor'] || 0), EST_I[i['Estado']] || i['Estado'] || '', i['Numero'] || '']);
+    out.resumo = Object.entries(EST_I).map(([k, n]) => [n, ins.filter(i => i['Estado'] === k).length]);
+  } else if (tipo === 'documentos') {
+    const l = activos.filter(e => e['Docs Completos'] !== true).sort((a, c) => String(a['Nome']).localeCompare(String(c['Nome']), 'pt'));
+    out.titulo = 'Alunos com documentação incompleta · ' + ano;
+    out.colunas = ['Número', 'Nome', 'Classe / curso', 'Turma', 'Documentos em falta', 'Encarregado', 'Telemóvel'];
+    out.linhas = l.map(e => { const t = T[e['Turma']], nv = nvT(t), en = EN[e['Encarregado']] || {}; const ed = estadoDocs(docsExigidos(cfg, nv, e['Curso'] ? '' : classeNorm(nv, e['Classe'] || (t && t['Classe'])), e['Tipo Matricula']), lerJSON(e['Documentos'], {}));
+      return [e['Numero'] || '', e['Nome'] || '', grupo(t), (t && t['Nome']) || '—', ed.falta.join('; ') || 'Por conferir', en['Nome'] || '—', en['Telefone'] || '—']; });
+    out.resumo = [['Alunos activos', activos.length], ['Com documentos em falta', l.length], ['Completos', activos.length - l.length]];
+  } else if (tipo === 'saidas') {
+    const l = ests.filter(e => ['cancelado', 'transferido'].includes(e['Estado']) && passa(e) && (!b.estado || e['Estado'] === b.estado)).sort((a, c) => String(c['Data Saida'] || '').localeCompare(String(a['Data Saida'] || '')));
+    out.titulo = 'Matrículas canceladas e alunos transferidos';
+    out.colunas = ['Data', 'Número', 'Nome', 'Turma', 'Situação', 'Motivo / destino'];
+    out.linhas = l.map(e => [dmy(e['Data Saida']), e['Numero'] || '', e['Nome'] || '', (T[e['Turma']] || {})['Nome'] || '—', e['Estado'] === 'cancelado' ? 'Matrícula cancelada' : 'Transferido', e['Motivo Saida'] || '']);
+    out.resumo = [['Canceladas', l.filter(e => e['Estado'] === 'cancelado').length], ['Transferidos', l.filter(e => e['Estado'] === 'transferido').length]];
+  } else if (tipo === 'historico') {
+    const l = ests.filter(e => passa(e) && (e['Estado'] || 'activo') !== 'apagado');
+    const linhas = [];
+    l.forEach(e => { lerJSON(e['Historico'], []).forEach(h => linhas.push([dmy(h.data), e['Numero'] || '', e['Nome'] || '', { renovacao: 'Renovação (vinha de ' + (h.ano || '') + ')', mudanca: 'Mudança de turma', cancelado: 'Cancelada', transferido: 'Transferido', activo: 'Reactivada' }[h.tipo] || h.tipo,
+      (T[h.turma || h.de] || {})['Nome'] || '', (T[h.para] || {})['Nome'] || '', h.motivo || ''])); linhas.push([dmy(e['Data Matricula']), e['Numero'] || '', e['Nome'] || '', 'Matrícula ' + (e['Ano Lectivo'] || '') + ' · ' + (TIPOS_MAT[e['Tipo Matricula']] || 'Nova'), '', (T[e['Turma']] || {})['Nome'] || '', '']); });
+    out.titulo = 'Histórico de matrículas';
+    out.colunas = ['Data', 'Número', 'Nome', 'Movimento', 'De', 'Para', 'Motivo'];
+    out.linhas = linhas.sort((a, c) => c[0].split('/').reverse().join('').localeCompare(a[0].split('/').reverse().join('')));
+    out.resumo = [['Movimentos', linhas.length], ['Alunos', l.length]];
+  } else if (tipo === 'geral') {
+    const act = ests.filter(e => ativoEst(e) && doAno(e)), k = conta(act);
+    const tAno = ts.filter(t => t['Activa'] !== false && String(t['Ano Lectivo'] || ano) === ano);
+    out.titulo = 'Relatório geral da escola · ' + ano;
+    out.resumo = [['Total de alunos', k.total], ['Masculino', k.m], ['Feminino', k.f], ['Turmas', tAno.length], ['Cursos', cs.filter(c => c['Activo'] !== false).length || '—']];
+    const porNivel = {}; act.forEach(e => { const n = NIVEIS_NOME[nvT(T[e['Turma']])] || '—'; (porNivel[n] = porNivel[n] || []).push(e); });
+    const porAno = {}; ests.filter(ativoEst).forEach(e => { const a = String(e['Ano Lectivo'] || '—'); (porAno[a] = porAno[a] || []).push(e); });
+    out.colunas = ['Grupo', 'Valor', 'Alunos', 'M', 'F', 'Turmas'];
+    out.linhas = Object.entries(porNivel).map(([n, l]) => { const k2 = conta(l); return ['Nível de ensino', n, k2.total, k2.m, k2.f, tAno.filter(t => NIVEIS_NOME[nvT(t)] === n).length]; })
+      .concat(Object.entries(porAno).sort().map(([a, l]) => { const k2 = conta(l); return ['Ano lectivo', a, k2.total, k2.m, k2.f, ts.filter(t => t['Activa'] !== false && String(t['Ano Lectivo'] || '') === a).length]; }));
+  } else return erro(res, 400, 'Escolha o tipo de relatório.');
+  res.json(out);
+}));
+const NIVEIS_NOME = { ESC: 'Escolinha', PRI: 'Ensino Primário', SEC: 'Ensino Secundário', TEC: 'Técnico-Profissional', SUP: 'Ensino Superior', CON: 'Condução' };
+
 
 
 // ============================================================
@@ -4008,14 +4371,15 @@ function situacaoLink(l, inscritos) {
 }
 function linkOut(l, extra) {
   return Object.assign({ id: l._id, codigo: l['Codigo'] || '', titulo: l['Titulo'] || '', descricao: l['Descricao'] || '', preco: Number(l['Preco'] || 0), cor: COR_OK(l['Cor']) ? l['Cor'] : '#0A64DC',
-    capa: l['Capa'] || '', nivel: CODIGO_NIVEL[l['Nivel']] || l['Nivel'] || '', prazo: l['Prazo'] ? String(l['Prazo']).slice(0, 10) : '', vagas: Number(l['Vagas'] || 0),
+    capa: l['Capa'] || '', nivel: CODIGO_NIVEL[l['Nivel']] || l['Nivel'] || '', classe: l['Classe'] || '', curso: l['Curso'] || '', ano_curso: Number(l['Ano Curso'] || 0) || null, prazo: l['Prazo'] ? String(l['Prazo']).slice(0, 10) : '', vagas: Number(l['Vagas'] || 0),
     campos: lerCampos(l['Campos']), mensagem: l['Mensagem Final'] || '', contacto: l['Contacto'] || '', whatsapp: l['WhatsApp'] || '', activo: l['Activo'] !== false,
     encarregado: pedeEncarregado(l) }, extra || {});
 }
 const inscOut = i => ({ id: i._id, link: i['Link'] || '', nome: i['Nome'] || '', telefone: i['Telefone'] || '', nascimento: i['Nascimento'] || '', enc_nome: i['Encarregado Nome'] || '',
   enc_telefone: i['Encarregado Telefone'] || '', email: i['Email'] || '', respostas: (() => { try { return JSON.parse(i['Respostas'] || '{}'); } catch (e) { return {}; } })(),
   valor: Number(i['Valor'] || 0), metodo: i['Metodo'] || '', estado: i['Estado'] || 'pendente', referencia: i['Referencia'] || '', pago_em: i['Pago Em'] || null,
-  criado: i['Created Date'] || null, numero: i['Numero'] || '', estudante: i['Estudante'] || '' });
+  criado: i['Created Date'] || null, numero: i['Numero'] || '', estudante: i['Estudante'] || '', classe: i['Classe'] || '', curso: i['Curso'] || '', ano_curso: Number(i['Ano Curso'] || 0) || null,
+  sexo: i['Sexo'] || '', tipo_matricula: i['Tipo Matricula'] || 'nova', escola_anterior: i['Escola Anterior'] || '', documentos: docsOut(lerJSON(i['Documentos'], {})) });
 function linkPublico(sub, codigo) { return PORTAL_URL.replace(/[^/]*$/, '') + 'inscricao?e=' + encodeURIComponent(sub || '') + '&l=' + encodeURIComponent(codigo || ''); }
 
 // ---------- Direcção ----------
@@ -4047,7 +4411,8 @@ app.post('/link-guardar', exigeDireccao, rota(async (req, res) => {
   if (b.prazo && !dataOk(b.prazo)) return erro(res, 400, 'Data limite inválida.');
   const campos = validarCampos(b.campos);
   const campos2 = { 'Escola': req.escola, 'Titulo': titulo, 'Descricao': txt(b.descricao, 2000), 'Preco': preco, 'Cor': COR_OK(b.cor) ? b.cor : '#0A64DC', 'Capa': capa,
-    'Nivel': nivel ? NIVEIS[nivel] : '', 'Vagas': Math.max(0, Math.round(num(b.vagas, 0))), 'Campos': JSON.stringify(campos), 'Mensagem Final': txt(b.mensagem, 600),
+    'Nivel': nivel ? NIVEIS[nivel] : '', 'Classe': CLASSES[nivel] && CLASSES[nivel].includes(b.classe) ? b.classe : '', 'Curso': (nivel === 'TEC' || nivel === 'SUP') && b.curso ? String(b.curso) : '', 'Ano Curso': (nivel === 'TEC' || nivel === 'SUP') && b.curso ? Math.max(1, Math.round(num(b.ano_curso, 1))) : 0,
+    'Vagas': Math.max(0, Math.round(num(b.vagas, 0))), 'Campos': JSON.stringify(campos), 'Mensagem Final': txt(b.mensagem, 600),
     'Contacto': txt(b.contacto, 40), 'WhatsApp': tel9(b.whatsapp).length === 9 ? tel9(b.whatsapp) : '', 'Activo': b.activo !== false };
   if (b.prazo) campos2['Prazo'] = new Date(b.prazo + 'T12:00:00Z').toISOString();
   let id = b.id ? String(b.id) : null;
@@ -4085,12 +4450,15 @@ app.post('/inscricao-online-matricular', exigeDireccao, rota(async (req, res) =>
       enc_nome: i['Telefone'] ? i['Encarregado Nome'] : '', enc_telefone: i['Telefone'] ? i['Encarregado Telefone'] : '' });
     r = { id: r.estudante, numero: r.numero, sms: r.sms ? 1 : 0 };
   } else {
-    if (!b.turma) return erro(res, 400, 'Escolha a turma.');
-    r = await matricularCore(req.escola, { nome: i['Nome'], turma: String(b.turma), nascimento: i['Nascimento'], telefone: i['Telefone'],
-      enc_nome: i['Encarregado Nome'], enc_telefone: i['Encarregado Telefone'], enc_email: i['Email'] });
+    // v5.27: a mesma matrícula do balcão — turma automática da classe pedida (ou a turma escolhida), documentos entregues online
+    const l = i['Link'] ? await obter('linkinscricao', i['Link']).catch(() => null) : null;
+    const nivel = String(b.nivel || CODIGO_NIVEL[(l && l['Nivel']) || ''] || '').toUpperCase();
+    r = await matricularCore(req.escola, { nome: i['Nome'], turma: b.turma ? String(b.turma) : '', nivel, classe: b.classe || i['Classe'], curso: b.curso_ensino || i['Curso'], ano: b.ano || i['Ano Curso'],
+      sexo: i['Sexo'], tipo: i['Tipo Matricula'] || 'nova', escola_anterior: i['Escola Anterior'], nascimento: i['Nascimento'], telefone: i['Telefone'],
+      enc_nome: i['Encarregado Nome'], enc_telefone: i['Encarregado Telefone'], enc_email: i['Email'], docs_atuais: lerJSON(i['Documentos'], {}), origem: 'online', quem: 'Inscrição online', forcar: !!b.forcar });
   }
   await mudar('inscricaoonline', i._id, { 'Estado': 'matriculada', 'Estudante': r.id || '', 'Numero': r.numero || '' });
-  res.json({ ok: true, numero: r.numero, sms: r.sms });
+  res.json({ ok: true, numero: r.numero, sms: r.sms, turma: r.turma, turma_criada: r.turma_criada, docs_completos: r.docs_completos });
 }));
 app.post('/inscricao-online-recusar', exigeDireccao, rota(async (req, res) => {
   const i = await daMinhaEscola('inscricaoonline', String((req.body || {}).id || ''), req.escola);
@@ -4111,8 +4479,10 @@ app.post('/pub/link', rota(async (req, res) => {
   if (travao('pub-link|' + req.ip, 60, 10)) return erro(res, 429, 'Muitos pedidos seguidos. Espere alguns minutos.');
   const { esc, l } = await linkDaEscola(b.escola, b.link);
   if (!esc || !l) return erro(res, 404, 'Este link de inscrição não existe. Confirme o endereço com a escola.');
-  const n = await contarInscritos(esc._id, l), sit = situacaoLink(l, n.validas);
-  res.json({ ok: true, escola: { nome: esc['Nome'] || '', logotipo: esc['Logotipo'] || '', telefone: esc['Telefone'] || '', email: esc['Email'] || '', morada: esc['Morada'] || '' },
+  const n = await contarInscritos(esc._id, l), sit0 = situacaoLink(l, n.validas), cfgM = configMatriculas(esc);
+  const sit = sit0.aberto && !cfgM.abertas ? { aberto: false, motivo: 'As matrículas desta escola estão fechadas de momento.' } : sit0;
+  const nvL = CODIGO_NIVEL[l['Nivel']] || '', cursosL = (nvL === 'TEC' || nvL === 'SUP') ? (await procurarTodos('curso', daEscola(esc._id)).catch(() => [])).filter(c => c['Activo'] !== false).map(c => ({ id: c._id, nome: c['Nome'], grau: c['Grau'] || '', duracao: Number(c['Duracao'] || 1) })) : [];
+  res.json({ ok: true, ano_lectivo: cfgM.ano, classes: CLASSES[nvL] || [], cursos: cursosL, docs: cfgM.docs, escola: { nome: esc['Nome'] || '', logotipo: esc['Logotipo'] || '', telefone: esc['Telefone'] || '', email: esc['Email'] || '', morada: esc['Morada'] || '' },
     link: linkOut(l), aberto: sit.aberto, motivo: sit.motivo || '', restantes: sit.restantes == null ? null : sit.restantes });
 }));
 async function confirmarInscricaoSMS(i, l, esc) {
@@ -4143,6 +4513,22 @@ app.post('/pub/inscrever', rota(async (req, res) => {
   if (b.nascimento && !dataOk(b.nascimento)) return erro(res, 400, 'Data de nascimento inválida.');
   const email = txt(b.email, 120).toLowerCase();
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return erro(res, 400, 'O email não parece válido.');
+  // v5.27: classe (ou curso e ano) pretendida, sexo, tipo de matrícula e documentos
+  const nvL = CODIGO_NIVEL[l['Nivel']] || '', cfgM = configMatriculas(esc);
+  if (!cfgM.abertas) return erro(res, 400, 'As matrículas desta escola estão fechadas de momento.');
+  let classeI = '', cursoI = '', anoI = 0;
+  if (CLASSES[nvL]) { classeI = l['Classe'] || classeNorm(nvL, b.classe); if (!CLASSES[nvL].includes(classeI)) return erro(res, 400, nvL === 'ESC' ? 'Escolha a sala (idade).' : 'Escolha a classe que o aluno vai frequentar.'); }
+  if (nvL === 'TEC' || nvL === 'SUP') {
+    cursoI = l['Curso'] || String(b.curso || '');
+    const c = cursoI ? await obter('curso', cursoI).catch(() => null) : null;
+    if (!c || c['Escola'] !== esc._id || c['Activo'] === false) return erro(res, 400, 'Escolha o curso.');
+    anoI = Number(l['Ano Curso']) || Math.round(num(b.ano_curso, 1)) || 1;
+    if (anoI < 1 || anoI > Number(c['Duracao'] || 1)) return erro(res, 400, 'Escolha o ano do curso.');
+  }
+  const tipoI = TIPOS_MAT[b.tipo] ? b.tipo : 'nova';
+  if (tipoI === 'transferencia' && txt(b.escola_anterior, 120).length < 3) return erro(res, 400, 'Escreva o nome da escola de onde vem transferido.');
+  const docsEnv = lerDocsEnviados(b.docs);
+  if (docsEnv.filter(d => d.ficheiro).length > 8) return erro(res, 400, 'Envie no máximo 8 documentos.');
   const respostas = {};
   for (const c of lerCampos(l['Campos'])) {
     let v = (b.respostas || {})[c.id];
@@ -4168,7 +4554,9 @@ app.post('/pub/inscrever', rota(async (req, res) => {
   const fmt = t => t ? t.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3') : '';
   const campos = { 'Escola': esc._id, 'Link': l._id, 'Nome': nome, 'Telefone': fmt(tel), 'Nascimento': b.nascimento || '', 'Encarregado Nome': (comEnc || encDado) ? txt(b.enc_nome, 100) : '',
     'Encarregado Telefone': (comEnc || encDado) ? fmt(telEnc) : '', 'Email': email, 'Respostas': JSON.stringify(respostas), 'Valor': preco, 'Metodo': preco ? metodo : 'gratis',
-    'Estado': preco ? 'pendente' : 'paga', 'Chave': chave };
+    'Estado': preco ? 'pendente' : 'paga', 'Chave': chave,
+    'Classe': classeI, 'Curso': cursoI, 'Ano Curso': anoI, 'Sexo': b.sexo === 'F' ? 'F' : b.sexo === 'M' ? 'M' : '', 'Tipo Matricula': tipoI, 'Escola Anterior': txt(b.escola_anterior, 120) };
+  if (docsEnv.length) campos['Documentos'] = JSON.stringify(await juntarDocs(esc._id, 'insc-' + chave.slice(0, 10), {}, docsEnv.filter(d => d.ficheiro).map(d => Object.assign(d, { entregue: true })), 'Inscrição online'));
   if (!preco) campos['Pago Em'] = new Date().toISOString();
   const id = await criar('inscricaoonline', campos);
   if (!preco) { const i = await obter('inscricaoonline', id); await confirmarInscricaoSMS(i, l, esc); return res.json({ ok: true, id, chave, estado: 'paga' }); }
@@ -4797,7 +5185,7 @@ app.post('/importar-estudantes', exigeDireccao, rota(async (req, res) => {
   const agora = new Date().toISOString();
   const lote = validas.map(v => {
     v.numero = ano + '-' + String(++maior).padStart(4, '0');
-    const c = { 'Escola': req.escola, 'Numero': v.numero, 'Nome': v.nome, 'Sexo': v.sexo || '', 'Turma': v.turma._id, 'Ano Lectivo': ano, 'Data Matricula': agora, 'Estado': 'activo' };
+    const c = { 'Escola': req.escola, 'Numero': v.numero, 'Nome': v.nome, 'Sexo': v.sexo || '', 'Turma': v.turma._id, 'Classe': v.turma['Classe'] || '', 'Curso': v.turma['Curso'] || '', 'Ano Curso': Number(v.turma['Ano Curso'] || 0), 'Tipo Matricula': 'nova', 'Origem': 'importacao', 'Ano Lectivo': ano, 'Data Matricula': agora, 'Estado': 'activo' };
     if (v.nasc) c['Data Nascimento'] = new Date(v.nasc + 'T12:00:00Z').toISOString();
     if (v.telE.length === 9) c['Telefone'] = v.telE.replace(/(\d{2})(\d{3})(\d{4})/, '$1 $2 $3');
     const eid = v.enc ? (v.enc.id || encId[v.enc.novo]) : null; if (eid) c['Encarregado'] = eid;
