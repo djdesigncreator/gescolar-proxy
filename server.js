@@ -32,6 +32,7 @@
 //    Escola de condução 1 (v5.0): /cursos /curso-guardar /curso-apagar /instruendos /inscrever /inscricao-estado
 //    Convites aos professores (v4.10): SMS automático ao registar · /professor-convite /professores-convite
 //    Palavra-passe e equipa (v4.9): /senha-pedir /senha-nova (código por SMS) · /equipa /equipa-criar /equipa-estado
+//    SMS e email (v5.25): /registo-codigo · /sms-saldo /sms-recarregar /sms-recarga-estado · /pl/sms-dar /pl/sms-recargas /pl/sms-aprovar
 //    Assinatura e plataforma (v4.8): /assinatura /assinatura-pagar /assinatura-estado · /pl/resumo /pl/escola /pl/escola-guardar
 //                                    /pl/transferencia /pl/transferencia-apagar  (PLATAFORMA_EMAILS)
 //    Painel (v4.7): /painel-indicadores — dinheiro, chamadas de hoje, faltas, notas por trimestre
@@ -49,7 +50,7 @@
 const express = require('express');
 const crypto = require('crypto');
 
-const VERSAO = 'gescolar-proxy 5.23.1';
+const VERSAO = 'gescolar-proxy 5.26.0';
 const PORT = process.env.PORT || 8080;
 const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
 const BUBBLE_WF = BUBBLE_BASE.replace(/\/obj$/, '/wf');
@@ -156,7 +157,24 @@ function verificar(token) {
 }
 function sessaoDo(req) {
   const h = req.headers.authorization || '';
-  return verificar(h.startsWith('Bearer ') ? h.slice(7) : '');
+  const s = verificar(h.startsWith('Bearer ') ? h.slice(7) : '');
+  if (s) try { marcarPresenca(s); } catch (e) {}
+  return s;
+}
+// ---------- presença (v5.24): quem está a usar o Gescolar agora (em memória; recomeça quando o servidor reinicia) ----------
+const PRESENCA = new Map();   // escolaId → Map('Papel:userId' → ms)
+const ONLINE_MIN = 5;         // conta como «online» quem fez algum pedido nos últimos 5 minutos
+function marcarPresenca(s) {
+  if (!s || !s.e) return;
+  let m = PRESENCA.get(s.e); if (!m) { m = new Map(); PRESENCA.set(s.e, m); }
+  m.set(String(s.p || '') + ':' + String(s.u || ''), Date.now());
+  if (m.size > 3000) { const lim = Date.now() - 864e5; for (const [k, t] of m) if (t < lim) m.delete(k); }
+}
+function presencaDe(escolaId) {
+  const m = PRESENCA.get(escolaId), lim = Date.now() - ONLINE_MIN * 60e3, papeis = {};
+  let online = 0, ultimo = 0;
+  if (m) for (const [k, t] of m) { if (t > ultimo) ultimo = t; if (t >= lim) { online++; const p = k.split(':')[0] || 'Outro'; papeis[p] = (papeis[p] || 0) + 1; } }
+  return { online, papeis, ultimo: ultimo ? new Date(ultimo).toISOString() : null };
 }
 // para as rotas seguintes (pautas, propinas…): exige sessão válida
 function exigeSessao(req, res, next) {
@@ -192,7 +210,7 @@ async function resumoEscola(id) {
   return {
     id: e._id, nome: e['Nome'], subdominio: e['Subdominio'], estado: e['Estado'], plano: e['Plano'],
     niveis: (e['Niveis'] || []).map(n => CODIGO_NIVEL[n] || n), ano: e['Ano Lectivo'], teste_ate: e['Teste Ate'] || null, valida_ate: e['Valida Ate'] || null,
-    situacao: situacaoEscola(e),
+    situacao: situacaoEscola(e), sms: creditosDe(e),
     regras: { dia_limite: e['Dia Limite'], multa: e['Multa Percent'], multa_max: e['Multa Max'], aprovacao: e['Nota Aprovacao'], dispensa: e['Nota Dispensa'], formula: e['Formula Media'], admissao: e['Nota Admissao'], peso_exame: e['Peso Exame'] }
   };
 }
@@ -214,6 +232,41 @@ async function abrirSessao(userId, pl) {
 app.get('/', (req, res) => {
   res.json({ ok: true, versao: VERSAO, bubble: BUBBLE_BASE && BUBBLE_TOKEN ? 'configurado' : 'em falta', sessoes: SESSION_SECRET.length >= 32 ? 'configurado' : 'em falta', mozpayment: (process.env.MOZ_EMAIL && process.env.MOZ_SENHA && process.env.MOZ_WALLET) ? 'configurado' : 'em falta', c2b: MOZ_C2B_MODO === 'checkout' ? 'checkout ' + MOZ_C2B_PATH : 'directo (antigo)', b2c: MOZ_B2C_MODO === 'payout' ? MOZ_PAYOUT_PATH : 'antigo', webhook: process.env.MOZ_WEBHOOK_KEY ? 'configurado' : 'em falta', sms: (process.env.SMS_TOKEN && process.env.SMS_ORIGEM) ? 'configurado' : 'em falta', email: (RESEND_KEY && MAIL_FROM) ? 'resend' : 'bubble (workflow enviar-email)', ia: process.env.OPENAI_API_KEY ? 'configurado' : 'em falta', aulas_gravadas: STREAM_OK ? 'configurado' : 'em falta', aulas_ao_vivo: AGORA_OK ? 'configurado' : 'em falta', ficheiros: BUNNY_OK ? ('bunny' + (CDN_TOKEN_KEY ? ' com links que expiram' : ' SEM CDN_TOKEN_KEY')) : 'bubble', hora: new Date().toISOString() });
 });
+
+// ============================================================
+//  v5.25: confirmar o email antes de criar a escola
+//  POST /registo-codigo { email, nome }  → envia um código de 6 dígitos por email (Resend) e devolve { pedido }
+//  O /registo passa a exigir { pedido, codigo }. Render: REGISTO_CONFIRMAR_EMAIL=nao desliga a confirmação.
+// ============================================================
+const REGISTO_CONFIRMAR = String(process.env.REGISTO_CONFIRMAR_EMAIL || 'sim').toLowerCase() !== 'nao';
+app.post('/registo-codigo', rota(async (req, res) => {
+  const b = req.body || {}, email = txt(b.email, 120).toLowerCase(), nome = txt(b.nome, 120);
+  if (!emailOk(email)) return erro(res, 400, 'Escreva um email válido.');
+  if (travao('reg-cod-ip|' + req.ip, 10, 30) || travao('reg-cod|' + email, 4, 30)) return erro(res, 429, 'Já enviámos vários códigos. Espere alguns minutos e tente de novo.');
+  if (await userPorEmail(email)) return erro(res, 409, 'Este email já tem conta no Gescolar. Use «Entrar» ou outro email.');
+  const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0'), pedido = crypto.randomBytes(16).toString('hex');
+  const primeiro = nome ? nome.split(/\s+/)[0] : '';
+  const blocos = [{ p: (primeiro ? 'Olá, ' + primeiro + '!' : 'Olá!') + ' Está quase a criar a sua escola no Gescolar.' }, { p: 'Escreva este código na página do registo para confirmar o seu email:' }, { codigo },
+    { nota: 'O código vale 15 minutos. Se não foi você que pediu, pode ignorar este email: nenhuma conta é criada sem o código.' }];
+  const m = await enviarEmail(email, 'Gescolar: o seu código é ' + codigo, emailGescolar('', 'Confirme o seu email', blocos), textoDeBlocos('Confirme o seu email', blocos));
+  if (!m.ok) return erro(res, 502, 'Não foi possível enviar o email agora. Confirme o endereço e tente de novo dentro de um minuto.');
+  pedidosAcesso.set(pedido, { tipo: 'registo', email, hash: hashCodigo(pedido + codigo), exp: Date.now() + 900e3, tent: 0 });
+  res.json({ ok: true, pedido, destino: mascararEmail(email) });
+}));
+function confirmarRegisto(b, email) {
+  if (!REGISTO_CONFIRMAR) return null;
+  if (!b.pedido) return { st: 400, msg: 'Confirme primeiro o seu email: carregue em «Criar a escola» para receber o código.' };
+  const pd = pedidosAcesso.get(String(b.pedido || ''));
+  if (!pd || pd.tipo !== 'registo' || pd.exp < Date.now()) return { st: 410, msg: 'O código expirou. Peça um novo.' };
+  if (pd.email !== email) return { st: 400, msg: 'O código foi enviado para outro email. Peça um novo.' };
+  if (pd.ok) return null;
+  pd.tent++;
+  if (pd.tent > 5) { pedidosAcesso.delete(String(b.pedido)); return { st: 410, msg: 'Demasiadas tentativas. Peça um novo código.' }; }
+  const cod = soDigitos(b.codigo), a = Buffer.from(hashCodigo(String(b.pedido) + cod)), c = Buffer.from(pd.hash);
+  if (cod.length !== 6 || a.length !== c.length || !crypto.timingSafeEqual(a, c)) return { st: 401, msg: 'Código errado (' + (5 - pd.tent) + ' tentativas restantes).' };
+  pd.ok = true;   // fica válido até a escola ser criada (se faltar outro dado, não é preciso pedir outro código)
+  return null;
+}
 
 // ============================================================
 //  POST /registo
@@ -240,7 +293,11 @@ app.post('/registo', async (req, res) => {
     if (nuit.length !== 9) return erro(res, 400, 'O NUIT tem 9 dígitos.');
     if (!PROVINCIAS.includes(provincia)) return erro(res, 400, 'Escolha a província.');
     if (!niveis.length) return erro(res, 400, 'Escolha pelo menos um tipo de ensino.');
+    const nvErro = niveisValidos(niveis);   // v5.26
+    if (nvErro) return erro(res, 400, nvErro);
     if (adminNome.split(/\s+/).length < 2) return erro(res, 400, 'Escreva o nome completo do administrador.');
+    const conf = confirmarRegisto(b, email);   // v5.25: o email tem de ser confirmado com o código
+    if (conf) return erro(res, conf.st, conf.msg);
 
     // NUIT repetido? (antes de criar a conta, para não deixar contas soltas)
     const mesmoNuit = await procurar('escola', [{ key: 'NUIT', constraint_type: 'equals', value: nuit }], 1);
@@ -271,12 +328,13 @@ app.post('/registo', async (req, res) => {
       'Telefone': txt(b.telefone, 30), 'Email': txt(b.email_escola || email, 120), 'Subdominio': sub,
       'Niveis': niveis.map(k => NIVEIS[k]), 'Plano': plano, 'Estado': 'teste', 'Teste Ate': testeAte.toISOString(),
       'Ano Lectivo': String(hoje.getFullYear()), 'Dia Limite': 10, 'Multa Percent': 10, 'Multa Max': 25,
-      'Nota Aprovacao': 10, 'Nota Dispensa': 14, 'Formula Media': 'MT = (2 x MACS + ACP) / 3'
+      'Nota Aprovacao': 10, 'Nota Dispensa': 14, 'Formula Media': 'MT = (2 x MACS + ACP) / 3', 'SMS Creditos': SMS_INICIAIS, 'SMS Usados': 0
     });
 
     // 4. ligar a conta à escola como Direcção
     await mudar('user', userId, { 'Escola': escolaId, 'Papel': 'Direccao', 'Nome Completo': adminNome, 'Telefone': txt(b.admin_tel, 30), 'Activo': true });
 
+    if (b.pedido) pedidosAcesso.delete(String(b.pedido));
     const s = await abrirSessao(userId);
     s.subdominio = sub; s.teste_ate = testeAte.toISOString().slice(0, 10); s.acesso = linkFamilias(sub);
     // SMS de boas-vindas ao director com o código da escola e os links
@@ -374,11 +432,103 @@ function rota(fn) {
 const num = (v, def) => { const n = Number(v); return isFinite(n) ? n : def; };
 
 // ---------- currículo modelo (a escola ajusta depois) ----------
-const CURRICULO = {
+const CURRICULO = {   // [nome, sigla, cor, tempos por semana, classes (vazio = todas as classes do nível)]
   ESC: [['Linguagem e comunicação', 'LNG', '#0A64DC', 6], ['Matemática lúdica', 'MLU', '#C2410C', 5], ['Expressão plástica', 'EXP', '#9B3FB5', 5], ['Música e movimento', 'MUS', '#7B4DD6', 5], ['Conhecimento do mundo', 'NAT', '#168A52', 5], ['Brincadeira livre', 'BRI', '#8A6D00', 4]],
-  PRI: [['Português', 'POR', '#0A64DC', 7], ['Matemática', 'MAT', '#C2410C', 7], ['Ciências Naturais', 'CN', '#168A52', 4], ['Ciências Sociais', 'CS', '#8A6D00', 4], ['Inglês', 'ING', '#7B4DD6', 2], ['Educação Visual', 'EV', '#9B3FB5', 2], ['Educação Física', 'EF', '#3E7D1E', 2], ['Ofícios', 'OF', '#6B4E2E', 2]],
-  SEC: [['Português', 'POR', '#0A64DC', 5], ['Matemática', 'MAT', '#C2410C', 5], ['Inglês', 'ING', '#7B4DD6', 3], ['Física', 'FIS', '#0E7C86', 3], ['Química', 'QUI', '#B4235A', 3], ['Biologia', 'BIO', '#168A52', 3], ['Geografia', 'GEO', '#8A6D00', 2], ['História', 'HIS', '#6B4E2E', 2], ['Educação Física', 'E.FÍS', '#3E7D1E', 2], ['Educação Visual', 'E.VIS', '#9B3FB5', 1], ['TIC', 'TIC', '#0B2A4A', 1], ['Filosofia', 'FIL', '#5A4FCF', 2], ['Francês', 'FRA', '#0E5FA8', 2]]
+  PRI: [['Português', 'POR', '#0A64DC', 7], ['Matemática', 'MAT', '#C2410C', 7], ['Educação Física', 'EF', '#3E7D1E', 2],
+        ['Ciências Naturais', 'CN', '#168A52', 4, ['4ª', '5ª', '6ª']], ['Ciências Sociais', 'CS', '#8A6D00', 4, ['4ª', '5ª', '6ª']], ['Inglês', 'ING', '#7B4DD6', 2, ['4ª', '5ª', '6ª']],
+        ['Educação Visual', 'EV', '#9B3FB5', 2, ['4ª', '5ª', '6ª']], ['Ofícios', 'OF', '#6B4E2E', 2, ['4ª', '5ª', '6ª']]],
+  SEC: [['Português', 'POR', '#0A64DC', 5], ['Matemática', 'MAT', '#C2410C', 5], ['Inglês', 'ING', '#7B4DD6', 3], ['Física', 'FIS', '#0E7C86', 3], ['Química', 'QUI', '#B4235A', 3], ['Biologia', 'BIO', '#168A52', 3],
+        ['Geografia', 'GEO', '#8A6D00', 2], ['História', 'HIS', '#6B4E2E', 2], ['Educação Física', 'E.FÍS', '#3E7D1E', 2],
+        ['Educação Visual', 'E.VIS', '#9B3FB5', 1, ['7ª', '8ª', '9ª']], ['TIC', 'TIC', '#0B2A4A', 1, ['7ª', '8ª', '9ª']], ['Agro-pecuária', 'AGP', '#4D7C0F', 2, ['7ª', '8ª', '9ª']],
+        ['Filosofia', 'FIL', '#5A4FCF', 2, ['10ª', '11ª', '12ª']], ['Francês', 'FRA', '#0E5FA8', 2, ['10ª', '11ª', '12ª']], ['Desenho e Geometria Descritiva', 'DGD', '#A16207', 3, ['10ª', '11ª', '12ª']]]
 };
+// ---------- estrutura das escolas segundo o Sistema Nacional de Educação (v5.26) ----------
+//  Escolinha → salas por idade → turmas · Primário (1ª–6ª: 1º ciclo 1ª–3ª, 2º ciclo 4ª–6ª) → classes → turmas
+//  Secundário (ESG1 7ª–9ª, ESG2 10ª–12ª com áreas) → classes → turmas
+//  Técnico-profissional e Superior → cursos → ano → turmas
+//  Bubble: tabela nova «Curso»: Escola (Escola) · Nome · Sigla · Nivel · Grau · Area (text) · Duracao (number) · Propina Mensal (number) · Coordenador (text) · Activo (yes/no)
+//          Turma + «Curso» (text) · «Ano Curso» (number) · «Area» (text)
+//          Disciplina + «Classes» (list of texts) · «Curso» (text) · «Ano Curso» (number) · «Semestre» (number) · «Horas» (number) · «Tipo» (text)
+const CLASSES = {
+  ESC: ['Berçário', '3 anos', '4 anos', '5 anos'],
+  PRI: ['1ª', '2ª', '3ª', '4ª', '5ª', '6ª'],
+  SEC: ['7ª', '8ª', '9ª', '10ª', '11ª', '12ª']
+};
+// turmas antigas: «10ª Classe», «10» ou «10a» passam a «10ª»
+function classeNorm(nivel, classe) {
+  const c = String(classe || '').trim();
+  if (!CLASSES[nivel] || CLASSES[nivel].includes(c)) return c;
+  const n = parseInt(c, 10), k = n + 'ª';
+  return isFinite(n) && CLASSES[nivel].includes(k) ? k : c;
+}
+function cicloDe(nivel, classe) {
+  const n = parseInt(classe, 10);
+  if (nivel === 'PRI') return n <= 3 ? '1º ciclo' : '2º ciclo';
+  if (nivel === 'SEC') return n <= 9 ? 'ESG1 · 1º ciclo' : 'ESG2 · 2º ciclo';
+  return '';
+}
+const AREAS_ESG2 = ['Comunicação e Ciências Sociais', 'Matemática e Ciências Naturais', 'Artes Visuais e Cénicas'];
+const GRAUS = {
+  TEC: [{ g: 'Básico', anos: 3, d: 'Depois da 6ª/7ª classe' }, { g: 'Médio', anos: 3, d: 'Depois da 9ª/10ª classe ou do básico' },
+        { g: 'CV3', anos: 1, d: 'Certificado Vocacional 3 (QNQP)' }, { g: 'CV4', anos: 1, d: 'Certificado Vocacional 4 (QNQP)' }, { g: 'CV5', anos: 1, d: 'Certificado Vocacional 5 (QNQP)' }],
+  SUP: [{ g: 'Licenciatura', anos: 4, d: '1º ciclo · 180 a 240 créditos' }, { g: 'Mestrado', anos: 2, d: '2º ciclo' }, { g: 'Doutoramento', anos: 3, d: '3º ciclo' }, { g: 'Pós-graduação', anos: 1, d: 'Curso de curta duração' }]
+};
+const TIPOS_MODULO = ['Geral', 'Vocacional', 'Específico', 'Estágio'];
+const ESTRUTURA = { classes: CLASSES, areas: AREAS_ESG2, graus: GRAUS, tipos_modulo: TIPOS_MODULO };
+// Escolinha, Primário e Secundário podem juntar-se na mesma escola; Técnico, Superior e Condução ficam sempre sozinhos
+const SOZINHOS = ['TEC', 'SUP', 'CON'];
+const SO_NOME = { TEC: 'O ensino técnico-profissional', SUP: 'O ensino superior', CON: 'A escola de condução' };
+function niveisValidos(niveis) {
+  const s = niveis.filter(k => SOZINHOS.includes(k));
+  if (s.length && niveis.length > 1) return SO_NOME[s[0]] + ' não se junta a outros tipos de ensino. Escolha só esse tipo, ou crie outra conta para os restantes.';
+  return null;
+}
+const cursoEnsinoOut = c => ({ id: c._id, nome: c['Nome'] || '', sigla: c['Sigla'] || '', nivel: CODIGO_NIVEL[c['Nivel']] || c['Nivel'] || '', grau: c['Grau'] || '', area: c['Area'] || '',
+  duracao: Number(c['Duracao'] || 0) || 1, propina: Number(c['Propina Mensal'] || 0), coordenador: c['Coordenador'] || '' });
+app.post('/ensino-cursos', exigeDireccao, rota(async (req, res) => {
+  const f = daEscola(req.escola);
+  const [cs, ts] = await Promise.all([procurarTodos('curso', f).catch(() => []), procurarTodos('turma', f)]);
+  res.json({ ok: true, estrutura: ESTRUTURA, cursos: cs.filter(c => c['Activo'] !== false).map(c => Object.assign(cursoEnsinoOut(c), { turmas: ts.filter(t => t['Activa'] !== false && t['Curso'] === c._id).length }))
+    .sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+}));
+app.post('/ensino-curso-guardar', exigeDireccao, rota(async (req, res) => {
+  const b = req.body || {}, nivel = String(b.nivel || '').toUpperCase(), nome = txt(b.nome, 100);
+  if (!['TEC', 'SUP'].includes(nivel)) return erro(res, 400, 'Os cursos são do ensino técnico-profissional ou do ensino superior.');
+  const escola = await resumoEscola(req.escola);
+  if (escola && escola.niveis.length && !escola.niveis.includes(nivel)) return erro(res, 400, 'Esta escola não tem esse tipo de ensino.');
+  if (nome.length < 3) return erro(res, 400, 'Escreva o nome do curso, por exemplo «Contabilidade e Gestão».');
+  const grau = (GRAUS[nivel].find(g => g.g === b.grau) || {}).g;
+  if (!grau) return erro(res, 400, 'Escolha o nível do curso (' + GRAUS[nivel].map(g => g.g).join(', ') + ').');
+  const dur = Math.round(num(b.duracao, 0));
+  if (dur < 1 || dur > 7) return erro(res, 400, 'A duração do curso vai de 1 a 7 anos.');
+  const campos = { 'Escola': req.escola, 'Nome': nome, 'Sigla': (txt(b.sigla, 10) || nome.split(/\s+/).filter(p => p.length > 2).map(p => p[0]).join('').slice(0, 5)).toUpperCase(),
+    'Nivel': NIVEIS[nivel], 'Grau': grau, 'Area': txt(b.area, 80), 'Duracao': dur, 'Propina Mensal': Math.max(0, num(b.propina, 0)), 'Coordenador': txt(b.coordenador, 40), 'Activo': true };
+  let id = b.id ? String(b.id) : null;
+  if (id) {
+    await daMinhaEscola('curso', id, req.escola);
+    const ts = await procurarTodos('turma', [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Curso', constraint_type: 'equals', value: id }]);
+    const maior = Math.max(0, ...ts.filter(t => t['Activa'] !== false).map(t => Number(t['Ano Curso'] || 0)));
+    if (maior > dur) return erro(res, 400, 'Há turmas no ' + maior + 'º ano. A duração não pode ser menor do que ' + maior + ' anos.');
+    await mudar('curso', id, campos);
+  } else id = await criar('curso', campos);
+  res.json({ ok: true, id });
+}));
+app.post('/ensino-curso-apagar', exigeDireccao, rota(async (req, res) => {
+  const id = String((req.body || {}).id || '');
+  await daMinhaEscola('curso', id, req.escola);
+  const ts = await procurarTodos('turma', [{ key: 'Escola', constraint_type: 'equals', value: req.escola }, { key: 'Curso', constraint_type: 'equals', value: id }]);
+  if (ts.some(t => t['Activa'] !== false)) return erro(res, 409, 'O curso tem turmas. Apague ou mude as turmas antes de apagar o curso.');
+  await mudar('curso', id, { 'Activo': false });
+  res.json({ ok: true });
+}));
+// disciplina serve esta turma? (geral: pela classe; técnico e superior: pelo curso e ano)
+function discServeTurma(d, t) {
+  if (d['Nivel'] !== t['Nivel'] || d['Activa'] === false) return false;
+  if (t['Curso']) return d['Curso'] === t['Curso'] && (!Number(d['Ano Curso']) || Number(d['Ano Curso']) === Number(t['Ano Curso'] || 0));
+  const cl = d['Classes'] || [], tc = classeNorm(CODIGO_NIVEL[t['Nivel']] || t['Nivel'], t['Classe']);
+  return !cl.length || !tc || cl.includes(tc);
+}
+
 
 // ---------- painel: contadores e estado do arranque ----------
 app.post('/painel', exigeDireccao, rota(async (req, res) => {
@@ -405,14 +555,15 @@ app.post('/painel', exigeDireccao, rota(async (req, res) => {
 
 // ---------- turmas ----------
 function turmaOut(t, estudantes) {
-  return { id: t._id, nome: t['Nome'], codigo: t['Codigo'] || '', nivel: CODIGO_NIVEL[t['Nivel']] || t['Nivel'] || '', classe: t['Classe'] || '', turno: t['Turno'] || '',
+  const nv = CODIGO_NIVEL[t['Nivel']] || t['Nivel'] || '', cl = classeNorm(nv, t['Classe']);
+  return { id: t._id, nome: t['Nome'], codigo: t['Codigo'] || '', nivel: nv, classe: cl, ciclo: cicloDe(nv, cl), curso: t['Curso'] || '', ano_curso: Number(t['Ano Curso'] || 0) || null, area: t['Area'] || '', turno: t['Turno'] || '',
     sala: t['Sala'] || '', capacidade: t['Capacidade'] || 0, propina: t['Propina Mensal'] || 0, director: t['Director Turma'] || null, titular: t['Professor Titular'] || null, disciplinas: t['Disciplinas'] || [],
     estudantes: estudantes ? estudantes.filter(e => e['Turma'] === t._id && (e['Estado'] || 'activo') === 'activo').length : undefined };
 }
 app.post('/turmas', exigeDireccao, rota(async (req, res) => {
   const f = daEscola(req.escola);
   const [turmas, estudantes] = await Promise.all([procurarTodos('turma', f), procurarTodos('estudante', f)]);
-  res.json({ ok: true, turmas: turmas.filter(t => t['Activa'] !== false).map(t => turmaOut(t, estudantes)).sort((a, b) => a.nome.localeCompare(b.nome, 'pt')) });
+  res.json({ ok: true, estrutura: ESTRUTURA, turmas: turmas.filter(t => t['Activa'] !== false).map(t => turmaOut(t, estudantes)).sort((a, b) => a.nome.localeCompare(b.nome, 'pt', { numeric: true })) });
 }));
 app.post('/turma-guardar', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {};
@@ -421,13 +572,28 @@ app.post('/turma-guardar', exigeDireccao, rota(async (req, res) => {
   if (!NIVEIS[nivel]) return erro(res, 400, 'Escolha o nível de ensino da turma.');
   const escola = await resumoEscola(req.escola);
   if (escola && escola.niveis.length && !escola.niveis.includes(nivel)) return erro(res, 400, 'Esta escola não tem o nível escolhido. Acrescente-o nas Definições.');
+  // v5.26: ensino geral → classe (e área no ESG2); técnico e superior → curso e ano
+  let classe = txt(b.classe, 40), curso = null, ano = null, area = '';
+  if (CLASSES[nivel]) {
+    if (!CLASSES[nivel].includes(classe)) return erro(res, 400, nivel === 'ESC' ? 'Escolha a sala (idade).' : 'Escolha a classe da turma.');
+    if (nivel === 'SEC' && parseInt(classe, 10) >= 10 && b.area) { area = AREAS_ESG2.includes(b.area) ? b.area : ''; if (!area) return erro(res, 400, 'Área inválida.'); }
+  } else if (nivel === 'TEC' || nivel === 'SUP') {
+    curso = await daMinhaEscola('curso', String(b.curso || ''), req.escola).catch(() => null);
+    if (!curso || curso['Activo'] === false || curso['Nivel'] !== NIVEIS[nivel]) return erro(res, 400, 'Escolha o curso da turma.');
+    ano = Math.round(num(b.ano, 0));
+    const dur = Number(curso['Duracao'] || 1);
+    if (ano < 1 || ano > dur) return erro(res, 400, 'O curso ' + curso['Nome'] + ' tem ' + dur + ' ano(s). Escolha um ano de 1 a ' + dur + '.');
+    classe = ano + 'º ano';
+  }
   let discs = Array.isArray(b.disciplinas) ? b.disciplinas.map(String) : null;
-  if (!discs) { // por defeito: todas as disciplinas activas do mesmo nível
+  if (!discs) { // por defeito: as disciplinas da classe (ou do curso e ano)
     const todas = await procurarTodos('disciplina', daEscola(req.escola));
-    discs = todas.filter(d => d['Nivel'] === NIVEIS[nivel] && d['Activa'] !== false).map(d => d._id);
+    const tv = { 'Nivel': NIVEIS[nivel], 'Classe': classe, 'Curso': curso ? curso._id : '', 'Ano Curso': ano };
+    discs = todas.filter(d => discServeTurma(d, tv)).map(d => d._id);
   }
   const campos = { 'Escola': req.escola, 'Nome': nome, 'Codigo': txt(b.codigo, 20) || slug(nome).toUpperCase().replace(/-/g, '').slice(0, 8), 'Nivel': NIVEIS[nivel],
-    'Classe': txt(b.classe, 40), 'Turno': txt(b.turno, 20) || 'Manhã', 'Sala': txt(b.sala, 40), 'Capacidade': num(b.capacidade, 40), 'Propina Mensal': num(b.propina, 0),
+    'Classe': classe, 'Curso': curso ? curso._id : '', 'Ano Curso': ano || 0, 'Area': area, 'Turno': txt(b.turno, 20) || 'Manhã', 'Sala': txt(b.sala, 40), 'Capacidade': num(b.capacidade, 40),
+    'Propina Mensal': (b.propina === '' || b.propina == null) && curso ? Number(curso['Propina Mensal'] || 0) : num(b.propina, 0),
     'Ano Lectivo': (escola && escola.ano) || String(new Date().getFullYear()), 'Disciplinas': discs, 'Activa': true };
   if (b.director) campos['Director Turma'] = String(b.director);
   if (b.titular !== undefined) {
@@ -450,10 +616,10 @@ app.post('/turma-apagar', exigeDireccao, rota(async (req, res) => {
 }));
 
 // ---------- disciplinas ----------
-const discOut = d => ({ id: d._id, nome: d['Nome'], sigla: d['Sigla'] || '', cor: d['Cor'] || '#0A64DC', nivel: CODIGO_NIVEL[d['Nivel']] || d['Nivel'] || '', carga: d['Carga Semanal'] || 0, creditos: d['Creditos'] || 0, descritiva: !!d['Avaliacao Descritiva'] });
+const discOut = d => ({ id: d._id, classes: d['Classes'] || [], curso: d['Curso'] || '', ano_curso: Number(d['Ano Curso'] || 0) || null, semestre: Number(d['Semestre'] || 0) || null, horas: Number(d['Horas'] || 0), tipo: d['Tipo'] || '', nome: d['Nome'], sigla: d['Sigla'] || '', cor: d['Cor'] || '#0A64DC', nivel: CODIGO_NIVEL[d['Nivel']] || d['Nivel'] || '', carga: d['Carga Semanal'] || 0, creditos: d['Creditos'] || 0, descritiva: !!d['Avaliacao Descritiva'] });
 app.post('/disciplinas', exigeDireccao, rota(async (req, res) => {
   const l = await procurarTodos('disciplina', daEscola(req.escola));
-  res.json({ ok: true, disciplinas: l.filter(d => d['Activa'] !== false).map(discOut).sort((a, b) => (a.nivel + a.nome).localeCompare(b.nivel + b.nome, 'pt')) });
+  res.json({ ok: true, estrutura: ESTRUTURA, disciplinas: l.filter(d => d['Activa'] !== false).map(discOut).sort((a, b) => (a.nivel + a.nome).localeCompare(b.nivel + b.nome, 'pt')) });
 }));
 app.post('/disciplina-guardar', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {}, nivel = String(b.nivel || '').toUpperCase(), nome = txt(b.nome, 60);
@@ -461,9 +627,25 @@ app.post('/disciplina-guardar', exigeDireccao, rota(async (req, res) => {
   if (!NIVEIS[nivel]) return erro(res, 400, 'Escolha o nível.');
   const campos = { 'Escola': req.escola, 'Nome': nome, 'Sigla': txt(b.sigla, 8).toUpperCase() || nome.slice(0, 3).toUpperCase(), 'Cor': /^#[0-9a-f]{6}$/i.test(b.cor || '') ? b.cor : '#0A64DC',
     'Nivel': NIVEIS[nivel], 'Carga Semanal': num(b.carga, 2), 'Creditos': num(b.creditos, 0), 'Avaliacao Descritiva': nivel === 'ESC' ? true : !!b.descritiva, 'Activa': true };
-  let id = b.id ? String(b.id) : null;
+  // v5.26: ensino geral → classes onde se dá; técnico e superior → curso, ano (e semestre no superior)
+  if (CLASSES[nivel]) campos['Classes'] = Array.isArray(b.classes) ? [...new Set(b.classes.map(String))].filter(c => CLASSES[nivel].includes(c)) : [];
+  if (nivel === 'TEC' || nivel === 'SUP') {
+    const c = await daMinhaEscola('curso', String(b.curso || ''), req.escola).catch(() => null);
+    if (!c || c['Activo'] === false || c['Nivel'] !== NIVEIS[nivel]) return erro(res, 400, nivel === 'TEC' ? 'Escolha o curso deste módulo.' : 'Escolha o curso desta cadeira.');
+    const ano = Math.round(num(b.ano, 0)), dur = Number(c['Duracao'] || 1);
+    if (ano < 1 || ano > dur) return erro(res, 400, 'Escolha o ano (1 a ' + dur + ').');
+    campos['Curso'] = c._id; campos['Ano Curso'] = ano;
+    if (nivel === 'SUP') { const sm = Math.round(num(b.semestre, 0)); if (![1, 2].includes(sm)) return erro(res, 400, 'Escolha o semestre (1º ou 2º).'); campos['Semestre'] = sm; }
+    if (nivel === 'TEC') { campos['Horas'] = Math.max(0, Math.round(num(b.horas, 0))); campos['Tipo'] = TIPOS_MODULO.includes(b.tipo) ? b.tipo : 'Vocacional'; }
+  }
+  let id = b.id ? String(b.id) : null, novo = !id;
   if (id) { await daMinhaEscola('disciplina', id, req.escola); await mudar('disciplina', id, campos); }
   else id = await criar('disciplina', campos);
+  // nova disciplina entra logo nas turmas que a usam
+  if (novo) {
+    const ts = (await procurarTodos('turma', daEscola(req.escola))).filter(t => t['Activa'] !== false && discServeTurma(campos, t) && !(t['Disciplinas'] || []).includes(id));
+    for (const t of ts) await mudar('turma', t._id, { 'Disciplinas': [...(t['Disciplinas'] || []), id] }).catch(() => {});
+  }
   res.json({ ok: true, id });
 }));
 app.post('/disciplina-apagar', exigeDireccao, rota(async (req, res) => {
@@ -478,9 +660,12 @@ app.post('/disciplinas-modelo', exigeDireccao, rota(async (req, res) => {
   if (!CURRICULO[nivel]) return erro(res, 400, 'Não há modelo para este nível. Crie as disciplinas uma a uma.');
   const existentes = (await procurarTodos('disciplina', daEscola(req.escola))).filter(d => d['Nivel'] === NIVEIS[nivel] && d['Activa'] !== false).map(d => String(d['Nome']).toLowerCase());
   let criadas = 0;
-  for (const [nome, sigla, cor, carga] of CURRICULO[nivel]) {
+  const ts = (await procurarTodos('turma', daEscola(req.escola))).filter(t => t['Activa'] !== false && t['Nivel'] === NIVEIS[nivel]);
+  for (const [nome, sigla, cor, carga, classes] of CURRICULO[nivel]) {
     if (existentes.includes(nome.toLowerCase())) continue;
-    await criar('disciplina', { 'Escola': req.escola, 'Nome': nome, 'Sigla': sigla, 'Cor': cor, 'Nivel': NIVEIS[nivel], 'Carga Semanal': carga, 'Avaliacao Descritiva': nivel === 'ESC', 'Activa': true });
+    const campos = { 'Escola': req.escola, 'Nome': nome, 'Sigla': sigla, 'Cor': cor, 'Nivel': NIVEIS[nivel], 'Carga Semanal': carga, 'Avaliacao Descritiva': nivel === 'ESC', 'Classes': classes || [], 'Activa': true };
+    const id = await criar('disciplina', campos);
+    for (const t of ts) if (discServeTurma(campos, t)) { t['Disciplinas'] = [...(t['Disciplinas'] || []), id]; await mudar('turma', t._id, { 'Disciplinas': t['Disciplinas'] }).catch(() => {}); }
     criadas++;
   }
   res.json({ ok: true, criadas });
@@ -573,12 +758,12 @@ async function matricularCore(escolaId, b) {
   if (esc) {
     const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = turma['Nome'] || '';
     if (telEst) {
-      const r = await enviarSMS([telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
+      const r = await smsEscola(escolaId, [telEst], en + ': ' + (superior ? 'bem-vindo(a), ' + nome.split(/\s+/)[0] + '. Esta inscrito(a) em ' : nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + numero +
         '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + numero + ').').catch(() => ({ ok: false }));
       if (r.ok) sms++;
     }
     if (encTel && encTel !== telEst) {
-      const r = await enviarSMS([encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
+      const r = await smsEscola(escolaId, [encTel], en + ': ' + nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + numero +
         '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => ({ ok: false }));
       if (r.ok) sms++;
     }
@@ -869,15 +1054,26 @@ const MAIL_FROM = (process.env.MAIL_FROM || '').trim();
 const RESEND_URL = process.env.RESEND_URL || 'https://api.resend.com/emails';
 const escH = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // corpo do email com a cara do Gescolar; blocos = [{p:'texto'} | {codigo:'123456'} | {botao:'Texto', link:'https://…'} | {nota:'texto'}]
+// v5.25: cabeçalho azul com o logótipo e a faixa amarela da marca
+const LOGO_EMAIL = process.env.LOGO_EMAIL || 'https://gescolar.co.mz/logo.png';
 function emailGescolar(escolaNome, titulo, blocos) {
-  const corpo = blocos.map(b => b.codigo ? '<div style="font:800 34px/1 Consolas,monospace;letter-spacing:8px;color:#0B2A4A;background:#EEF4FC;border-radius:12px;padding:18px 0;text-align:center;margin:18px 0">' + escH(b.codigo) + '</div>'
-    : b.botao ? '<div style="text-align:center;margin:22px 0"><a href="' + escH(b.link) + '" style="display:inline-block;background:#0A64DC;color:#fff;text-decoration:none;font:700 16px Arial,sans-serif;padding:14px 26px;border-radius:10px">' + escH(b.botao) + '</a></div><p style="font:13px/1.5 Arial,sans-serif;color:#5F6B7A;margin:0 0 14px;word-break:break-all">Se o botão não abrir, copie este endereço: ' + escH(b.link) + '</p>'
-    : b.nota ? '<p style="font:13px/1.5 Arial,sans-serif;color:#5F6B7A;margin:14px 0 0">' + escH(b.nota) + '</p>'
-    : '<p style="font:15px/1.55 Arial,sans-serif;color:#12233A;margin:0 0 12px">' + escH(b.p) + '</p>').join('');
-  return '<!doctype html><html><body style="margin:0;background:#F2F5F9;padding:24px 12px"><div style="max-width:520px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #E2E8F0">' +
-    '<div style="background:#0B2A4A;color:#fff;padding:18px 22px;font:800 18px Arial,sans-serif">Gescolar<span style="display:block;font:400 13px Arial,sans-serif;opacity:.8;margin-top:2px">' + escH(escolaNome || '') + '</span></div>' +
-    '<div style="padding:24px 22px"><h1 style="font:800 20px/1.3 Arial,sans-serif;color:#0B2A4A;margin:0 0 14px">' + escH(titulo) + '</h1>' + corpo + '</div>' +
-    '<div style="padding:14px 22px;background:#F7F9FC;font:12px Arial,sans-serif;color:#8A94A3">Gescolar · gestão escolar em Moçambique · gescolar.co.mz</div></div></body></html>';
+  const F = "font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+  const corpo = blocos.map(b => b.codigo ? '<div style="margin:22px 0;text-align:center"><div style="display:inline-block;' + F + 'font-weight:800;font-size:38px;letter-spacing:10px;color:#0B2A4A;background:#EEF4FC;border:2px dashed #0A64DC;border-radius:14px;padding:18px 26px 18px 36px">' + escH(b.codigo) + '</div></div>'
+    : b.botao ? '<div style="text-align:center;margin:26px 0 8px"><a href="' + escH(b.link) + '" style="display:inline-block;background:#FFC21A;color:#0B2A4A;text-decoration:none;' + F + 'font-weight:800;font-size:16px;padding:15px 30px;border-radius:12px;border-bottom:4px solid #E0A400">' + escH(b.botao) + '</a></div><p style="' + F + 'font-size:12px;line-height:1.5;color:#8A94A3;margin:10px 0 14px;text-align:center;word-break:break-all">Se o botão não abrir, copie este endereço: ' + escH(b.link) + '</p>'
+    : b.nota ? '<p style="' + F + 'font-size:13px;line-height:1.55;color:#5F6B7A;margin:16px 0 0">' + escH(b.nota) + '</p>'
+    : '<p style="' + F + 'font-size:15.5px;line-height:1.6;color:#12233A;margin:0 0 14px;white-space:pre-line">' + escH(b.p) + '</p>').join('');
+  return '<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + escH(titulo) + '</title></head>' +
+    '<body style="margin:0;padding:0;background:#EEF2F8"><div style="padding:28px 12px">' +
+    '<div style="max-width:540px;margin:0 auto;background:#FFFFFF;border-radius:20px;overflow:hidden;box-shadow:0 10px 30px rgba(11,42,74,.10)">' +
+    '<div style="background:#0A3D91;background-image:linear-gradient(135deg,#0A64DC 0%,#062A66 100%);padding:26px 26px 22px;text-align:left">' +
+      '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr><td style="vertical-align:middle;padding-right:14px"><img src="' + escH(LOGO_EMAIL) + '" width="52" height="52" alt="Gescolar" style="display:block;border-radius:50%;background:#fff;border:2px solid rgba(255,255,255,.85)"></td>' +
+      '<td style="vertical-align:middle"><div style="' + F + 'font-weight:800;font-size:24px;color:#FFFFFF;letter-spacing:-.3px">G<span style="color:#FFC21A">e</span>scolar</div>' +
+      '<div style="' + F + 'font-size:13px;color:#CFE0FB;margin-top:2px">' + escH(escolaNome || 'Gestão escolar em Moçambique') + '</div></td></tr></table></div>' +
+    '<div style="height:6px;background:#FFC21A;line-height:6px;font-size:0">&nbsp;</div>' +
+    '<div style="padding:30px 28px 26px"><h1 style="' + F + 'font-weight:800;font-size:22px;line-height:1.3;color:#0B2A4A;margin:0 0 16px">' + escH(titulo) + '</h1>' + corpo + '</div>' +
+    '<div style="padding:18px 28px;background:#F6F8FC;border-top:1px solid #E6ECF4;' + F + 'font-size:12px;line-height:1.6;color:#8A94A3">' +
+      '<b style="color:#0B2A4A">Gescolar</b> · a escola inteira, num só sistema<br>gescolar.co.mz · geral@gescolar.co.mz</div>' +
+    '</div></div></body></html>';
 }
 function textoDeBlocos(titulo, blocos) { return titulo + '\n\n' + blocos.map(b => b.codigo ? 'Código: ' + b.codigo : b.botao ? b.botao + ': ' + b.link : (b.p || b.nota || '')).join('\n\n'); }
 // sem Resend, o email sai pelo «Send email» do próprio Bubble: backend workflow «enviar-email» com para, assunto, texto
@@ -953,6 +1149,113 @@ async function enviarSMS(numeros, mensagem) {
     return { ok: false, erro: e.message, numeros: lista };
   }
 }
+// ---------- créditos de SMS por escola (v5.25) ----------
+//  Cada escola começa com SMS_INICIAIS SMS (por defeito 20). Cada número que recebe gasta 1 crédito por cada parte de 160 caracteres
+//  (mensagens maiores: 153 por parte). Gastam todos os SMS que a escola manda, incluindo os códigos de entrada.
+//  Os avisos do Gescolar à própria escola (assinatura, transferências, saques, escola criada) não gastam.
+//  Sem créditos, quem tem email recebe a mensagem por email (Resend, grátis) e a Direcção recebe um aviso para recarregar.
+//  Bubble: Escola → «SMS Creditos» (number) e «SMS Usados» (number)
+//          tabela nova «RecargaSMS»: Escola (Escola) · Pacote (text) · SMS (number) · Valor (number) · Metodo (text) · Telefone (text)
+//                                    · Estado (text) · Referencia (text) · Transacao (text) · Raw (text) · Pago Em (date) · Feita Por (text)
+//  Render (opcional): SMS_INICIAIS (20) · SMS_PACOTES («100:250,500:1000,1000:1800» = SMS:MT)
+const SMS_INICIAIS = Math.max(0, Number(process.env.SMS_INICIAIS === undefined || process.env.SMS_INICIAIS === '' ? 20 : process.env.SMS_INICIAIS) || 0);
+const SMS_PACOTES = String(process.env.SMS_PACOTES || '100:250,500:1000,1000:1800').split(',').map(x => x.trim().split(':').map(Number))
+  .filter(x => x.length === 2 && x[0] > 0 && x[1] > 0).map(x => ({ id: String(x[0]), sms: x[0], valor: x[1] }));
+const SMS_POUCOS = 5;
+function partesSMS(m) { const t = textoSMS(m); return !t ? 0 : t.length <= 160 ? 1 : Math.ceil(t.length / 153); }
+function creditosDe(e) { const v = e ? e['SMS Creditos'] : undefined; return (v === undefined || v === null || v === '') ? SMS_INICIAIS : Math.max(0, Math.floor(Number(v) || 0)); }
+// uma fila por escola: dois envios ao mesmo tempo nunca gastam o mesmo crédito
+const filaSMS = new Map();
+function naFilaSMS(id, fn) {
+  const ant = filaSMS.get(id) || Promise.resolve();
+  const p = ant.then(fn, fn), fim = p.catch(() => {});
+  filaSMS.set(id, fim); fim.then(() => { if (filaSMS.get(id) === fim) filaSMS.delete(id); });
+  return p;
+}
+async function mexerCreditos(escolaId, delta, usados) {
+  return naFilaSMS(String(escolaId), async () => {
+    const e = await obter('escola', escolaId);
+    if (!e) throw new Error('escola não encontrada');
+    const antes = creditosDe(e), depois = Math.max(0, antes + delta);
+    await mudar('escola', escolaId, { 'SMS Creditos': depois, 'SMS Usados': Math.max(0, (Number(e['SMS Usados']) || 0) + (usados || 0)) });
+    if (typeof cachePainel !== 'undefined') cachePainel.delete(escolaId);
+    return { e, antes, depois };
+  });
+}
+// reserva créditos para os primeiros n números que couberem
+async function reservarSMS(escolaId, quantos, partes) {
+  return naFilaSMS(String(escolaId), async () => {
+    const e = await obter('escola', escolaId);
+    if (!e) return { e: null, n: quantos, antes: 0, depois: 0, livre: true };
+    const antes = creditosDe(e), n = Math.min(quantos, Math.floor(antes / Math.max(1, partes)));
+    const depois = antes - n * partes;
+    if (n > 0) { await mudar('escola', escolaId, { 'SMS Creditos': depois, 'SMS Usados': (Number(e['SMS Usados']) || 0) + n * partes }); if (typeof cachePainel !== 'undefined') cachePainel.delete(escolaId); }
+    return { e, n, antes, depois };
+  });
+}
+// telemóvel → email das pessoas da escola (encarregados, professores, equipa), guardado 10 minutos
+const cacheEmailsTel = new Map();
+async function emailsPorTelefone(escolaId) {
+  const c = cacheEmailsTel.get(escolaId);
+  if (c && c.exp > Date.now()) return c.mapa;
+  const f = daEscola(escolaId), mapa = new Map();
+  const [encs, profs, users] = await Promise.all([procurarTodos('encarregado', f).catch(() => []), procurarTodos('professor', f).catch(() => []), procurarTodos('user', f).catch(() => [])]);
+  const juntar = (tel, mail) => { const t = tel9(tel), m = String(mail || '').trim().toLowerCase(); if (t.length === 9 && emailOk(m) && !mapa.has(t)) mapa.set(t, m); };
+  encs.forEach(x => juntar(x['Telefone'], x['Email'])); profs.forEach(x => juntar(x['Telefone'], x['Email'])); users.forEach(u => juntar(u['Telefone'], emailDoUser(u)));
+  cacheEmailsTel.set(escolaId, { exp: Date.now() + 600e3, mapa });
+  return mapa;
+}
+async function emailEmVezDeSMS(escolaId, e, numeros, mensagem, op) {
+  let n = 0;
+  try {
+    const mapa = await emailsPorTelefone(escolaId), nome = (e && e['Nome']) || 'A sua escola';
+    const emails = [...new Set(numeros.map(x => mapa.get(tel9(x))).filter(Boolean))];
+    const blocos = [{ p: String(mensagem || '') }, { nota: 'Mensagem enviada por ' + nome + ' através do Gescolar.' }];
+    for (const m of emails) { const r = await enviarEmail(m, (op && op.assunto) || (nome + ': nova mensagem'), emailGescolar(nome, (op && op.titulo) || 'Mensagem da escola', blocos), textoDeBlocos('Mensagem da escola', blocos)); if (r.ok) n++; }
+  } catch (err) { console.error('[sms→email]', err.message); }
+  return n;
+}
+// aviso à Direcção quando os SMS estão a acabar ou acabaram (no máximo um de cada tipo por dia)
+const avisosSMS = new Map();
+async function avisarCreditosSMS(escolaId, e, restam) {
+  try {
+    const tipo = restam <= 0 ? 'zero' : 'poucos', chave = escolaId + '|' + tipo, ult = avisosSMS.get(chave) || 0;
+    if (Date.now() - ult < 864e5) return;
+    avisosSMS.set(chave, Date.now());
+    const mail = String((e && e['Email']) || '').trim().toLowerCase();
+    if (!emailOk(mail)) return;
+    const nome = (e && e['Nome']) || 'A sua escola';
+    const blocos = restam <= 0
+      ? [{ p: 'Os SMS de ' + nome + ' acabaram. Os avisos às famílias e os códigos de entrada deixam de ir por SMS; quem tem email continua a receber por email.' }, { p: 'Para voltar a enviar SMS, recarregue no painel da Direcção, em Conta → SMS e emails. Pode pagar por M-Pesa, e-Mola ou cartão.' }, { botao: 'Recarregar SMS', link: linkPagina('direccao') + '#sms' }]
+      : [{ p: 'Restam só ' + restam + ' SMS a ' + nome + '.' }, { p: 'Recarregue antes que acabem, no painel da Direcção, em Conta → SMS e emails.' }, { botao: 'Recarregar SMS', link: linkPagina('direccao') + '#sms' }];
+    await enviarEmail(mail, restam <= 0 ? 'Os SMS da escola acabaram' : 'Os SMS da escola estão a acabar', emailGescolar(nome, restam <= 0 ? 'Os SMS acabaram' : 'Os SMS estão a acabar', blocos), textoDeBlocos('SMS da escola', blocos));
+  } catch (err) { console.error('[sms-aviso]', err.message); }
+}
+// envia SMS em nome de uma escola, gastando os créditos dela
+//   op.semEmail: não manda por email quem fica sem SMS (quando a rota já envia o seu próprio email)
+async function smsEscola(escolaId, numeros, mensagem, op) {
+  op = op || {};
+  if (!escolaId) return enviarSMS(numeros, mensagem);
+  const lista = [...new Set((Array.isArray(numeros) ? numeros : [numeros]).map(numeroSMS).filter(Boolean))];
+  if (!lista.length) return { ok: false, erro: 'nenhum número válido', numeros: [] };
+  if (!SMS_TOKEN || !SMS_ORIGEM) return enviarSMS(lista, mensagem);
+  const partes = partesSMS(mensagem);
+  if (!partes) return { ok: false, erro: 'mensagem vazia', numeros: [] };
+  const rs = await reservarSMS(escolaId, lista.length, partes);
+  const vai = lista.slice(0, rs.n), fica = lista.slice(rs.n);
+  let r = { ok: false, erro: 'A escola não tem SMS. Recarregue em Conta → SMS e emails.', numeros: [] };
+  if (vai.length) {
+    r = await enviarSMS(vai, mensagem);
+    if (!r.ok && !rs.livre) await mexerCreditos(escolaId, vai.length * partes, -vai.length * partes).catch(err => console.error('[sms] devolver créditos', err.message));
+  }
+  if (fica.length) {
+    r.sem_creditos = true; r.sem_sms = fica.length;
+    r.por_email = op.semEmail ? 0 : await emailEmVezDeSMS(escolaId, rs.e, fica, mensagem, op);
+    console.warn('[sms] ' + escolaId + ' sem créditos: ' + fica.length + ' número(s) sem SMS, ' + (r.por_email || 0) + ' por email');
+  }
+  if (rs.e && !rs.livre && (fica.length || rs.depois <= SMS_POUCOS)) avisarCreditosSMS(escolaId, rs.e, rs.depois);
+  return r;
+}
 const mt = v => Number(v || 0).toLocaleString('pt-PT', { maximumFractionDigits: 6 }).replace(/\s/g, ' ') + ' MT';
 // recibo por SMS: ao encarregado (se aceita SMS) e a quem pagou pelo telemóvel
 async function smsRecibo(pag, documento) {
@@ -968,7 +1271,7 @@ async function smsRecibo(pag, documento) {
     const msg = (escola ? escola['Nome'] + ': ' : '') + 'recebemos ' + mt(pag['Valor']) +
       (est ? ' de ' + est['Nome'] : '') + (qtd > 1 ? ' (' + qtd + ' mensalidades)' : '') +
       '. Recibo ' + documento + '. Obrigado. Gescolar';
-    const r = await enviarSMS(numeros, msg);
+    const r = await smsEscola(pag['Escola'], numeros, msg);
     if (!r.ok) console.warn('[sms] recibo ' + documento + ' não enviado: ' + r.erro);
   } catch (e) { console.error('[sms] recibo', e.message); }
 }
@@ -976,7 +1279,7 @@ app.post('/sms-teste', exigeDireccao, rota(async (req, res) => {
   const b = req.body || {};
   if (!numeroSMS(b.numero)) return erro(res, 400, 'Número inválido. Use 9 dígitos, por exemplo 84 123 4567.');
   const escola = await resumoEscola(req.escola);
-  const r = await enviarSMS([b.numero], txt(b.mensagem, 300) || ((escola ? escola.nome + ': ' : '') + 'teste de SMS do Gescolar. Se recebeu esta mensagem, esta tudo a funcionar.'));
+  const r = await smsEscola(req.escola, [b.numero], txt(b.mensagem, 300) || ((escola ? escola.nome + ': ' : '') + 'teste de SMS do Gescolar. Se recebeu esta mensagem, esta tudo a funcionar.'), { semEmail: true });
   if (!r.ok) return erro(res, 502, 'O SMS não foi enviado: ' + r.erro);
   res.json({ ok: true, enviado_para: r.numeros });
 }));
@@ -1235,9 +1538,9 @@ app.post('/acesso-codigo', rota(async (req, res) => {
   const pedido = crypto.randomBytes(16).toString('hex');
   const blocos = [{ p: 'Use este código para entrar no Gescolar (' + (tipo === 'professor' ? 'Professor' : tipo === 'estudante' ? 'Estudante' : 'Encarregado') + '):' }, { codigo }, { nota: 'O código vale 10 minutos. Não o partilhe com ninguém. Se não pediu este código, ignore este email.' }];
   const [r, m] = await Promise.all([
-    destino.length === 9 ? enviarSMS([destino], esc['Nome'] + ': o seu codigo de acesso ao Gescolar e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.') : Promise.resolve({ ok: false }),
+    destino.length === 9 ? smsEscola(esc._id, [destino], esc['Nome'] + ': o seu codigo de acesso ao Gescolar e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.', { semEmail: true }) : Promise.resolve({ ok: false }),
     emailOk(String(emailDestino).toLowerCase()) ? enviarEmail(emailDestino, 'Código de acesso: ' + codigo, emailGescolar(esc['Nome'], 'O seu código de acesso', blocos), textoDeBlocos('O seu código de acesso', blocos)) : Promise.resolve({ ok: false })]);
-  if (!r.ok && !m.ok) return erro(res, 502, 'Não foi possível enviar o código agora. Tente de novo dentro de um minuto.');
+  if (!r.ok && !m.ok) return erro(res, r.sem_creditos ? 402 : 502, r.sem_creditos ? 'A escola ficou sem SMS e não tem um email seu registado. Peça à escola para recarregar os SMS ou para registar o seu email.' : 'Não foi possível enviar o código agora. Tente de novo dentro de um minuto.');
   pedidosAcesso.set(pedido, { escola: esc._id, tipo, id: alvo._id, hash: hashCodigo(pedido + codigo), exp: Date.now() + 600e3, tent: 0 });
   res.json({ ok: true, pedido, destino: [r.ok ? mascarar(destino) : '', m.ok ? mascararEmail(emailDestino) : ''].filter(Boolean).join(' e '), sms: r.ok, email: m.ok, escola: esc['Nome'] || '' });
 }));
@@ -1315,7 +1618,7 @@ app.post('/familias-convite', exigeDireccao, rota(async (req, res) => {
   const msg = (esc['Nome'] || 'A escola') + ': ja pode ver propinas, recibos e notas do seu educando e pagar por M-Pesa ou e-Mola. Entre ' + link + ' com o seu numero de telemovel.';
   let enviados = 0, falhas = 0;
   for (let i = 0; i < nums.length; i += 50) {
-    const r = await enviarSMS(nums.slice(i, i + 50), msg);
+    const r = await smsEscola(req.escola, nums.slice(i, i + 50), msg);
     if (r.ok) enviados += r.numeros.length; else falhas += nums.slice(i, i + 50).length;
   }
   if (!enviados) return erro(res, 502, 'Não foi possível enviar os SMS agora. Tente mais tarde.');
@@ -1440,7 +1743,9 @@ app.post('/comunicado-guardar', exigeDireccao, rota(async (req, res) => {
       const nums = [...new Set(encs.filter(e => encIds.has(e._id) && e['Activo'] !== false && e['Recebe SMS'] !== false).map(e => tel9(e['Telefone'])).filter(t => t.length === 9))];
       const curto = texto.length > 120 ? texto.slice(0, 117).replace(/\s+\S*$/, '') + '...' : texto;
       const msg = (esc['Nome'] || 'Escola') + ': ' + titulo + '. ' + curto + (texto.length > 120 ? ' Veja tudo ' + noGescolar(esc['Subdominio']) + '.' : '');
-      for (let i = 0; i < nums.length; i += 50) { const r = await enviarSMS(nums.slice(i, i + 50), msg); if (r.ok) sms += r.numeros.length; }
+      let semCred = 0, porEmail = 0;
+      for (let i = 0; i < nums.length; i += 50) { const r = await smsEscola(req.escola, nums.slice(i, i + 50), msg, { assunto: (esc['Nome'] || 'Escola') + ': ' + titulo, titulo }); if (r.ok) sms += r.numeros.length; semCred += r.sem_sms || 0; porEmail += r.por_email || 0; }
+      if (semCred) aviso = 'Os SMS da escola acabaram: ' + semCred + ' encarregado(s) ficaram sem SMS' + (porEmail ? ' (' + porEmail + ' receberam por email)' : '') + '. Recarregue em Conta → SMS e emails.';
       if (sms) await mudar('comunicado', id, { 'SMS Enviados': sms }).catch(() => {});
       else if (!nums.length) aviso = 'O comunicado foi publicado. Não há encarregados com telemóvel para receber o SMS.';
       else aviso = 'O comunicado foi publicado, mas o SMS falhou. Tente mais tarde.';
@@ -1981,7 +2286,7 @@ async function guardarChamada(req, res, quem, podeJustificar) {
       const est = await obter('estudante', f['Estudante']).catch(() => null);
       const enc = est && est['Encarregado'] ? await obter('encarregado', est['Encarregado']).catch(() => null) : null;
       if (!enc || enc['Recebe SMS'] === false || tel9(enc['Telefone']).length !== 9) continue;
-      const r = await enviarSMS([enc['Telefone']], (esc['Nome'] || 'Escola') + ': ' + est['Nome'] + (d.dia ? ' faltou hoje as aulas' : ' faltou hoje a ' + d.disciplina.nome + ' (' + d.i + ')') + '. Se a falta tiver justificacao, contacte a escola.');
+      const r = await smsEscola(req.escola, [enc['Telefone']], (esc['Nome'] || 'Escola') + ': ' + est['Nome'] + (d.dia ? ' faltou hoje as aulas' : ' faltou hoje a ' + d.disciplina.nome + ' (' + d.i + ')') + '. Se a falta tiver justificacao, contacte a escola.');
       if (r.ok) { sms++; await mudar('falta', f._id, { 'SMS': true }).catch(() => {}); }
     }
   }
@@ -2291,6 +2596,94 @@ async function aplicarSubscricao(x, b, estado) {
   return { ok: true, estado: 'pago', valida_ate: ate };
 }
 
+// ---------- SMS da escola: saldo e recargas (v5.25) ----------
+const recargaOut = x => ({ id: x._id, data: x['Pago Em'] || x['Created Date'] || null, pacote: x['Pacote'] || '', sms: Number(x['SMS'] || 0), valor: Number(x['Valor'] || 0),
+  metodo: x['Metodo'] || '', estado: x['Estado'] || 'pendente', por: x['Feita Por'] || '' });
+app.post('/sms-saldo', exigeDireccao, rota(async (req, res) => {
+  const [e, recs] = await Promise.all([obter('escola', req.escola), procurarTodos('recargasms', daEscola(req.escola), 300).catch(() => [])]);
+  res.json({ ok: true, creditos: creditosDe(e), usados: Number(e['SMS Usados'] || 0), iniciais: SMS_INICIAIS, poucos: SMS_POUCOS, pacotes: SMS_PACOTES,
+    email: RESEND_KEY && MAIL_FROM ? 'resend' : 'bubble', email_escola: e['Email'] || '',
+    historico: recs.map(recargaOut).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/sms-recarregar', exigeSoDireccao, rota(async (req, res) => {
+  const b = req.body || {}, metodo = String(b.metodo || '').toLowerCase();
+  const pac = SMS_PACOTES.find(p => p.id === String(b.pacote));
+  if (!pac) return erro(res, 400, 'Escolha um pacote de SMS.');
+  if (!['mpesa', 'emola', 'cartao'].includes(metodo)) return erro(res, 400, 'Escolha M-Pesa, e-Mola ou cartão.');
+  if (!MOZ_WALLET) return erro(res, 500, 'O servidor ainda não tem a carteira configurada (MOZ_WALLET).');
+  const numero = soDigitos(b.numero).replace(/^258(?=\d{9}$)/, '');
+  if (metodo !== 'cartao') {
+    if (numero.length !== 9) return erro(res, 400, 'O número tem 9 dígitos, por exemplo 84 123 4567.');
+    const pre = numero.slice(0, 2);
+    if (metodo === 'mpesa' && !['84', '85'].includes(pre)) return erro(res, 400, 'M-Pesa só funciona com números Vodacom (84 ou 85).');
+    if (metodo === 'emola' && !['86', '87'].includes(pre)) return erro(res, 400, 'e-Mola só funciona com números Movitel (86 ou 87).');
+  }
+  const e = await obter('escola', req.escola);
+  const id = await criar('recargasms', { 'Escola': req.escola, 'Pacote': pac.sms + ' SMS', 'SMS': pac.sms, 'Valor': pac.valor, 'Metodo': metodo, 'Telefone': numero, 'Estado': 'pendente' });
+  try {
+    if (metodo === 'cartao') {
+      const d = await mozPedido(MOZ_CARD_PATH, { valor: String(pac.valor), nome_cliente: (e['Nome'] || 'Escola').slice(0, 80), carteira: MOZ_WALLET, nome_producto: ('Gescolar ' + pac.sms + ' SMS · ' + (e['Nome'] || '')).slice(0, 120) });
+      const link = acharLink(d);
+      if (!link) throw new Error('sem link na resposta: ' + JSON.stringify(d).slice(0, 220));
+      await mudar('recargasms', id, { 'Referencia': String(achar(d, ['session_id', 'sessionId', 'session']) || sessionDoLink(link) || ''), 'Raw': JSON.stringify(d).slice(0, 4000) });
+      return res.json({ ok: true, id, link, total: pac.valor, sms: pac.sms });
+    }
+    const c2b = await iniciarC2B(metodo, pac.valor, numero, (e['Nome'] || 'Escola').slice(0, 80), 'Gescolar SMS');
+    await mudar('recargasms', id, { 'Referencia': c2b.ref, 'Raw': JSON.stringify(c2b.raw).slice(0, 4000) });
+    res.json({ ok: true, id, total: pac.valor, sms: pac.sms, iframe: c2b.iframe, embed: c2b.embed, mensagem: msgC2B(c2b, numero) });
+  } catch (err) {
+    console.error('[sms-recarga]', err.message);
+    await mudar('recargasms', id, { 'Estado': 'falhado', 'Raw': String(err.message).slice(0, 2000) }).catch(() => {});
+    erro(res, 502, 'A MozPayment não aceitou o pedido: ' + String(err.message).slice(0, 300));
+  }
+}));
+app.post('/sms-recarga-estado', exigeDireccao, rota(async (req, res) => {
+  const x = await daMinhaEscola('recargasms', String((req.body || {}).id || ''), req.escola);
+  const e = x['Estado'] === 'pago' ? await obter('escola', req.escola).catch(() => null) : null;
+  res.json({ ok: true, estado: x['Estado'] || 'pendente', sms: Number(x['SMS'] || 0), valor: Number(x['Valor'] || 0), creditos: e ? creditosDe(e) : null });
+}));
+// chamado pelo webhook quando a referência é de uma recarga de SMS
+async function aplicarRecargaSMS(x, b, estado) {
+  if (x['Estado'] === 'pago') return { ok: true, ja: 'aplicado' };
+  const raw = JSON.stringify(b).slice(0, 4000), trx = txt(b.transaction_id, 120);
+  const valor = Math.round(Number(String(b.amount || '').replace(',', '.')));
+  if (estado === 'pago' && valor !== Math.round(Number(x['Valor'] || 0))) { await mudar('recargasms', x._id, { 'Estado': 'revisao', 'Transacao': trx, 'Raw': raw }); return { ok: true, revisao: true }; }
+  if (estado !== 'pago') { await mudar('recargasms', x._id, { 'Estado': estado, 'Transacao': trx, 'Raw': raw }); return { ok: true, estado }; }
+  await mudar('recargasms', x._id, { 'Estado': 'pago', 'Transacao': trx, 'Raw': raw, 'Pago Em': new Date().toISOString() });
+  const m = await mexerCreditos(x['Escola'], Number(x['SMS'] || 0), 0);
+  console.log('[sms-recarga] ' + x['Escola'] + ' +' + x['SMS'] + ' → ' + m.depois);
+  return { ok: true, estado: 'pago', creditos: m.depois };
+}
+// Plataforma: dar ou tirar SMS à mão, e aprovar recargas em revisão
+app.post('/pl/sms-dar', exigePlataforma, rota(async (req, res) => {
+  const b = req.body || {}, n = Math.trunc(Number(b.sms));
+  if (!n || Math.abs(n) > 100000) return erro(res, 400, 'Escreva quantos SMS (por exemplo 100, ou -20 para tirar).');
+  const e = await obter('escola', String(b.escola || ''));
+  if (!e) return erro(res, 404, 'Escola não encontrada.');
+  const quem = txt(b.por, 80) || 'Plataforma';
+  if (n > 0) await criar('recargasms', { 'Escola': e._id, 'Pacote': 'Atribuído à mão', 'SMS': n, 'Valor': Math.max(0, Number(String(b.valor || 0).replace(',', '.')) || 0), 'Metodo': METODOS_MANUAIS[b.metodo] ? b.metodo : 'oferta',
+    'Estado': 'pago', 'Pago Em': new Date().toISOString(), 'Feita Por': quem, 'Raw': JSON.stringify({ manual: true, notas: txt(b.notas, 300) }) }).catch(err => console.error('[pl/sms-dar] registo', err.message));
+  const m = await mexerCreditos(e._id, n, 0);
+  if (b.avisar && n > 0 && emailOk(String(e['Email'] || '').toLowerCase())) {
+    const blocos = [{ p: 'Foram adicionados ' + n + ' SMS à conta de ' + (e['Nome'] || 'a escola') + '. Saldo actual: ' + m.depois + ' SMS.' }];
+    enviarEmail(e['Email'], 'Gescolar: ' + n + ' SMS adicionados', emailGescolar(e['Nome'], 'SMS adicionados', blocos), textoDeBlocos('SMS adicionados', blocos)).catch(() => {});
+  }
+  res.json({ ok: true, creditos: m.depois });
+}));
+app.post('/pl/sms-recargas', exigePlataforma, rota(async (req, res) => {
+  const [recs, escolas] = await Promise.all([procurarTodos('recargasms', [], 20000).catch(() => []), procurarTodos('escola', [], 5000)]);
+  const EN = Object.fromEntries(escolas.map(e => [e._id, e['Nome'] || '']));
+  res.json({ ok: true, pacotes: SMS_PACOTES, recargas: recs.map(x => Object.assign(recargaOut(x), { escola: x['Escola'], escola_nome: EN[x['Escola']] || '' })).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/pl/sms-aprovar', exigePlataforma, rota(async (req, res) => {
+  const x = await obter('recargasms', String((req.body || {}).id || ''));
+  if (!x) return erro(res, 404, 'Recarga não encontrada.');
+  if (x['Estado'] === 'pago') return erro(res, 409, 'Esta recarga já foi aplicada.');
+  await mudar('recargasms', x._id, { 'Estado': 'pago', 'Pago Em': new Date().toISOString(), 'Feita Por': 'Plataforma (aprovada)' });
+  const m = await mexerCreditos(x['Escola'], Number(x['SMS'] || 0), 0);
+  res.json({ ok: true, creditos: m.depois });
+}));
+
 // ---------- área da plataforma ----------
 function exigePlataforma(req, res, next) {
   const s = sessaoDo(req);
@@ -2300,8 +2693,10 @@ function exigePlataforma(req, res, next) {
 }
 const ONLINE = m => ['mpesa', 'emola', 'cartao'].includes(String(m || '').toLowerCase());
 app.post('/pl/resumo', exigePlataforma, rota(async (req, res) => {
-  const [escolas, pags, subs, trs0, ests, insc] = await Promise.all([procurarTodos('escola', [], 5000), procurarTodos('pagamento', [], 50000), procurarTodos('subscricao', [], 20000), procurarTodos('transferencia', [], 20000), procurarTodos('estudante', [], 100000),
-    procurarTodos('inscricaoonline', [], 50000).catch(() => [])]);
+  const [escolas, pags, subs, trs0, ests, insc, users] = await Promise.all([procurarTodos('escola', [], 5000), procurarTodos('pagamento', [], 50000), procurarTodos('subscricao', [], 20000), procurarTodos('transferencia', [], 20000), procurarTodos('estudante', [], 100000),
+    procurarTodos('inscricaoonline', [], 50000).catch(() => []), procurarTodos('user', [], 20000).catch(() => [])]);
+  const acessoEsc = {};
+  users.forEach(u => { const e = u['Escola'], t = u['Ultimo Acesso']; if (e && t && String(t) > String(acessoEsc[e] || '')) acessoEsc[e] = t; });
   const trs = trs0.filter(t => contaTransf(t) && t['Estado'] !== 'pedido');
   const pedidos = trs0.filter(t => t['Estado'] === 'pedido');
   const lista = escolas.map(e => {
@@ -2315,14 +2710,22 @@ app.post('/pl/resumo', exigePlataforma, rota(async (req, res) => {
       estudantes: ests.filter(x => x['Escola'] === e._id && (x['Estado'] || 'activo') === 'activo').length,
       propinas_online: limpa(bruto), taxa, transferido: limpa(transferido), saldo: limpa(bruto - taxa - transferido), pagamentos: online.length + insE.length,
       saques_pedidos: pedidos.filter(t => t['Escola'] === e._id).reduce((x, t) => x + Number(t['Valor'] || 0), 0),
-      assinaturas: assin.reduce((x, s2) => x + Number(s2['Valor'] || 0), 0), ultimo_pagamento: online.map(p => p['Pago Em']).sort().pop() || null };
+      assinaturas: assin.reduce((x, s2) => x + Number(s2['Valor'] || 0), 0), ultimo_pagamento: online.map(p => p['Pago Em']).sort().pop() || null,
+      presenca: (function () { const pr = presencaDe(e._id); const a = acessoEsc[e._id] || null; if (a && (!pr.ultimo || String(a) > pr.ultimo)) pr.ultimo = a; return pr; })(),
+      subs_pendentes: subs.filter(x => x['Escola'] === e._id && ['pendente', 'revisao'].includes(x['Estado'])).length, sms: creditosDe(e), sms_usados: Number(e['SMS Usados'] || 0) };
   }).sort((a, b) => b.saldo - a.saldo || a.nome.localeCompare(b.nome, 'pt'));
   const mes = new Date().toISOString().slice(0, 7);
   res.json({ ok: true, taxa_pct: TAXA_PROPINAS, precos: PRECOS, escolas: lista,
     totais: { escolas: lista.length, activas: lista.filter(x => ['activa', 'tolerancia'].includes(x.situacao.estado)).length, teste: lista.filter(x => x.situacao.estado === 'teste').length,
       estudantes: lista.reduce((x, e) => x + e.estudantes, 0), a_transferir: limpa(lista.reduce((x, e) => x + Math.max(0, e.saldo), 0)),
       propinas_online: limpa(lista.reduce((x, e) => x + e.propinas_online, 0)), assinaturas: lista.reduce((x, e) => x + e.assinaturas, 0),
-      assinaturas_mes: subs.filter(x => x['Estado'] === 'pago' && String(x['Pago Em'] || '').slice(0, 7) === mes).reduce((x, s2) => x + Number(s2['Valor'] || 0), 0) } });
+      assinaturas_mes: subs.filter(x => x['Estado'] === 'pago' && String(x['Pago Em'] || '').slice(0, 7) === mes).reduce((x, s2) => x + Number(s2['Valor'] || 0), 0),
+      a_expirar: lista.filter(x => ['activa', 'teste'].includes(x.situacao.estado) && x.situacao.dias != null && x.situacao.dias <= 7).length,
+      expiradas: lista.filter(x => ['expirada', 'tolerancia'].includes(x.situacao.estado)).length,
+      suspensas: lista.filter(x => x.situacao.estado === 'suspensa').length,
+      mensal: lista.filter(x => ['activa', 'tolerancia'].includes(x.situacao.estado)).reduce((x, e) => x + (PRECOS[e.plano] || 0), 0),
+      online_escolas: lista.filter(x => x.presenca.online > 0).length, online_pessoas: lista.reduce((x, e) => x + e.presenca.online, 0), online_min: ONLINE_MIN,
+      revisao: subs.filter(x => x['Estado'] === 'revisao').length } });
 }));
 app.post('/pl/escola', exigePlataforma, rota(async (req, res) => {
   const id = String((req.body || {}).id || '');
@@ -2347,9 +2750,18 @@ app.post('/pl/escola-guardar', exigePlataforma, rota(async (req, res) => {
   if (b.estado !== undefined) { if (!['teste', 'activa', 'suspensa'].includes(b.estado)) return erro(res, 400, 'Estado inválido.'); mud['Estado'] = b.estado; }
   if (b.valida_ate !== undefined) { if (b.valida_ate && isNaN(Date.parse(b.valida_ate))) return erro(res, 400, 'Data inválida.'); if (b.valida_ate) mud['Valida Ate'] = new Date(b.valida_ate + 'T23:59:00Z').toISOString(); }
   if (b.mais_meses) mud['Valida Ate'] = novaValidade(e, Math.max(1, Math.min(24, Number(b.mais_meses) || 1)));
+  if (b.mais_dias_teste) {   // v5.24: prolongar o período de teste
+    const n = Math.max(1, Math.min(90, Number(b.mais_dias_teste) || 7)), t0 = e['Teste Ate'] && new Date(e['Teste Ate']).getTime() > Date.now() ? new Date(e['Teste Ate']) : new Date();
+    t0.setUTCDate(t0.getUTCDate() + n); mud['Teste Ate'] = t0.toISOString(); if (!e['Valida Ate'] && e['Estado'] !== 'suspensa') mud['Estado'] = 'teste';
+  }
   if (!Object.keys(mud).length) return erro(res, 400, 'Nada para guardar.');
   if (mud['Valida Ate'] && !mud['Estado'] && e['Estado'] !== 'suspensa') mud['Estado'] = 'activa';
   await mudar('escola', e._id, mud);
+  if (b.sms && mud['Estado'] && tel9(e['Telefone']).length === 9) {
+    const txtSms = mud['Estado'] === 'suspensa' ? 'Gescolar: o acesso de ' + (e['Nome'] || 'a escola') + ' foi suspenso. Fale connosco para regularizar a subscricao.'
+      : mud['Estado'] === 'activa' && e['Estado'] === 'suspensa' ? 'Gescolar: o acesso de ' + (e['Nome'] || 'a escola') + ' foi reactivado.' : '';
+    if (txtSms) enviarSMS([e['Telefone']], txtSms).catch(() => {});
+  }
   cachePainel.delete(e._id);
   res.json({ ok: true, situacao: situacaoEscola(Object.assign({}, e, mud)) });
 }));
@@ -2383,6 +2795,71 @@ app.post('/pl/transferencia', exigePlataforma, rota(async (req, res) => {
   const id = await criar('transferencia', { 'Escola': e._id, 'Valor': valor, 'Data': data, 'Referencia': txt(b.referencia, 80), 'Metodo': txt(b.metodo, 40), 'Notas': txt(b.notas, 300), 'Feita Por': (eu && eu['Nome Completo']) || 'Plataforma' });
   if (b.sms && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: transferimos ' + mt(valor) + ' para ' + (e['Nome'] || 'a escola') + ' (propinas pagas online)' + (b.referencia ? '. Ref. ' + txt(b.referencia, 40) : '') + '.').catch(() => {});
   res.json({ ok: true, id });
+}));
+// quem está online agora (só memória, leve: a página da Plataforma pergunta de 30 em 30 segundos)
+app.post('/pl/online', exigePlataforma, (req, res) => {
+  const out = {}; for (const k of PRESENCA.keys()) { const p = presencaDe(k); if (p.ultimo) out[k] = p; }
+  res.json({ ok: true, min: ONLINE_MIN, escolas: out, hora: new Date().toISOString() });
+});
+// ---------- assinaturas na Plataforma (v5.24) ----------
+//  Atribuir à mão (numerário, transferência, oferta…), aprovar as que ficaram em revisão, anular um registo.
+//  Usa só campos que a tabela Subscricao já tem: a referência manual vai para «Transacao» (não para «Referencia»,
+//  que é a que o webhook compara) e as notas ficam em «Raw».
+const METODOS_MANUAIS = { numerario: 'Numerário', transferencia: 'Transferência bancária', mpesa: 'M-Pesa', emola: 'e-Mola', cartao: 'Cartão', oferta: 'Oferta / cortesia' };
+app.post('/pl/assinaturas', exigePlataforma, rota(async (req, res) => {
+  const [subs, escolas] = await Promise.all([procurarTodos('subscricao', [], 20000), procurarTodos('escola', [], 5000)]);
+  const EN = Object.fromEntries(escolas.map(e => [e._id, e['Nome'] || '']));
+  res.json({ ok: true, metodos: METODOS_MANUAIS, assinaturas: subs.map(x => {
+    let extra = {}; try { const r = JSON.parse(x['Raw'] || '{}'); if (r && r.manual) extra = r; } catch (e) {}
+    return Object.assign(subOut(x), { escola: x['Escola'], escola_nome: EN[x['Escola']] || '', transacao: x['Transacao'] || '', manual: !!extra.manual, por: extra.por || '', notas: extra.notas || '' });
+  }).sort((a, b) => String(b.data || '').localeCompare(String(a.data || ''))) });
+}));
+app.post('/pl/assinatura-manual', exigePlataforma, rota(async (req, res) => {
+  const b = req.body || {};
+  const e = await obter('escola', String(b.escola || ''));
+  if (!e) return erro(res, 404, 'Escola não encontrada.');
+  const plano = PLANOS.includes(b.plano) ? b.plano : (e['Plano'] || 'Essencial');
+  const meses = Math.round(Number(b.meses));
+  if (!(meses >= 1 && meses <= 36)) return erro(res, 400, 'Escolha entre 1 e 36 meses.');
+  const metodo = METODOS_MANUAIS[b.metodo] ? b.metodo : '';
+  if (!metodo) return erro(res, 400, 'Escolha como foi pago.');
+  const valor = metodo === 'oferta' ? 0 : valorMT(b.valor === undefined || b.valor === '' ? 0 : b.valor);
+  if (isNaN(valor) || valor < 0) return erro(res, 400, 'Escreva o valor em meticais (ex.: 4900 ou 4900,50). Use 0 para oferta.');
+  const eu = await obter('user', req.sessao.u).catch(() => null), por = (eu && eu['Nome Completo']) || 'Plataforma';
+  const inicio = b.inicio && !isNaN(Date.parse(b.inicio)) ? new Date(b.inicio + 'T00:00:00Z').toISOString() : null;
+  const ate = inicio ? somaMeses(inicio, meses) : novaValidade(e, meses);
+  const id = await criar('subscricao', { 'Escola': e._id, 'Plano': plano, 'Meses': meses, 'Valor': valor, 'Metodo': metodo, 'Estado': 'pago', 'Transacao': txt(b.referencia, 120),
+    'Pago Em': new Date().toISOString(), 'Valida Ate': ate, 'Raw': JSON.stringify({ manual: true, por, notas: txt(b.notas, 300), inicio }) });
+  await mudar('escola', e._id, { 'Valida Ate': ate, 'Estado': 'activa', 'Plano': plano });
+  cachePainel.delete(e._id);
+  if (b.sms && tel9(e['Telefone']).length === 9) enviarSMS([e['Telefone']], 'Gescolar: a assinatura ' + plano + ' de ' + (e['Nome'] || 'a escola') + ' esta activa ate ' + new Date(ate).toISOString().slice(0, 10).split('-').reverse().join('/') + '. Obrigado.').catch(() => {});
+  res.json({ ok: true, id, valida_ate: ate, situacao: situacaoEscola(Object.assign({}, e, { 'Valida Ate': ate, 'Estado': 'activa' })) });
+}));
+app.post('/pl/assinatura-aprovar', exigePlataforma, rota(async (req, res) => {
+  const x = await obter('subscricao', String((req.body || {}).id || '')).catch(() => null);
+  if (!x) return erro(res, 404, 'Assinatura não encontrada.');
+  if (x['Estado'] === 'pago') return erro(res, 409, 'Esta assinatura já está aplicada.');
+  const e = await obter('escola', x['Escola']);
+  if (!e) return erro(res, 404, 'A escola desta assinatura já não existe.');
+  const ate = novaValidade(e, Number(x['Meses'] || 1)), eu = await obter('user', req.sessao.u).catch(() => null);
+  await mudar('subscricao', x._id, { 'Estado': 'pago', 'Pago Em': new Date().toISOString(), 'Valida Ate': ate,
+    'Raw': String(x['Raw'] || '').slice(0, 3600) + ' | aprovada à mão por ' + ((eu && eu['Nome Completo']) || 'Plataforma') });
+  await mudar('escola', e._id, { 'Valida Ate': ate, 'Estado': 'activa', 'Plano': x['Plano'] || e['Plano'] });
+  cachePainel.delete(e._id);
+  res.json({ ok: true, valida_ate: ate });
+}));
+app.post('/pl/assinatura-anular', exigePlataforma, rota(async (req, res) => {
+  const x = await obter('subscricao', String((req.body || {}).id || '')).catch(() => null);
+  if (!x) return erro(res, 404, 'Assinatura não encontrada.');
+  if (x['Estado'] === 'anulada') return erro(res, 409, 'Já está anulada.');
+  const eraPaga = x['Estado'] === 'pago';
+  await mudar('subscricao', x._id, { 'Estado': 'anulada' });
+  let ate = null;
+  if (eraPaga && (req.body || {}).tirar_meses) {   // tira os meses desta assinatura à validade da escola
+    const e = await obter('escola', x['Escola']).catch(() => null);
+    if (e && e['Valida Ate']) { ate = somaMeses(e['Valida Ate'], -Number(x['Meses'] || 1)); await mudar('escola', e._id, { 'Valida Ate': ate }); cachePainel.delete(e._id); }
+  }
+  res.json({ ok: true, valida_ate: ate });
 }));
 app.post('/pl/transferencia-apagar', exigePlataforma, rota(async (req, res) => {
   const id = String((req.body || {}).id || '');
@@ -2420,12 +2897,22 @@ app.post('/senha-pedir', rota(async (req, res) => {
   if (!u) return erro(res, 404, 'Não encontrámos nenhuma conta com este email.');
   if (u['Activo'] === false) return erro(res, 403, 'Esta conta está desactivada. Fale com a Direcção da escola.');
   const tel = tel9(u['Telefone']);
-  if (tel.length !== 9) return erro(res, 409, 'Esta conta não tem telemóvel registado. Escreva para geral@gescolar.co.mz a pedir ajuda.');
   const codigo = String(crypto.randomInt(0, 1000000)).padStart(6, '0'), pedido = crypto.randomBytes(16).toString('hex');
-  const r = await enviarSMS([tel], 'Gescolar: o seu codigo para criar uma nova palavra-passe e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.');
-  if (!r.ok) return erro(res, 502, 'Não foi possível enviar o SMS agora. Tente de novo dentro de um minuto.');
+  // v5.25: por SMS (gasta um crédito da escola); sem telemóvel ou sem SMS, vai para o email da conta
+  let destino = '';
+  if (tel.length === 9) {
+    const msg = 'Gescolar: o seu codigo para criar uma nova palavra-passe e ' + codigo + '. Valido 10 minutos. Nao partilhe este codigo.';
+    const r = u['Escola'] ? await smsEscola(u['Escola'], [tel], msg, { semEmail: true }) : await enviarSMS([tel], msg);
+    if (r.ok) destino = mascarar(tel);
+  }
+  if (!destino) {
+    const blocos = [{ p: 'Pediu para criar uma nova palavra-passe no Gescolar. Use este código:' }, { codigo }, { nota: 'O código vale 10 minutos. Se não foi você, ignore este email: a sua palavra-passe continua igual.' }];
+    const m = await enviarEmail(email, 'Gescolar: código para nova palavra-passe', emailGescolar('', 'Nova palavra-passe', blocos), textoDeBlocos('Nova palavra-passe', blocos));
+    if (m.ok) destino = mascararEmail(email);
+  }
+  if (!destino) return erro(res, 502, 'Não foi possível enviar o código agora. Tente de novo dentro de um minuto.');
   pedidosAcesso.set(pedido, { tipo: 'senha', id: u._id, email, hash: hashCodigo(pedido + codigo), exp: Date.now() + 600e3, tent: 0 });
-  res.json({ ok: true, pedido, destino: mascarar(tel) });
+  res.json({ ok: true, pedido, destino });
 }));
 app.post('/senha-nova', rota(async (req, res) => {
   const b = req.body || {}, chave = String(b.pedido || '');
@@ -2485,7 +2972,7 @@ app.post('/equipa-criar', exigeSoDireccao, rota(async (req, res) => {
   const esc = await obter('escola', req.escola).catch(() => null);
   const link = linkPagina('recuperar') + '?email=' + encodeURIComponent(email);
   const papelN = papel === 'Direccao' ? 'Direccao' : 'Secretaria', escN = (esc && esc['Nome']) || 'a escola';
-  const r = await enviarSMS([tel], 'Gescolar: foi criada a sua conta (' + papelN + ') em ' + escN + (SMS_LINKS ? '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, '') : '. Enviamos para o seu email ' + email + ' o link para criar a palavra-passe.'));
+  const r = await smsEscola(req.escola, [tel], 'Gescolar: foi criada a sua conta (' + papelN + ') em ' + escN + (SMS_LINKS ? '. Crie a sua palavra-passe em ' + link.replace(/^https?:\/\//, '') : '. Enviamos para o seu email ' + email + ' o link para criar a palavra-passe.'), { semEmail: true });
   const blocos = [{ p: 'Foi criada a sua conta (' + (papel === 'Direccao' ? 'Direcção' : 'Secretaria') + ') em ' + escN + ' no Gescolar.' }, { botao: 'Criar a palavra-passe', link }, { p: 'Depois entre no Gescolar com este email (' + email + ') e a palavra-passe que escolher.' }];
   const m = await enviarEmail(email, 'Gescolar: a sua conta em ' + escN, emailGescolar(escN, 'Bem-vindo ao Gescolar', blocos), textoDeBlocos('Bem-vindo ao Gescolar', blocos));
   res.json({ ok: true, id: userId, sms: r.ok, email: m.ok, link });
@@ -2515,7 +3002,7 @@ async function convidarProfessor(escolaId, p, escRaw) {
       : 'Para entrar, a escola tem de registar o seu número de telemóvel: é com ele que entra. Peça à Direcção para o acrescentar à sua ficha.' },
     { nota: 'Código da escola: ' + (esc['Subdominio'] || '') }];
   const [r, m] = await Promise.all([
-    tel.length === 9 ? enviarSMS([tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre ' + noGescolar(esc['Subdominio']) + ', escolha Professor e use este numero.') : Promise.resolve({ ok: false }),
+    tel.length === 9 ? smsEscola(escolaId, [tel], (esc['Nome'] || 'A escola') + ': foi registado como professor no Gescolar. Para ver as suas turmas, o horario, fazer a chamada e lancar notas entre ' + noGescolar(esc['Subdominio']) + ', escolha Professor e use este numero.') : Promise.resolve({ ok: false }),
     emailOk(mail) ? enviarEmail(mail, (esc['Nome'] || 'Gescolar') + ': o seu acesso de professor', emailGescolar(esc['Nome'], 'O seu acesso ao Gescolar', blocos), textoDeBlocos('O seu acesso ao Gescolar', blocos)) : Promise.resolve({ ok: false })]);
   return (r.ok || m.ok) ? { sms: r.ok, email: m.ok } : false;
 }
@@ -2645,9 +3132,9 @@ async function inscreverCore(escolaId, b) {
   let sms = false;
   if (esc) {
     const link = noGescolar(esc['Subdominio']);
-    const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola ' + link + ' (escolha Estudante).');
+    const r = await smsEscola(escolaId, [tel], (esc['Nome'] || 'A escola') + ': bem-vindo ao curso da carta ' + c['Categoria'] + '. O seu numero e ' + numero + '. Veja aulas, prestacoes e recibos e pague por M-Pesa ou e-Mola ' + link + ' (escolha Estudante).');
     sms = r.ok;
-    if (encTel && encTel !== tel) await enviarSMS([encTel], (esc['Nome'] || 'A escola') + ': ' + nome + ' foi inscrito(a) no curso da carta ' + c['Categoria'] + ' com o numero ' + numero + '. Acompanhe aulas e prestacoes e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => {});
+    if (encTel && encTel !== tel) await smsEscola(escolaId, [encTel], (esc['Nome'] || 'A escola') + ': ' + nome + ' foi inscrito(a) no curso da carta ' + c['Categoria'] + ' com o numero ' + numero + '. Acompanhe aulas e prestacoes e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).').catch(() => {});
   }
   cachePainel.delete(escolaId);
   return { id: insId, estudante: estId, numero, prestacoes: prest, sms };
@@ -2774,7 +3261,7 @@ async function marcarAula(req, res, b) {
   if (b.sms && tel9(e['Telefone']).length === 9) {
     const esc = await obter('escola', req.escola).catch(() => null);
     const d = new Date(b.data + 'T12:00:00Z'), dia = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'][d.getUTCDay()];
-    const r = await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': aula pratica marcada para ' + dia + ' ' + dmCurto(b.data) + ', ' + b.inicio + '-' + hhmmDe(fim) + '. Instrutor ' + (p['Nome'] || '').split(' ')[0] + ', viatura ' + v['Matricula'] + '.' + (extra ? ' Aula extra: ' + extra + ' MT, pague no portal.' : ''));
+    const r = await smsEscola(req.escola, [e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': aula pratica marcada para ' + dia + ' ' + dmCurto(b.data) + ', ' + b.inicio + '-' + hhmmDe(fim) + '. Instrutor ' + (p['Nome'] || '').split(' ')[0] + ', viatura ' + v['Matricula'] + '.' + (extra ? ' Aula extra: ' + extra + ' MT, pague no portal.' : ''));
     sms = r.ok;
   }
   return res.json({ ok: true, id, fim: hhmmDe(fim), sms, extra });
@@ -2795,7 +3282,7 @@ app.post('/aula-estado', exigeDireccao, rota(async (req, res) => {
     for (const p of ps.filter(x => x['Descricao'] === ref && x['Estado'] !== 'paga')) await mudar('propina', p._id, { 'Estado': 'anulada' }).catch(() => {});
     if (b.sms !== false && a['Data'] >= hojeMZ().data) {
       const [e, esc] = await Promise.all([obter('estudante', a['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null)]);
-      if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': a sua aula pratica de ' + dmCurto(a['Data']) + ' as ' + a['Inicio'] + ' foi cancelada. A escola vai marcar outra data.')).ok;
+      if (e && tel9(e['Telefone']).length === 9) sms = (await smsEscola(req.escola, [e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': a sua aula pratica de ' + dmCurto(a['Data']) + ' as ' + a['Inicio'] + ' foi cancelada. A escola vai marcar outra data.')).ok;
     }
   }
   res.json({ ok: true, estado, sms });
@@ -2843,7 +3330,7 @@ app.post('/exame-marcar', exigeDireccao, rota(async (req, res) => {
   let sms = false;
   if (b.sms) {
     const [e, esc] = await Promise.all([obter('estudante', i['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null)]);
-    if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': ' + TIPO_EXAME[tipo].toLowerCase() + ' da carta ' + i['Categoria'] + ' marcado para ' + dmCurto(b.data) + (b.hora ? ' as ' + b.hora : '') + (b.local ? ', ' + txt(b.local, 60) : '') + '. Leve o BI. Boa sorte!')).ok;
+    if (e && tel9(e['Telefone']).length === 9) sms = (await smsEscola(req.escola, [e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': ' + TIPO_EXAME[tipo].toLowerCase() + ' da carta ' + i['Categoria'] + ' marcado para ' + dmCurto(b.data) + (b.hora ? ' as ' + b.hora : '') + (b.local ? ', ' + txt(b.local, 60) : '') + '. Leve o BI. Boa sorte!')).ok;
   }
   res.json({ ok: true, id, tentativa, sms });
 }));
@@ -2858,7 +3345,7 @@ app.post('/exame-resultado', exigeDireccao, rota(async (req, res) => {
     await mudar('inscricaoconducao', x['Inscricao'], { 'Estado': 'concluida' }).catch(() => {});
     concluida = true;
     const [e, esc, i] = await Promise.all([obter('estudante', x['Estudante']).catch(() => null), obter('escola', req.escola).catch(() => null), obter('inscricaoconducao', x['Inscricao']).catch(() => null)]);
-    if (e && tel9(e['Telefone']).length === 9) sms = (await enviarSMS([e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': parabens, ' + String(e['Nome'] || '').split(' ')[0] + '! Foi aprovado no exame de conducao da carta ' + ((i && i['Categoria']) || '') + '. Boa estrada!')).ok;
+    if (e && tel9(e['Telefone']).length === 9) sms = (await smsEscola(req.escola, [e['Telefone']], ((esc && esc['Nome']) || 'Escola') + ': parabens, ' + String(e['Nome'] || '').split(' ')[0] + '! Foi aprovado no exame de conducao da carta ' + ((i && i['Categoria']) || '') + '. Boa estrada!')).ok;
   }
   cachePainel.delete(req.escola);
   res.json({ ok: true, resultado: r, concluida, sms });
@@ -3306,7 +3793,7 @@ async function lembretesConducao() {
       lembretesFeitos.add(a._id);
       const [esc, e, p, v] = await Promise.all([pega('escola', a['Escola']), pega('estudante', a['Estudante']), pega('professor', a['Instrutor']), pega('viatura', a['Viatura'])]);
       if (!esc || esc['Estado'] === 'suspensa' || !e || tel9(e['Telefone']).length !== 9) continue;
-      const r = await enviarSMS([e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dia + ' ' + dmCurto(amanha) + ') tem aula pratica das ' + a['Inicio'] + ' as ' + a['Fim'] + (p ? ' com ' + String(p['Nome'] || '').split(' ')[0] : '') + (v ? ', viatura ' + v['Matricula'] : '') + '. Se nao puder vir, avise a escola.');
+      const r = await smsEscola(esc._id, [e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dia + ' ' + dmCurto(amanha) + ') tem aula pratica das ' + a['Inicio'] + ' as ' + a['Fim'] + (p ? ' com ' + String(p['Nome'] || '').split(' ')[0] : '') + (v ? ', viatura ' + v['Matricula'] : '') + '. Se nao puder vir, avise a escola.');
       if (r.ok) { n++; await mudar('aulapratica', a._id, { 'Lembrete': true }).catch(() => {}); }
     }
     // agenda do dia seguinte para cada instrutor
@@ -3317,14 +3804,14 @@ async function lembretesConducao() {
       const p = await pega('professor', pid), esc = await pega('escola', L[0]['Escola']);
       if (!p || !esc || esc['Estado'] === 'suspensa' || tel9(p['Telefone']).length !== 9) continue;
       L.sort((x, y) => String(x['Inicio']).localeCompare(String(y['Inicio'])));
-      const r = await enviarSMS([p['Telefone']], (esc['Nome'] || 'Escola') + ': amanha (' + dia + ' ' + dmCurto(amanha) + ') tem ' + L.length + ' aula(s) pratica(s). A primeira e as ' + L[0]['Inicio'] + '. Veja a agenda no Gescolar.');
+      const r = await smsEscola(esc._id, [p['Telefone']], (esc['Nome'] || 'Escola') + ': amanha (' + dia + ' ' + dmCurto(amanha) + ') tem ' + L.length + ' aula(s) pratica(s). A primeira e as ' + L[0]['Inicio'] + '. Veja a agenda no Gescolar.');
       if (r.ok) n++;
     }
     for (const x of exames.filter(z => z['Lembrete'] !== true && !lembretesFeitos.has(z._id))) {
       lembretesFeitos.add(x._id);
       const [esc, e] = await Promise.all([pega('escola', x['Escola']), pega('estudante', x['Estudante'])]);
       if (!esc || esc['Estado'] === 'suspensa' || !e || tel9(e['Telefone']).length !== 9) continue;
-      const r = await enviarSMS([e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dmCurto(amanha) + ') tem ' + (TIPO_EXAME[x['Tipo']] || 'exame').toLowerCase() + (x['Hora'] ? ' as ' + x['Hora'] : '') + (x['Local'] ? ', ' + String(x['Local']).slice(0, 50) : '') + '. Leve o BI e chegue cedo. Boa sorte!');
+      const r = await smsEscola(esc._id, [e['Telefone']], (esc['Nome'] || 'Escola') + ': lembrete - amanha (' + dmCurto(amanha) + ') tem ' + (TIPO_EXAME[x['Tipo']] || 'exame').toLowerCase() + (x['Hora'] ? ' as ' + x['Hora'] : '') + (x['Local'] ? ', ' + String(x['Local']).slice(0, 50) : '') + '. Leve o BI e chegue cedo. Boa sorte!');
       if (r.ok) { n++; await mudar('exameconducao', x._id, { 'Lembrete': true }).catch(() => {}); }
     }
     if (n) console.log('[lembretes] ' + n + ' SMS enviados para ' + amanha);
@@ -3631,7 +4118,7 @@ app.post('/pub/link', rota(async (req, res) => {
 async function confirmarInscricaoSMS(i, l, esc) {
   const tel = tel9(i['Encarregado Telefone']) || tel9(i['Telefone']);
   if (tel.length !== 9) return false;
-  const r = await enviarSMS([tel], (esc['Nome'] || 'A escola') + ': inscricao de ' + i['Nome'] + ' em "' + (l['Titulo'] || '') + '" recebida' +
+  const r = await smsEscola(esc._id || i['Escola'], [tel], (esc['Nome'] || 'A escola') + ': inscricao de ' + i['Nome'] + ' em "' + (l['Titulo'] || '') + '" recebida' +
     (Number(i['Valor']) ? ' e paga (' + Number(i['Valor']) + ' MT)' : '') + '. A escola vai contacta-lo para a matricula.').catch(() => ({ ok: false }));
   return !!r.ok;
 }
@@ -3931,6 +4418,7 @@ app.post('/wh-moz/:chave', async (req, res) => {
     for (const c of candidatos) { const l = await procurar('pagamento', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) { p = l[0]; break; } }
     if (!p) {
       for (const c of candidatos) { const l = await procurar('subscricao', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1); if (l[0]) return res.json(await aplicarSubscricao(l[0], b, estado)); }
+      for (const c of candidatos) { const l = await procurar('recargasms', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []); if (l[0]) return res.json(await aplicarRecargaSMS(l[0], b, estado)); }
       for (const c of candidatos) { const l = await procurar('inscricaoonline', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []); if (l[0]) return res.json(await aplicarInscricao(l[0], b, estado)); }
       for (const c of candidatos) {   // levantamento (B2C payout) que ficou pendente
         const l = await procurar('transferencia', [{ key: 'Referencia', constraint_type: 'equals', value: c }], 1).catch(() => []);
@@ -4324,8 +4812,8 @@ app.post('/importar-estudantes', exigeDireccao, rota(async (req, res) => {
     criados++; r.numero = v.numero;
     if (esc) {
       const link = noGescolar(esc['Subdominio']), en = esc['Nome'] || 'A escola', tn = v.turma['Nome'] || '';
-      if (v.telE.length === 9 && (await enviarSMS([v.telE], en + ': ' + (v.superior ? 'bem-vindo(a), ' + v.nome.split(' ')[0] + '. Esta inscrito(a) em ' : v.nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + v.numero + '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + v.numero + ').')).ok) sms++;
-      if (v.enc && v.enc.tel && v.enc.tel !== v.telE && (await enviarSMS([v.enc.tel], en + ': ' + v.nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + v.numero + '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).')).ok) sms++;
+      if (v.telE.length === 9 && (await smsEscola(req.escola, [v.telE], en + ': ' + (v.superior ? 'bem-vindo(a), ' + v.nome.split(' ')[0] + '. Esta inscrito(a) em ' : v.nome + ' esta matriculado(a) na ') + tn + ' com o numero ' + v.numero + '. Veja notas, horario e propinas ' + link + ' (escolha Estudante e escreva ' + v.numero + ').')).ok) sms++;
+      if (v.enc && v.enc.tel && v.enc.tel !== v.telE && (await smsEscola(req.escola, [v.enc.tel], en + ': ' + v.nome + ' foi matriculado(a) na ' + tn + ' com o numero ' + v.numero + '. Veja propinas, recibos e notas e pague por M-Pesa ou e-Mola ' + link + ' (escolha Encarregado e use este numero de telemovel).')).ok) sms++;
     }
   }
   cachePainel.delete(req.escola);
@@ -4530,11 +5018,11 @@ async function cobrancasAutomaticas() {
         const atraso = lista.filter(x => x.c.estado === 'atrasada' && Number(x.p['Avisos Atraso'] || 0) < COBRANCA_MAX && diasEntre(x.venc, hoje) >= 1 &&
           (!x.p['Ultimo Aviso'] || diasEntre(dataMZ(x.p['Ultimo Aviso']), hoje) >= COBRANCA_INTERVALO));
         for (const g of await destinosCobranca(e._id, antes)) {
-          if ((await enviarSMS([g.tel], smsAntes(esc, g))).ok) n++;
+          if ((await smsEscola(e._id, [g.tel], smsAntes(esc, g))).ok) n++;
           for (const i of g.itens) await mudar('propina', i.p._id, { 'Aviso Antes': new Date().toISOString() }).catch(() => {});
         }
         for (const g of await destinosCobranca(e._id, atraso)) {
-          if ((await enviarSMS([g.tel], smsAtraso(esc, g))).ok) n++;
+          if ((await smsEscola(e._id, [g.tel], smsAtraso(esc, g))).ok) n++;
           for (const i of g.itens) await mudar('propina', i.p._id, { 'Avisos Atraso': Number(i.p['Avisos Atraso'] || 0) + 1, 'Ultimo Aviso': new Date().toISOString() }).catch(() => {});
         }
       } catch (err) { console.error('[cobrancas] escola ' + e._id + ':', err.message); }
@@ -4569,7 +5057,7 @@ app.post('/avisar-devedores', exigeDireccao, rota(async (req, res) => {
   if (!grupos.length) return res.json({ ok: true, enviados: 0, destinatarios: 0 });
   let enviados = 0;
   for (const g of grupos) {
-    if ((await enviarSMS([g.tel], smsAtraso(esc, g))).ok) enviados++;
+    if ((await smsEscola(req.escola, [g.tel], smsAtraso(esc, g))).ok) enviados++;
     for (const i of g.itens) await mudar('propina', i.p._id, { 'Ultimo Aviso': new Date().toISOString() }).catch(() => {});
   }
   res.json({ ok: true, enviados, destinatarios: grupos.length });
